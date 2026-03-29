@@ -3,14 +3,15 @@
 #include <string>
 #include <vector>
 
+enum class ExportMode { SourceFormat, GIF };
+
 struct TimeRange {
     double startSec = 0.0;
     double endSec = 0.0;
+    ExportMode mode = ExportMode::SourceFormat;
 };
 
 struct ExportSettings {
-    enum class Mode { SourceFormat, GIF };
-    Mode mode = Mode::SourceFormat;
     std::string outputPath;
     std::vector<TimeRange> segments;
     int gifWidth = 480;

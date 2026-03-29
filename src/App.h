@@ -2,6 +2,8 @@
 
 #include "ui/UIManager.h"
 #include "core/Player.h"
+#include "core/SegmentManager.h"
+#include "export/Exporter.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
@@ -28,15 +30,28 @@ private:
     bool m_running = false;
 
     Player m_player;
+    SegmentManager m_segments;
+    Exporter m_exporter;
+
+    // Export dialog state
+    bool m_showExportDialog = false;
+    ExportSettings m_pendingExport;
+    char m_exportDir[512] = "";
+    char m_exportName[256] = "";
+    std::string m_currentFilePath;
 
     // Display
     GLuint m_videoTexture = 0;
     int m_videoWidth = 0;
     int m_videoHeight = 0;
 
-    // Seek slider state
+    // Seek slider state (controls panel + timeline bar)
     bool m_isSeeking = false;
     bool m_wasPlayingBeforeSeek = false;
     double m_seekTarget = 0.0;
     uint64_t m_lastSeekTime = 0;
+
+    // Timeline bar scrubbing state
+    bool m_isTimelineSeeking = false;
+    bool m_wasPlayingBeforeTimelineSeek = false;
 };

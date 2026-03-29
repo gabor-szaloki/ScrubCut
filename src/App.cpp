@@ -6,6 +6,7 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <cmath>
+#include <filesystem>
 
 bool App::Init() {
     LogFile::Get().Open();
@@ -59,9 +60,11 @@ void App::Run() {
     while (m_running) {
         TRACE_EVENT("Frame");
         ProcessEvents();
+        m_player.PollSeekComplete();
 
-        {
-            TRACE_EVENT("TryGetVideoFrame");
+        // Fetch frame before render (for async playback)
+        // and after render (for sync seeks triggered by UI during Render)
+        auto fetchFrame = [&]() {
             const uint8_t* rgba = nullptr;
             int w = 0, h = 0;
             if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
@@ -72,9 +75,17 @@ void App::Run() {
                 }
                 UploadFrame(rgba, w, h);
             }
+        };
+
+        {
+            TRACE_EVENT("TryGetVideoFrame");
+            fetchFrame();
         }
 
         Render();
+
+        // Pick up frames from seeks triggered during Render (timeline/slider drags)
+        fetchFrame();
     }
 }
 
@@ -113,6 +124,9 @@ void App::OpenFile(const std::string& path) {
 
     if (!m_player.Open(path))
         return;
+
+    m_currentFilePath = path;
+    m_segments.Clear();
 
     m_videoWidth = m_player.GetVideoWidth();
     m_videoHeight = m_player.GetVideoHeight();
@@ -196,6 +210,28 @@ void App::ProcessEvents() {
                 m_player.SetSpeed(spd);
                 break;
             }
+            case SDLK_I:
+                if (m_player.HasMedia())
+                    m_segments.SetMarkIn(m_player.GetPlaybackTime());
+                break;
+            case SDLK_O:
+                if (m_player.HasMedia())
+                    m_segments.SetMarkOut(m_player.GetPlaybackTime());
+                break;
+            case SDLK_DELETE:
+                if (m_segments.GetCount() > 0)
+                    m_segments.RemoveSegment(m_segments.GetCount() - 1);
+                break;
+            case SDLK_E:
+                if (ctrl && m_segments.GetCount() > 0 && !m_exporter.IsRunning()) {
+                    m_showExportDialog = true;
+                    auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
+                    auto stem = std::filesystem::path(m_currentFilePath).stem().string();
+                    snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+                    snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
+                    m_pendingExport = ExportSettings{};
+                }
+                break;
             }
         }
     }
@@ -208,6 +244,13 @@ void App::Render() {
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+    // Keep seek target in sync with player when not actively seeking
+    // and no async seek is in progress. This prevents the playhead from
+    // snapping back to an old position while the seek thread is still working.
+    if (!m_isSeeking && !m_isTimelineSeeking && !m_player.IsSeekBusy() && m_player.HasMedia()) {
+        m_seekTarget = m_player.GetPlaybackTime();
+    }
+
     m_ui.BeginFrame();
 
     // Menu bar
@@ -215,6 +258,16 @@ void App::Render() {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open...", "Ctrl+O")) {
                 // TODO: file dialog
+            }
+            if (ImGui::MenuItem("Export Segments...", "Ctrl+E",
+                                false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
+                m_showExportDialog = true;
+                // Pre-fill defaults
+                auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
+                auto stem = std::filesystem::path(m_currentFilePath).stem().string();
+                snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+                snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
+                m_pendingExport = ExportSettings{};
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Alt+F4")) {
@@ -251,7 +304,7 @@ void App::Render() {
     // Controls panel
     ImGui::Begin("Controls");
     if (m_player.HasMedia()) {
-        double currentTime = m_isSeeking ? m_seekTarget : m_player.GetPlaybackTime();
+        double currentTime = m_seekTarget;
         double duration = m_player.GetDuration();
 
         // --- Row 1: Transport + Seek buttons ---
@@ -300,8 +353,7 @@ void App::Render() {
             }
         }
         if (m_isSeeking && !ImGui::IsItemActive()) {
-            m_player.SeekTo(m_seekTarget);
-            if (m_wasPlayingBeforeSeek) m_player.Play();
+            m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeSeek);
             m_isSeeking = false;
         }
 
@@ -343,6 +395,8 @@ void App::Render() {
             "Space: Play/Pause | Arrows: +/-5s | Ctrl+Arrows: +/-1s | Shift+Arrows: +/-30s");
         ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
             "Alt+Arrows or ,/.: Frame step | +/-: Speed | Home/End: Start/End");
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+            "I: Mark In | O: Mark Out | Delete: Remove last segment | Ctrl+E: Export");
     } else {
         ImGui::Text("No video loaded. Drag and drop a video file.");
     }
@@ -351,9 +405,322 @@ void App::Render() {
     // Timeline panel
     ImGui::Begin("Timeline");
     if (m_player.HasMedia()) {
-        ImGui::Text("Timeline (Phase 5)");
+        double duration = m_player.GetDuration();
+        double displayTime = m_seekTarget;
+
+        // --- Mark buttons ---
+        if (ImGui::Button("Mark In [I]")) {
+            m_segments.SetMarkIn(displayTime);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Mark Out [O]")) {
+            m_segments.SetMarkOut(displayTime);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Marks")) {
+            m_segments.ClearPendingMark();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear All")) {
+            m_segments.Clear();
+        }
+        if (m_segments.HasPendingMarkIn()) {
+            double markIn = m_segments.GetPendingMarkIn();
+            int mMin = static_cast<int>(markIn) / 60;
+            int mSec = static_cast<int>(markIn) % 60;
+            int mMs  = static_cast<int>(markIn * 1000) % 1000;
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "  Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
+        }
+
+        // --- Timeline bar ---
+        ImVec2 barPos = ImGui::GetCursorScreenPos();
+        float barWidth = ImGui::GetContentRegionAvail().x;
+        float barHeight = 32.0f;
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+        // Background
+        drawList->AddRectFilled(barPos, ImVec2(barPos.x + barWidth, barPos.y + barHeight),
+                                IM_COL32(40, 40, 40, 255));
+
+        // Segments
+        const auto& segs = m_segments.GetSegments();
+        for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+            float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
+            float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
+            // Color by export mode
+            ImU32 fillCol = (segs[i].mode == ExportMode::GIF)
+                ? IM_COL32(180, 120, 220, 120) : IM_COL32(80, 140, 220, 120);
+            ImU32 borderCol = (segs[i].mode == ExportMode::GIF)
+                ? IM_COL32(200, 150, 255, 200) : IM_COL32(100, 170, 255, 200);
+            drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
+            drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol);
+        }
+
+        // Pending mark-in indicator
+        if (m_segments.HasPendingMarkIn() && duration > 0.0) {
+            float mx = barPos.x + static_cast<float>(m_segments.GetPendingMarkIn() / duration) * barWidth;
+            for (float y = barPos.y; y < barPos.y + barHeight; y += 6.0f) {
+                float yEnd = y + 3.0f;
+                if (yEnd > barPos.y + barHeight) yEnd = barPos.y + barHeight;
+                drawList->AddLine(ImVec2(mx, y), ImVec2(mx, yEnd),
+                                  IM_COL32(255, 200, 50, 180), 2.0f);
+            }
+        }
+
+        // Playhead (follows mouse immediately during any seek)
+        if (duration > 0.0) {
+            float px = barPos.x + static_cast<float>(displayTime / duration) * barWidth;
+            drawList->AddLine(ImVec2(px, barPos.y), ImVec2(px, barPos.y + barHeight),
+                              IM_COL32(255, 255, 255, 220), 2.0f);
+        }
+
+        // --- Interaction: segment edge handles first, then bar click-to-seek ---
+        // Handles are rendered first so they take priority over the bar click
+        bool handleActive = false;
+        for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+            float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
+            float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
+            float handleW = 8.0f;
+
+            // Left handle
+            ImGui::SetCursorScreenPos(ImVec2(x0 - handleW * 0.5f, barPos.y));
+            char idBuf[32];
+            snprintf(idBuf, sizeof(idBuf), "##seg_l_%d", i);
+            ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
+            if (ImGui::IsItemActive()) {
+                float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
+                double newStart = static_cast<double>(mouseX / barWidth) * duration;
+                newStart = std::max(0.0, std::min(newStart, segs[i].endSec - 0.01));
+                m_segments.UpdateSegment(i, newStart, segs[i].endSec);
+                m_seekTarget = newStart;
+                handleActive = true;
+
+                if (!m_isTimelineSeeking) {
+                    m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
+                    if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
+                    m_isTimelineSeeking = true;
+                }
+                uint64_t now = SDL_GetTicksNS();
+                if (now - m_lastSeekTime > 150000000ULL) {
+                    m_player.SeekTo(newStart);
+                    m_lastSeekTime = now;
+                }
+            }
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
+                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+                m_isTimelineSeeking = false;
+            }
+
+            // Right handle
+            ImGui::SetCursorScreenPos(ImVec2(x1 - handleW * 0.5f, barPos.y));
+            snprintf(idBuf, sizeof(idBuf), "##seg_r_%d", i);
+            ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
+            if (ImGui::IsItemActive()) {
+                float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
+                double newEnd = static_cast<double>(mouseX / barWidth) * duration;
+                newEnd = std::max(segs[i].startSec + 0.01, std::min(newEnd, duration));
+                m_segments.UpdateSegment(i, segs[i].startSec, newEnd);
+                m_seekTarget = newEnd;
+                handleActive = true;
+
+                if (!m_isTimelineSeeking) {
+                    m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
+                    if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
+                    m_isTimelineSeeking = true;
+                }
+                uint64_t now = SDL_GetTicksNS();
+                if (now - m_lastSeekTime > 150000000ULL) {
+                    m_player.SeekTo(newEnd);
+                    m_lastSeekTime = now;
+                }
+            }
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
+                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+                m_isTimelineSeeking = false;
+            }
+        }
+
+        // Click-to-seek on timeline bar (only if no handle is active)
+        ImGui::SetCursorScreenPos(barPos);
+        ImGui::InvisibleButton("##timeline_bar", ImVec2(barWidth, barHeight));
+        if (ImGui::IsItemActive() && !handleActive) {
+            float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
+            double clickTime = static_cast<double>(mouseX / barWidth) * duration;
+            clickTime = std::max(0.0, std::min(clickTime, duration));
+            m_seekTarget = clickTime;
+
+            if (!m_isTimelineSeeking) {
+                m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
+                if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
+                m_isTimelineSeeking = true;
+            }
+
+            uint64_t now = SDL_GetTicksNS();
+            if (now - m_lastSeekTime > 150000000ULL) {
+                m_player.SeekTo(m_seekTarget);
+                m_lastSeekTime = now;
+            }
+        }
+        if (m_isTimelineSeeking && !ImGui::IsItemActive()) {
+            m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+            m_isTimelineSeeking = false;
+        }
     }
     ImGui::End();
+
+    // Segments panel (separate from timeline)
+    ImGui::Begin("Segments");
+    if (m_player.HasMedia() && m_segments.GetCount() > 0) {
+        const auto& segs = m_segments.GetSegments();
+        int removeIdx = -1;
+        for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+            int sMin = static_cast<int>(segs[i].startSec) / 60;
+            int sSec = static_cast<int>(segs[i].startSec) % 60;
+            int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
+            int eMin = static_cast<int>(segs[i].endSec) / 60;
+            int eSec = static_cast<int>(segs[i].endSec) % 60;
+            int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
+            double dur = segs[i].endSec - segs[i].startSec;
+
+            char label[128];
+            snprintf(label, sizeof(label), "[%d] %02d:%02d.%03d - %02d:%02d.%03d (%.1fs)",
+                     i + 1, sMin, sSec, sMs, eMin, eSec, eMs, dur);
+
+            // Limit selectable width so it doesn't overlap buttons
+            float buttonsWidth = 90.0f;
+            float selectableWidth = ImGui::GetContentRegionAvail().x - buttonsWidth;
+            if (ImGui::Selectable(label, false, 0, ImVec2(selectableWidth, 0))) {
+                m_player.SeekTo(segs[i].startSec);
+            }
+
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttonsWidth + 10.0f);
+            const char* modeLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
+            ImU32 modeCol = (segs[i].mode == ExportMode::GIF)
+                ? IM_COL32(200, 150, 255, 255) : IM_COL32(100, 170, 255, 255);
+            ImGui::PushStyleColor(ImGuiCol_Button, modeCol);
+            char modeBuf[32];
+            snprintf(modeBuf, sizeof(modeBuf), "%s##mode_%d", modeLabel, i);
+            if (ImGui::SmallButton(modeBuf)) {
+                ExportMode newMode = (segs[i].mode == ExportMode::GIF)
+                    ? ExportMode::SourceFormat : ExportMode::GIF;
+                m_segments.SetSegmentMode(i, newMode);
+            }
+            ImGui::PopStyleColor();
+
+            ImGui::SameLine();
+            char xBuf[16];
+            snprintf(xBuf, sizeof(xBuf), "X##seg_%d", i);
+            if (ImGui::SmallButton(xBuf)) {
+                removeIdx = i;
+            }
+        }
+        if (removeIdx >= 0) {
+            m_segments.RemoveSegment(removeIdx);
+        }
+    } else if (m_player.HasMedia()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Press I to mark in, O to mark out");
+    }
+    ImGui::End();
+
+    // Export dialog
+    if (m_showExportDialog) {
+        m_exporter.ResetProgress();
+        ImGui::OpenPopup("Export Segments");
+        m_showExportDialog = false;
+    }
+
+    if (ImGui::BeginPopupModal("Export Segments", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto& progress = m_exporter.GetProgress();
+
+        if (!progress.running && !progress.finished) {
+            // --- Settings form ---
+            ImGui::Text("Output Directory:");
+            ImGui::SetNextItemWidth(400);
+            ImGui::InputText("##dir", m_exportDir, sizeof(m_exportDir));
+
+            ImGui::Text("Filename Base:");
+            ImGui::SetNextItemWidth(400);
+            ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
+
+            // GIF settings (apply to all GIF segments)
+            bool hasGif = false;
+            const auto& segs = m_segments.GetSegments();
+            for (const auto& s : segs) {
+                if (s.mode == ExportMode::GIF) { hasGif = true; break; }
+            }
+            if (hasGif) {
+                ImGui::Spacing();
+                ImGui::Text("GIF Settings:");
+                ImGui::Indent();
+                ImGui::SliderInt("Width", &m_pendingExport.gifWidth, 120, 1920);
+                float fps = static_cast<float>(m_pendingExport.gifFps);
+                if (ImGui::SliderFloat("FPS", &fps, 5.0f, 30.0f, "%.0f")) {
+                    m_pendingExport.gifFps = static_cast<double>(fps);
+                }
+                ImGui::Unindent();
+            }
+
+            // Segment list
+            ImGui::Spacing();
+            ImGui::Text("Segments to export:");
+            for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+                int sMin = static_cast<int>(segs[i].startSec) / 60;
+                int sSec = static_cast<int>(segs[i].startSec) % 60;
+                int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
+                int eMin = static_cast<int>(segs[i].endSec) / 60;
+                int eSec = static_cast<int>(segs[i].endSec) % 60;
+                int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
+                const char* fmt = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
+                ImGui::BulletText("[%d] %02d:%02d.%03d - %02d:%02d.%03d  (%s)",
+                                  i + 1, sMin, sSec, sMs, eMin, eSec, eMs, fmt);
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ImGui::Button("Export", ImVec2(120, 0))) {
+                m_pendingExport.segments = m_segments.GetSegments();
+                m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
+                m_exporter.Start(m_currentFilePath, m_pendingExport);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (progress.running) {
+            // --- Progress display ---
+            int cur = progress.currentSegment;
+            int total = progress.totalSegments;
+            ImGui::Text("Exporting segment %d of %d...", cur, total);
+            ImGui::ProgressBar(progress.fraction, ImVec2(400, 0));
+
+            if (ImGui::Button("Cancel Export", ImVec2(120, 0))) {
+                m_exporter.Cancel();
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (progress.finished) {
+            // --- Done ---
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Export complete!");
+            if (ImGui::Button("Close", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+        } else if (progress.error) {
+            // --- Error ---
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Export failed:");
+            ImGui::TextWrapped("%s", progress.GetError().c_str());
+            if (ImGui::Button("Close", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+
+        ImGui::EndPopup();
+    }
 
     m_ui.EndFrame();
 

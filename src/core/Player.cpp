@@ -52,6 +52,16 @@ bool Player::Open(const std::string& path) {
     m_clock.SetTime(0.0);
     m_clock.SetPaused(true);
 
+    // Start seek thread
+    m_stopSeekThread = false;
+    m_seekRequest = -1.0;
+    m_seekDone = false;
+    m_seekShouldResume = false;
+    m_seekBusy = false;
+    m_wantsToPlay = false;
+    m_seekThreadRunning = true;
+    m_seekThread = std::thread(&Player::SeekThread, this);
+
     // Decode first frame synchronously so we have something to show
     SyncDecodeNextFrame();
 
@@ -59,6 +69,14 @@ bool Player::Open(const std::string& path) {
 }
 
 void Player::Close() {
+    // Stop seek thread
+    if (m_seekThreadRunning) {
+        m_stopSeekThread = true;
+        m_seekCv.notify_one();
+        if (m_seekThread.joinable()) m_seekThread.join();
+        m_seekThreadRunning = false;
+    }
+
     StopThreads();
     m_frameCache.Clear();
     CloseResampler();
@@ -127,6 +145,7 @@ void Player::Pause() {
     TRACE_EVENT("Player::Pause");
     bool wasPlaying = m_playing.load(std::memory_order_relaxed);
     m_playing = false;
+    m_wantsToPlay = false;
     m_waitingForResumeFrame = false;
     m_clock.SetPaused(true);
     if (m_hasAudio) m_audioOutput.Pause();
@@ -144,19 +163,119 @@ void Player::TogglePlayPause() {
     else Play();
 }
 
-void Player::SeekTo(double seconds) {
+void Player::SeekTo(double seconds, bool resumeAfter) {
     TRACE_EVENT("Player::SeekTo");
     if (!m_hasMedia) return;
     double duration = m_demuxer.GetDuration();
     seconds = std::clamp(seconds, 0.0, duration);
 
-    bool wasPlaying = m_playing.load(std::memory_order_relaxed);
-    if (wasPlaying) Pause();
+    // Track intent: if we were playing (or already want to play), remember it.
+    if (m_playing.load(std::memory_order_relaxed) || resumeAfter)
+        m_wantsToPlay = true;
 
-    EnsureThreadsStopped();
-    SyncSeekAndDecode(seconds);
+    // Signal that we want to stop playing (the seek thread handles
+    // actually stopping/starting threads to avoid races).
+    m_playing = false;
+    m_waitingForResumeFrame = false;
+    m_clock.SetPaused(true);
+    if (m_hasAudio) m_audioOutput.Pause();
 
-    if (wasPlaying) Play();
+    // Clear stale completion — a new seek supersedes any previous result.
+    m_seekDone = false;
+
+    // Post seek request to background thread (non-blocking)
+    {
+        std::lock_guard<std::mutex> lock(m_seekMutex);
+        m_seekRequest = seconds;
+    }
+    m_seekCv.notify_one();
+}
+
+void Player::SeekThread() {
+    SetCurrentThreadName(L"ScrubCut Seek");
+
+    while (!m_stopSeekThread) {
+        double target;
+        {
+            std::unique_lock<std::mutex> lock(m_seekMutex);
+            m_seekCv.wait(lock, [&] {
+                return m_seekRequest >= 0.0 || m_stopSeekThread;
+            });
+            if (m_stopSeekThread) break;
+            target = m_seekRequest;
+            m_seekRequest = -1.0;
+        }
+
+        m_seekBusy = true;
+
+        // Drain any further seek requests that arrived while we were waking up
+        // (take the latest one — skip intermediate positions)
+        {
+            std::lock_guard<std::mutex> lock(m_seekMutex);
+            if (m_seekRequest >= 0.0) {
+                target = m_seekRequest;
+                m_seekRequest = -1.0;
+            }
+        }
+
+        bool threadsWereRunning = m_threadsRunning;
+        EnsureThreadsStopped();
+
+        if (threadsWereRunning) {
+            // Threads were mid-decode — flush to clear corrupt decoder state
+            m_videoDecoder.Flush();
+            if (m_hasAudio) m_audioDecoder.Flush();
+            m_videoPacketQueue.Flush();
+            m_audioPacketQueue.Flush();
+            m_videoFrameQueue.Flush();
+            m_decoderDirty = true;
+        }
+
+        // Try fast forward decode if decoder state is intact
+        double currentSec = m_clock.GetTime();
+        double delta = target - currentSec;
+        bool decoded = false;
+        if (!m_decoderDirty && delta > 0.0 && delta < 2.0) {
+            decoded = SyncDecodeForwardTo(target);
+        }
+        if (!decoded) {
+            SyncSeekAndDecode(target);
+        }
+
+        // Check if a newer seek request arrived while we were decoding
+        {
+            std::lock_guard<std::mutex> lock(m_seekMutex);
+            if (m_seekRequest >= 0.0) {
+                m_seekBusy = false;
+                continue; // process the newer request instead of resuming
+            }
+        }
+
+        bool shouldResume = m_wantsToPlay.load(std::memory_order_relaxed);
+
+        // Populate cache for backward stepping (safe here — no other thread
+        // touches the decoder while seek thread is busy and threads are stopped)
+        if (!shouldResume) {
+            PopulateCacheAroundCurrent();
+        }
+
+        // Signal main thread to resume playback if needed.
+        // Never call Play() from this thread — it would race with SeekTo().
+        m_seekShouldResume = shouldResume;
+        m_seekDone = true;
+        m_seekBusy = false;
+    }
+}
+
+void Player::PollSeekComplete() {
+    if (!m_seekDone.load(std::memory_order_acquire)) return;
+    m_seekDone = false;
+
+    if (m_seekShouldResume.load(std::memory_order_relaxed)) {
+        m_seekShouldResume = false;
+        m_wantsToPlay = false;
+        Play();
+    }
 }
 
 void Player::SeekRelative(double deltaSec) {
@@ -167,6 +286,8 @@ void Player::SeekRelative(double deltaSec) {
 void Player::StepFrame(int direction) {
     TRACE_EVENT("Player::StepFrame");
     if (!m_hasMedia) return;
+
+    WaitForSeek();
 
     bool wasPlaying = m_playing.load(std::memory_order_relaxed);
     if (wasPlaying) Pause();
@@ -411,14 +532,6 @@ bool Player::SyncSeekAndDecode(double targetSec) {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
-            // Cache every intermediate frame for future backward stepping
-            const uint8_t* rgba = m_frameConverter.Convert(frame);
-            if (rgba) {
-                m_frameCache.Put(frame->pts, rgba,
-                                 m_frameConverter.GetWidth(),
-                                 m_frameConverter.GetHeight());
-            }
-
             if (!bestFrame) {
                 bestFrame = av_frame_alloc();
             } else {
@@ -441,13 +554,15 @@ done:
         m_clock.SetTime(frameSec);
         m_lastDisplayedPts = bestFrame->pts;
 
-        // The final frame is already in the cache from the loop above.
-        // Set cached frame from the cache entry to avoid double-convert.
-        const auto* entry = m_frameCache.FindExact(bestFrame->pts);
-        if (entry) {
-            m_cachedFrame = entry->rgba.data();
-            m_cachedWidth = entry->width;
-            m_cachedHeight = entry->height;
+        // Only convert the final target frame to RGBA (skip intermediates for speed)
+        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
+        if (rgba) {
+            m_frameCache.Put(bestFrame->pts, rgba,
+                             m_frameConverter.GetWidth(),
+                             m_frameConverter.GetHeight());
+            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
+            m_cachedWidth = m_frameConverter.GetWidth();
+            m_cachedHeight = m_frameConverter.GetHeight();
             m_hasCachedFrame = true;
         }
 
@@ -457,6 +572,139 @@ done:
 
     m_clock.SetTime(targetSec);
     return false;
+}
+
+bool Player::SyncDecodeForwardTo(double targetSec) {
+    TRACE_EVENT("SyncDecodeForwardTo");
+    AVRational tb = m_demuxer.GetVideoTimeBase();
+    int64_t targetPts = static_cast<int64_t>(targetSec / av_q2d(tb));
+
+    if (m_lastDisplayedPts != AV_NOPTS_VALUE && targetPts <= m_lastDisplayedPts) {
+        return false; // target is behind us, can't decode forward
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* bestFrame = nullptr;
+    int maxPackets = 200;
+
+    while (maxPackets-- > 0) {
+        int ret = m_demuxer.ReadPacket(pkt);
+        if (ret == AVERROR_EOF || ret < 0) break;
+
+        if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        ret = m_videoDecoder.SendPacket(pkt);
+        av_packet_unref(pkt);
+        if (ret < 0) continue;
+
+        while (true) {
+            ret = m_videoDecoder.ReceiveFrame(frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) break;
+
+            if (!bestFrame)
+                bestFrame = av_frame_alloc();
+            else
+                av_frame_unref(bestFrame);
+            av_frame_move_ref(bestFrame, frame);
+
+            if (bestFrame->pts >= targetPts)
+                goto fwdDone;
+        }
+    }
+
+fwdDone:
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    if (bestFrame && bestFrame->pts > m_lastDisplayedPts) {
+        double frameSec = static_cast<double>(bestFrame->pts) * av_q2d(tb);
+        m_clock.SetTime(frameSec);
+        m_lastDisplayedPts = bestFrame->pts;
+
+        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
+        if (rgba) {
+            m_frameCache.Put(bestFrame->pts, rgba,
+                             m_frameConverter.GetWidth(),
+                             m_frameConverter.GetHeight());
+            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
+            m_cachedWidth = m_frameConverter.GetWidth();
+            m_cachedHeight = m_frameConverter.GetHeight();
+            m_hasCachedFrame = true;
+        }
+
+        av_frame_free(&bestFrame);
+        return m_hasCachedFrame;
+    }
+
+    if (bestFrame) av_frame_free(&bestFrame);
+    return false;
+}
+
+void Player::PopulateCacheAroundCurrent() {
+    TRACE_EVENT("PopulateCacheAroundCurrent");
+    if (!m_hasMedia) return;
+    if (m_playing) return; // only when paused
+
+    AVRational tb = m_demuxer.GetVideoTimeBase();
+    double currentSec = m_clock.GetTime();
+    int64_t currentPts = m_lastDisplayedPts;
+
+    // Seek to keyframe before current position
+    m_videoDecoder.Flush();
+    m_demuxer.Seek(currentSec);
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    int maxPackets = 500;
+
+    while (maxPackets-- > 0) {
+        int ret = m_demuxer.ReadPacket(pkt);
+        if (ret == AVERROR_EOF || ret < 0) break;
+
+        if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        m_videoDecoder.SendPacket(pkt);
+        av_packet_unref(pkt);
+
+        while (true) {
+            ret = m_videoDecoder.ReceiveFrame(frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) break;
+
+            // Past current position — done
+            if (frame->pts > currentPts) {
+                av_frame_unref(frame);
+                goto cacheDone;
+            }
+
+            // Only convert if not already cached
+            if (!m_frameCache.FindExact(frame->pts)) {
+                const uint8_t* rgba = m_frameConverter.Convert(frame);
+                if (rgba) {
+                    m_frameCache.Put(frame->pts, rgba,
+                                     m_frameConverter.GetWidth(),
+                                     m_frameConverter.GetHeight());
+                }
+            }
+            av_frame_unref(frame);
+        }
+    }
+
+cacheDone:
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    // Demuxer/decoder position is uncertain after cache population.
+    // Mark dirty so the next step operation will re-seek properly.
+    m_decoderDirty = true;
 }
 
 // --- TryGetVideoFrame (used during playback) ---
@@ -542,9 +790,16 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
     m_lastDisplayedPts = bestFrame->pts;
 
     const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
-    av_frame_free(&bestFrame);
+    if (!rgba) {
+        av_frame_free(&bestFrame);
+        return false;
+    }
 
-    if (!rgba) return false;
+    // Cache the frame for backward stepping
+    m_frameCache.Put(bestFrame->pts, rgba,
+                     m_frameConverter.GetWidth(),
+                     m_frameConverter.GetHeight());
+    av_frame_free(&bestFrame);
 
     *outRGBA = rgba;
     *outWidth = m_frameConverter.GetWidth();
@@ -557,6 +812,15 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 void Player::EnsureThreadsStopped() {
     if (m_threadsRunning) {
         StopThreads();
+    }
+}
+
+void Player::WaitForSeek() {
+    // Spin-wait for the seek thread to finish its current operation.
+    // This is only called for operations that need decoder consistency
+    // (StepFrame, PopulateCacheAroundCurrent).
+    while (m_seekBusy.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

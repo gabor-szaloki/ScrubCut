@@ -12,6 +12,8 @@
 
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <string>
 
 class Player {
@@ -29,14 +31,23 @@ public:
     void Pause();
     void TogglePlayPause();
 
-    void SeekTo(double seconds);
+    void SeekTo(double seconds, bool resumeAfter = false);
     void SeekRelative(double deltaSec);
     void StepFrame(int direction); // +1 forward, -1 backward
+
+    // Populate frame cache around the current position (for backward stepping).
+    // Called after a seek drag is released. Runs synchronously but only does
+    // RGBA conversion of frames not already in cache.
+    void PopulateCacheAroundCurrent();
 
     // Called from the main thread each render frame.
     bool TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHeight);
 
+    // Called from the main thread each frame. Handles post-seek resume.
+    void PollSeekComplete();
+
     bool IsPlaying() const { return m_playing.load(std::memory_order_relaxed); }
+    bool IsSeekBusy() const { return m_seekBusy.load(std::memory_order_relaxed); }
     bool HasMedia() const { return m_hasMedia; }
     bool HasAudio() const { return m_hasAudio; }
     bool IsEOF() const { return m_eof.load(std::memory_order_relaxed); }
@@ -61,6 +72,9 @@ private:
     // Ensure threads are stopped (for paused operations). No-op if already stopped.
     void EnsureThreadsStopped();
 
+    // Wait for any pending async seek to complete.
+    void WaitForSeek();
+
     // Synchronously decode the next video frame from the current demuxer/decoder state.
     // No seek, no flush. Returns true if a frame was decoded and cached.
     bool SyncDecodeNextFrame();
@@ -68,6 +82,26 @@ private:
     // Seek to targetSec, then synchronously decode forward to the target frame.
     // Flushes decoder. Threads must be stopped.
     bool SyncSeekAndDecode(double targetSec);
+
+    // Decode forward from current position to targetSec without re-seeking.
+    // Returns false if it can't reach the target (e.g. crossed a keyframe boundary).
+    bool SyncDecodeForwardTo(double targetSec);
+
+    // Background seek thread
+    void SeekThread();
+    std::thread m_seekThread;
+    std::mutex m_seekMutex;
+    std::condition_variable m_seekCv;
+    double m_seekRequest = -1.0;          // pending seek target, -1 = none
+    std::atomic<bool> m_seekBusy{false};   // seek thread is working
+    std::atomic<bool> m_seekDone{false};   // seek completed, main thread should check
+    std::atomic<bool> m_seekShouldResume{false}; // main thread should call Play()
+    std::atomic<bool> m_stopSeekThread{false};
+    bool m_seekThreadRunning = false;
+
+    // Sticky flag: true when the user intends playback to continue after seeking.
+    // Set by SeekTo when playback was active, cleared only when Play() is called.
+    std::atomic<bool> m_wantsToPlay{false};
 
     Demuxer m_demuxer;
     VideoDecoder m_videoDecoder;
@@ -87,7 +121,7 @@ private:
     std::atomic<bool> m_playing{false};
     std::atomic<bool> m_stopThreads{false};
     std::atomic<bool> m_eof{false};
-    bool m_threadsRunning = false;
+    std::atomic<bool> m_threadsRunning{false};
     bool m_hasMedia = false;
     bool m_hasAudio = false;
 

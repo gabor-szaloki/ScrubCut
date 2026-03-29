@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "ScrubCut Debug",
+            "name": "Build and Run ScrubCut Debug",
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/Debug/ScrubCut.exe",
@@ -11,10 +11,21 @@
             "cwd": "${workspaceFolder}",
             "environment": [],
             "console": "integratedTerminal",
-            //"preLaunchTask": "Build Debug"
+            "preLaunchTask": "Build Debug",
         },
         {
-            "name": "ScrubCut Release",
+            "name": "Run ScrubCut Debug",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/ScrubCut.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+        },
+        {
+            "name": "Build and Run ScrubCut Release",
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/Release/ScrubCut.exe",
@@ -23,10 +34,21 @@
             "cwd": "${workspaceFolder}",
             "environment": [],
             "console": "integratedTerminal",
-            //"preLaunchTask": "Build Release"
+            "preLaunchTask": "Build Release",
         },
         {
-            "name": "ScrubCut Release -trace",
+            "name": "Run ScrubCut Release",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/ScrubCut.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+        },
+        {
+            "name": "Run ScrubCut Release -trace",
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/Release/ScrubCut.exe",
@@ -35,7 +57,6 @@
             "cwd": "${workspaceFolder}",
             "environment": [],
             "console": "integratedTerminal",
-            //"preLaunchTask": "Build Release"
-        }
+        },
     ]
 }
