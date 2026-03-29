@@ -1,0 +1,38 @@
+cmake_minimum_required(VERSION 3.21)
+project(ScrubCut VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- Dependencies via vcpkg ---
+find_package(SDL3 CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
+find_package(OpenGL REQUIRED)
+
+# FFmpeg - vcpkg provides config-mode find modules
+find_package(FFMPEG REQUIRED)
+
+# --- Sources ---
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
+    src/*.cpp
+)
+
+add_executable(ScrubCut ${SOURCES})
+
+target_include_directories(ScrubCut PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${FFMPEG_INCLUDE_DIRS}
+)
+
+target_link_libraries(ScrubCut PRIVATE
+    SDL3::SDL3
+    imgui::imgui
+    OpenGL::GL
+    ${FFMPEG_LIBRARIES}
+)
+
+# Link ws2_32 and friends on Windows (needed by FFmpeg)
+if(WIN32)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids)
+endif()
