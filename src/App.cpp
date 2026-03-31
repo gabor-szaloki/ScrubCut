@@ -232,6 +232,10 @@ void App::ProcessEvents() {
                     m_pendingExport = ExportSettings{};
                 }
                 break;
+            case SDLK_SLASH:
+                // ? key (slash + shift)
+                if (shift) m_showHelpPanel = !m_showHelpPanel;
+                break;
             }
         }
     }
@@ -247,7 +251,7 @@ void App::Render() {
     // Keep seek target in sync with player when not actively seeking
     // and no async seek is in progress. This prevents the playhead from
     // snapping back to an old position while the seek thread is still working.
-    if (!m_isSeeking && !m_isTimelineSeeking && !m_player.IsSeekBusy() && m_player.HasMedia()) {
+    if (!m_isTimelineSeeking && !m_player.IsSeekBusy() && m_player.HasMedia()) {
         m_seekTarget = m_player.GetPlaybackTime();
     }
 
@@ -272,6 +276,12 @@ void App::Render() {
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", "Alt+F4")) {
                 m_running = false;
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Help", "?")) {
+                m_showHelpPanel = !m_showHelpPanel;
             }
             ImGui::EndMenu();
         }
@@ -301,13 +311,34 @@ void App::Render() {
     }
     ImGui::End();
 
-    // Controls panel
-    ImGui::Begin("Controls");
+    // Timeline panel (unified controls + timeline bar)
+    ImGui::Begin("Timeline");
     if (m_player.HasMedia()) {
         double currentTime = m_seekTarget;
         double duration = m_player.GetDuration();
 
-        // --- Row 1: Transport + Seek buttons ---
+        // --- Row 1: [left: speed] [center: transport] [right: volume] ---
+        float panelWidth = ImGui::GetContentRegionAvail().x;
+
+        // Left: speed controls
+        static const double speeds[] = { 0.25, 0.5, 1.0, 2.0, 4.0 };
+        static const char* speedLabels[] = { "0.25x", "0.5x", "1x", "2x", "4x" };
+        double curSpeed = m_player.GetSpeed();
+        for (int i = 0; i < 5; i++) {
+            if (i > 0) ImGui::SameLine();
+            bool selected = (std::abs(curSpeed - speeds[i]) < 0.01);
+            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
+            if (ImGui::Button(speedLabels[i])) {
+                m_player.SetSpeed(speeds[i]);
+            }
+            if (selected) ImGui::PopStyleColor();
+        }
+
+        // Center: transport buttons
+        float transportWidth = 11 * (ImGui::CalcTextSize("<<30").x + ImGui::GetStyle().FramePadding.x * 2 + ImGui::GetStyle().ItemSpacing.x);
+        float transportStart = (panelWidth - transportWidth) * 0.5f;
+        ImGui::SameLine(transportStart > 0 ? transportStart : 0);
+
         if (ImGui::Button("|<")) { m_player.SeekTo(0.0); }
         ImGui::SameLine();
         if (ImGui::Button("<<30")) { m_player.SeekRelative(-30.0); }
@@ -332,108 +363,24 @@ void App::Render() {
         ImGui::SameLine();
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
 
-        // --- Row 2: Seek bar ---
-        float seekPos = (duration > 0.0) ? static_cast<float>(currentTime / duration) : 0.0f;
-
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##seek", &seekPos, 0.0f, 1.0f, "")) {
-            double targetTime = static_cast<double>(seekPos) * duration;
-            m_seekTarget = targetTime;
-
-            if (!m_isSeeking) {
-                m_wasPlayingBeforeSeek = m_player.IsPlaying();
-                if (m_wasPlayingBeforeSeek) m_player.Pause();
-                m_isSeeking = true;
-            }
-
-            uint64_t now = SDL_GetTicksNS();
-            if (now - m_lastSeekTime > 150000000ULL) {
-                m_player.SeekTo(m_seekTarget);
-                m_lastSeekTime = now;
-            }
-        }
-        if (m_isSeeking && !ImGui::IsItemActive()) {
-            m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeSeek);
-            m_isSeeking = false;
-        }
-
-        // --- Row 3: Time + Speed ---
-        int curMin = static_cast<int>(currentTime) / 60;
-        int curSec = static_cast<int>(currentTime) % 60;
-        int curMs  = static_cast<int>(currentTime * 1000) % 1000;
-        int durMin = static_cast<int>(duration) / 60;
-        int durSec = static_cast<int>(duration) % 60;
-
-        ImGui::Text("%02d:%02d.%03d / %02d:%02d  |  %.1f fps  |  %dx%d",
-                     curMin, curSec, curMs, durMin, durSec,
-                     m_player.GetFrameRate(),
-                     m_videoWidth, m_videoHeight);
-
+        // Right: Mute + volume slider
         if (m_player.HasAudio()) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 0.4f, 1.0f), "[Audio]");
-        }
-
-        // --- Row 4: Speed controls ---
-        ImGui::Text("Speed:");
-        ImGui::SameLine();
-        static const double speeds[] = { 0.25, 0.5, 1.0, 2.0, 4.0 };
-        static const char* speedLabels[] = { "0.25x", "0.5x", "1x", "2x", "4x" };
-        double curSpeed = m_player.GetSpeed();
-        for (int i = 0; i < 5; i++) {
-            ImGui::SameLine();
-            bool selected = (std::abs(curSpeed - speeds[i]) < 0.01);
-            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
-            if (ImGui::Button(speedLabels[i])) {
-                m_player.SetSpeed(speeds[i]);
+            float volumeAreaWidth = 140.0f;
+            ImGui::SameLine(panelWidth - volumeAreaWidth);
+            bool muted = m_player.IsMuted();
+            if (ImGui::Button(muted ? "Unmute" : "Mute")) {
+                m_player.SetMuted(!muted);
             }
-            if (selected) ImGui::PopStyleColor();
-        }
-
-        // --- Row 5: Keyboard shortcuts ---
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-            "Space: Play/Pause | Arrows: +/-5s | Ctrl+Arrows: +/-1s | Shift+Arrows: +/-30s");
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-            "Alt+Arrows or ,/.: Frame step | +/-: Speed | Home/End: Start/End");
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
-            "I: Mark In | O: Mark Out | Delete: Remove last segment | Ctrl+E: Export");
-    } else {
-        ImGui::Text("No video loaded. Drag and drop a video file.");
-    }
-    ImGui::End();
-
-    // Timeline panel
-    ImGui::Begin("Timeline");
-    if (m_player.HasMedia()) {
-        double duration = m_player.GetDuration();
-        double displayTime = m_seekTarget;
-
-        // --- Mark buttons ---
-        if (ImGui::Button("Mark In [I]")) {
-            m_segments.SetMarkIn(displayTime);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Mark Out [O]")) {
-            m_segments.SetMarkOut(displayTime);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear Marks")) {
-            m_segments.ClearPendingMark();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear All")) {
-            m_segments.Clear();
-        }
-        if (m_segments.HasPendingMarkIn()) {
-            double markIn = m_segments.GetPendingMarkIn();
-            int mMin = static_cast<int>(markIn) / 60;
-            int mSec = static_cast<int>(markIn) % 60;
-            int mMs  = static_cast<int>(markIn * 1000) % 1000;
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "  Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
+            float volPct = m_player.GetVolume() * 100.0f;
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::SliderFloat("##vol", &volPct, 0.0f, 100.0f, "%.0f%%")) {
+                m_player.SetVolume(volPct / 100.0f);
+                if (volPct > 0.0f && m_player.IsMuted()) m_player.SetMuted(false);
+            }
         }
 
-        // --- Timeline bar ---
+        // --- Row 2: Timeline bar ---
         ImVec2 barPos = ImGui::GetCursorScreenPos();
         float barWidth = ImGui::GetContentRegionAvail().x;
         float barHeight = 32.0f;
@@ -470,7 +417,7 @@ void App::Render() {
 
         // Playhead (follows mouse immediately during any seek)
         if (duration > 0.0) {
-            float px = barPos.x + static_cast<float>(displayTime / duration) * barWidth;
+            float px = barPos.x + static_cast<float>(currentTime / duration) * barWidth;
             drawList->AddLine(ImVec2(px, barPos.y), ImVec2(px, barPos.y + barHeight),
                               IM_COL32(255, 255, 255, 220), 2.0f);
         }
@@ -570,12 +517,84 @@ void App::Render() {
             m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
             m_isTimelineSeeking = false;
         }
+
+        // --- Row 3: [left: time] [right: resolution | fps] ---
+        // Advance cursor past the timeline bar
+        ImGui::SetCursorScreenPos(ImVec2(barPos.x, barPos.y + barHeight + 2.0f));
+        ImGui::Dummy(ImVec2(0, 0)); // reset ImGui cursor tracking
+
+        int curMin2 = static_cast<int>(currentTime) / 60;
+        int curSec2 = static_cast<int>(currentTime) % 60;
+        int curMs2  = static_cast<int>(currentTime * 1000) % 1000;
+        int durMin2 = static_cast<int>(duration) / 60;
+        int durSec2 = static_cast<int>(duration) % 60;
+        ImGui::Text("%02d:%02d.%03d / %02d:%02d", curMin2, curSec2, curMs2, durMin2, durSec2);
+
+        // Format file size
+        int64_t fileSize = m_player.GetFileSize();
+        char sizeBuf[32];
+        if (fileSize >= 1024LL * 1024 * 1024)
+            snprintf(sizeBuf, sizeof(sizeBuf), "%.1f GB", fileSize / (1024.0 * 1024.0 * 1024.0));
+        else if (fileSize >= 1024LL * 1024)
+            snprintf(sizeBuf, sizeof(sizeBuf), "%.1f MB", fileSize / (1024.0 * 1024.0));
+        else
+            snprintf(sizeBuf, sizeof(sizeBuf), "%lld KB", static_cast<long long>(fileSize / 1024));
+
+        // Format bitrate
+        int64_t bitrate = m_player.GetBitRate();
+        char brateBuf[32];
+        if (bitrate >= 1000000)
+            snprintf(brateBuf, sizeof(brateBuf), "%.1f Mbps", bitrate / 1000000.0);
+        else if (bitrate > 0)
+            snprintf(brateBuf, sizeof(brateBuf), "%lld kbps", static_cast<long long>(bitrate / 1000));
+        else
+            brateBuf[0] = '\0';
+
+        char infoRight[128];
+        snprintf(infoRight, sizeof(infoRight), "%dx%d  |  %.1f fps  |  %s  |  %s  |  %s",
+                 m_videoWidth, m_videoHeight, m_player.GetFrameRate(),
+                 m_player.GetVideoCodecName(), brateBuf, sizeBuf);
+        float infoRightWidth = ImGui::CalcTextSize(infoRight).x;
+        ImGui::SameLine(panelWidth - infoRightWidth);
+        ImGui::Text("%s", infoRight);
+    } else {
+        ImGui::Text("No video loaded. Drag and drop a video file.");
     }
     ImGui::End();
 
-    // Segments panel (separate from timeline)
+    // Segments panel
     ImGui::Begin("Segments");
-    if (m_player.HasMedia() && m_segments.GetCount() > 0) {
+    if (m_player.HasMedia()) {
+        double displayTime = m_seekTarget;
+
+        // --- Mark buttons ---
+        if (ImGui::Button("Mark In")) {
+            m_segments.SetMarkIn(displayTime);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Mark Out")) {
+            m_segments.SetMarkOut(displayTime);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear Marks")) {
+            m_segments.ClearPendingMark();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear All")) {
+            m_segments.Clear();
+        }
+        if (m_segments.HasPendingMarkIn()) {
+            double markIn = m_segments.GetPendingMarkIn();
+            int mMin = static_cast<int>(markIn) / 60;
+            int mSec = static_cast<int>(markIn) % 60;
+            int mMs  = static_cast<int>(markIn * 1000) % 1000;
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "  Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
+        }
+
+        ImGui::Separator();
+
+    if (m_segments.GetCount() > 0) {
         const auto& segs = m_segments.GetSegments();
         int removeIdx = -1;
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
@@ -622,10 +641,41 @@ void App::Render() {
         if (removeIdx >= 0) {
             m_segments.RemoveSegment(removeIdx);
         }
-    } else if (m_player.HasMedia()) {
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Press I to mark in, O to mark out");
     }
+    } // end if (m_player.HasMedia())
     ImGui::End();
+
+    // Help panel (toggled with ?)
+    if (m_showHelpPanel) {
+        ImGui::Begin("Help", &m_showHelpPanel);
+        if (ImGui::BeginTable("##shortcuts", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableHeadersRow();
+
+            auto row = [](const char* action, const char* hotkey) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::Text("%s", action);
+                ImGui::TableNextColumn(); ImGui::Text("%s", hotkey);
+            };
+
+            row("Play / Pause",         "Space");
+            row("Seek +/- 1s",          "Ctrl + Left / Right");
+            row("Seek +/- 5s",          "Left / Right");
+            row("Seek +/- 30s",         "Shift + Left / Right");
+            row("Frame step",           "Alt + Left / Right  or  , / .");
+            row("Speed up / down",      "+ / -");
+            row("Jump to start / end",  "Home / End");
+            row("Mark In",              "I");
+            row("Mark Out",             "O");
+            row("Remove last segment",  "Delete");
+            row("Export segments",      "Ctrl + E");
+            row("Toggle help",          "?");
+
+            ImGui::EndTable();
+        }
+        ImGui::End();
+    }
 
     // Export dialog
     if (m_showExportDialog) {

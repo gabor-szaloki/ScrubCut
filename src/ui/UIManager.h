@@ -12,4 +12,5 @@ public:
 
 private:
     void SetupDockspace();
+    bool m_layoutInitialized = false;
 };

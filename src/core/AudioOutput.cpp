@@ -67,6 +67,12 @@ void AudioOutput::SetSpeed(float speed) {
         SDL_SetAudioStreamFrequencyRatio(m_stream, speed);
 }
 
+void AudioOutput::SetVolume(float volume) {
+    m_volume = volume;
+    if (m_stream)
+        SDL_SetAudioStreamGain(m_stream, volume);
+}
+
 double AudioOutput::GetPlaybackPosition() const {
     std::lock_guard<std::mutex> lock(m_mutex);
 

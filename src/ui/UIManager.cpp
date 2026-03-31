@@ -1,6 +1,7 @@
 #include "ui/UIManager.h"
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
 
@@ -65,6 +66,32 @@ void UIManager::SetupDockspace() {
     ImGui::PopStyleVar(3);
 
     ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
+
+    // Build default layout on first run (no saved layout yet)
+    if (!m_layoutInitialized) {
+        m_layoutInitialized = true;
+
+        if (ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
+            ImGui::DockBuilderRemoveNode(dockspaceId);
+            ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+            ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
+
+            // Split: top ~84% / bottom ~16% (compact timeline)
+            ImGuiID topId, bottomId;
+            ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Down, 0.16f, &bottomId, &topId);
+
+            // Split top: left 75% (viewport) / right 25% (segments)
+            ImGuiID viewportId, segmentsId;
+            ImGui::DockBuilderSplitNode(topId, ImGuiDir_Right, 0.25f, &segmentsId, &viewportId);
+
+            ImGui::DockBuilderDockWindow("Viewport", viewportId);
+            ImGui::DockBuilderDockWindow("Segments", segmentsId);
+            ImGui::DockBuilderDockWindow("Timeline", bottomId);
+
+            ImGui::DockBuilderFinish(dockspaceId);
+        }
+    }
+
     ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_PassthruCentralNode);
 
     ImGui::End();

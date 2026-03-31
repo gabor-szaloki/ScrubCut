@@ -422,11 +422,41 @@ double Player::GetFrameDuration() const {
     return (fps > 0) ? 1.0 / fps : 1.0 / 30.0;
 }
 
+const char* Player::GetVideoCodecName() const {
+    AVCodecParameters* params = m_demuxer.GetVideoCodecParams();
+    if (!params) return "unknown";
+    const AVCodecDescriptor* desc = avcodec_descriptor_get(params->codec_id);
+    return desc ? desc->name : "unknown";
+}
+
+int64_t Player::GetBitRate() const {
+    AVFormatContext* fmt = m_demuxer.GetFormatContext();
+    return fmt ? fmt->bit_rate : 0;
+}
+
+int64_t Player::GetFileSize() const {
+    AVFormatContext* fmt = m_demuxer.GetFormatContext();
+    if (!fmt || !fmt->pb) return 0;
+    return avio_size(fmt->pb);
+}
+
 void Player::SetSpeed(double speed) {
     m_clock.SetSpeed(speed);
     if (m_hasAudio) {
         m_audioOutput.SetSpeed(static_cast<float>(speed));
     }
+}
+
+void Player::SetVolume(float volume) {
+    m_volume = volume;
+    if (m_hasAudio && !m_muted)
+        m_audioOutput.SetVolume(volume);
+}
+
+void Player::SetMuted(bool muted) {
+    m_muted = muted;
+    if (m_hasAudio)
+        m_audioOutput.SetVolume(muted ? 0.0f : m_volume);
 }
 
 // --- Synchronous decode (used when paused) ---

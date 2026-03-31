@@ -33,8 +33,9 @@ private:
     SegmentManager m_segments;
     Exporter m_exporter;
 
-    // Export dialog state
+    // UI state
     bool m_showExportDialog = false;
+    bool m_showHelpPanel = false;
     ExportSettings m_pendingExport;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";
@@ -45,13 +46,9 @@ private:
     int m_videoWidth = 0;
     int m_videoHeight = 0;
 
-    // Seek slider state (controls panel + timeline bar)
-    bool m_isSeeking = false;
-    bool m_wasPlayingBeforeSeek = false;
+    // Seek/scrub state
     double m_seekTarget = 0.0;
     uint64_t m_lastSeekTime = 0;
-
-    // Timeline bar scrubbing state
     bool m_isTimelineSeeking = false;
     bool m_wasPlayingBeforeTimelineSeek = false;
 };

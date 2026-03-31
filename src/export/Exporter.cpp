@@ -92,11 +92,7 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, int segmentIn
     std::string dir = base.parent_path().string();
 
     char suffix[32];
-    if (totalSegments > 1) {
-        snprintf(suffix, sizeof(suffix), "_%03d", segmentIndex + 1);
-    } else {
-        suffix[0] = '\0';
-    }
+    snprintf(suffix, sizeof(suffix), "_%03d", segmentIndex + 1);
 
     std::filesystem::path result = std::filesystem::path(dir) / (stem + suffix + extension);
     return result.string();

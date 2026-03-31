@@ -57,9 +57,17 @@ public:
     double GetFrameDuration() const;
     int GetVideoWidth() const { return m_videoDecoder.GetWidth(); }
     int GetVideoHeight() const { return m_videoDecoder.GetHeight(); }
+    const char* GetVideoCodecName() const;
+    int64_t GetBitRate() const;
+    int64_t GetFileSize() const;
 
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
+
+    void SetVolume(float volume);
+    float GetVolume() const { return m_volume; }
+    void SetMuted(bool muted);
+    bool IsMuted() const { return m_muted; }
 
 private:
     void DemuxThread();
@@ -144,6 +152,10 @@ private:
     // threads arrives at or after m_resumeTime. Prevents fast-forward on Play.
     bool m_waitingForResumeFrame = false;
     double m_resumeTime = 0.0;
+
+    // Volume
+    float m_volume = 1.0f;
+    bool m_muted = false;
 
     // Resampler for audio
     SwrContext* m_swrCtx = nullptr;

@@ -30,6 +30,8 @@ public:
     void ResetPosition(double startTime);
 
     void SetSpeed(float speed);
+    void SetVolume(float volume); // 0.0 to 1.0
+    float GetVolume() const { return m_volume; }
 
     int GetSampleRate() const { return m_sampleRate; }
     int GetChannels() const { return m_channels; }
@@ -43,4 +45,5 @@ private:
     mutable std::mutex m_mutex;
     int64_t m_totalBytesWritten = 0;
     double m_positionOffset = 0.0;
+    float m_volume = 1.0f;
 };
