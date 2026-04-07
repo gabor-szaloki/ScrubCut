@@ -2,23 +2,32 @@
   "version": 3,
   "configurePresets": [
     {
-      "name": "default",
-      "binaryDir": "${sourceDir}/build",
+      "name": "debug",
+      "binaryDir": "${sourceDir}/build/debug",
       "cacheVariables": {
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "CMAKE_BUILD_TYPE": "Release"
       }
     }
   ],
   "buildPresets": [
     {
-      "name": "release",
-      "configurePreset": "default",
-      "configuration": "Release"
+      "name": "debug",
+      "configurePreset": "debug",
+      "configuration": "Debug"
     },
     {
-      "name": "debug",
-      "configurePreset": "default",
-      "configuration": "Debug"
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release"
     }
   ]
 }

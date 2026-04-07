@@ -567,7 +567,7 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     }
 
     // Flush filter graph
-    av_buffersrc_add_frame(bufSrcCtx, nullptr);
+    if (av_buffersrc_add_frame(bufSrcCtx, nullptr) < 0) goto gif_cleanup;
     if (!encodeFilteredFrames()) goto gif_cleanup;
 
     // Flush encoder

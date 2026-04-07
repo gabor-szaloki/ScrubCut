@@ -2,9 +2,16 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "CMake Configure",
+            "label": "CMake Configure Debug",
             "type": "shell",
-            "command": "cmake --preset default",
+            "command": "cmake --preset debug",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake Configure Release",
+            "type": "shell",
+            "command": "cmake --preset release",
             "group": "build",
             "problemMatcher": []
         },

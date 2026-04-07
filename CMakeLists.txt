@@ -4,6 +4,11 @@ project(ScrubCut VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Put binaries in a consistent location regardless of generator (single- or multi-config)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin)
+
 # --- Dependencies via vcpkg ---
 find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)

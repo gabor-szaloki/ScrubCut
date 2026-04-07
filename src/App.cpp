@@ -22,8 +22,13 @@ bool App::Init() {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
+    const char* windowTitle = "ScrubCut";
+#ifndef NDEBUG
+    windowTitle = "ScrubCut - Debug";
+#endif
+
     m_window = SDL_CreateWindow(
-        "ScrubCut",
+        windowTitle,
         1280, 720,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
     );
@@ -133,6 +138,9 @@ void App::OpenFile(const std::string& path) {
     CreateVideoTexture(m_videoWidth, m_videoHeight);
 
     std::string title = "ScrubCut - " + path;
+#ifndef NDEBUG
+    title += " - Debug";
+#endif
     SDL_SetWindowTitle(m_window, title.c_str());
 
     m_player.Play();

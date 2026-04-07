@@ -18,7 +18,7 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
 
     if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
         return false;
-    if (!ImGui_ImplOpenGL3_Init("#version 130"))
+    if (!ImGui_ImplOpenGL3_Init("#version 150"))
         return false;
 
     return true;
