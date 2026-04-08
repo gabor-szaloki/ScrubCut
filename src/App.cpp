@@ -8,6 +8,37 @@
 #include <cmath>
 #include <filesystem>
 
+struct PlatformKeys {
+    SDL_Keymod cmdMod;          // Cmd on Mac, Ctrl on Windows — for app commands (quit, export, open)
+    SDL_Keymod seekFineMod;     // Option on Mac, Ctrl on Windows — for 1s seeking
+    SDL_Keymod frameStepMod;    // Alt on both — for frame stepping (+ cmdMod on Mac)
+    SDL_Keymod jumpMod;         // Cmd on Mac, none on Windows (uses Home/End) — for jump to start/end
+    bool frameStepNeedsCmd;     // true on Mac (Cmd+Option), false on Windows (Alt alone)
+
+    const char* cmdName;        // "Cmd" / "Ctrl"
+    const char* seekFineName;   // "Option" / "Ctrl"
+    const char* frameStepName;  // "Cmd + Option" / "Alt"
+    const char* jumpName;       // "Cmd + Left / Right  or  Home / End" / "Home / End"
+    const char* deleteName;     // "Backspace" / "Delete"
+    const char* quitShortcut;   // "Cmd + Q" / "Alt+F4"
+};
+
+#ifdef __APPLE__
+static constexpr PlatformKeys kKeys = {
+    SDL_KMOD_GUI, SDL_KMOD_ALT, SDL_KMOD_ALT, SDL_KMOD_GUI, true,
+    "Cmd", "Option", "Cmd + Option",
+    "Cmd + Left / Right  or  Home / End",
+    "Backspace", "Cmd + Q"
+};
+#else
+static constexpr PlatformKeys kKeys = {
+    SDL_KMOD_CTRL, SDL_KMOD_CTRL, SDL_KMOD_ALT, SDL_Keymod(0), false,
+    "Ctrl", "Ctrl", "Alt",
+    "Home / End",
+    "Delete", "Alt+F4"
+};
+#endif
+
 bool App::Init() {
     LogFile::Get().Open();
 
@@ -162,25 +193,29 @@ void App::ProcessEvents() {
         }
         if (event.type == SDL_EVENT_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
             SDL_Keymod mod = SDL_GetModState();
-            bool shift = (mod & SDL_KMOD_SHIFT) != 0;
-            bool ctrl = (mod & SDL_KMOD_CTRL) != 0;
-            bool alt = (mod & SDL_KMOD_ALT) != 0;
+            bool shift     = (mod & SDL_KMOD_SHIFT)      != 0;
+            bool cmd       = (mod & kKeys.cmdMod)        != 0;
+            bool seekFine  = (mod & kKeys.seekFineMod)   != 0 && !cmd;
+            bool frameStep = (mod & kKeys.frameStepMod)  != 0 && (!kKeys.frameStepNeedsCmd || cmd);
+            bool jump      = kKeys.jumpMod && (mod & kKeys.jumpMod) != 0 && !frameStep;
 
             switch (event.key.key) {
             case SDLK_SPACE:
                 m_player.TogglePlayPause();
                 break;
             case SDLK_LEFT:
-                if (alt)        m_player.StepFrame(-1);
-                else if (shift) m_player.SeekRelative(-30.0);
-                else if (ctrl)  m_player.SeekRelative(-1.0);
-                else            m_player.SeekRelative(-5.0);
+                if (jump)           m_player.SeekTo(0.0);
+                else if (frameStep) m_player.StepFrame(-1);
+                else if (shift)     m_player.SeekRelative(-30.0);
+                else if (seekFine)  m_player.SeekRelative(-1.0);
+                else                m_player.SeekRelative(-5.0);
                 break;
             case SDLK_RIGHT:
-                if (alt)        m_player.StepFrame(+1);
-                else if (shift) m_player.SeekRelative(30.0);
-                else if (ctrl)  m_player.SeekRelative(1.0);
-                else            m_player.SeekRelative(5.0);
+                if (jump)           m_player.SeekTo(m_player.GetDuration());
+                else if (frameStep) m_player.StepFrame(+1);
+                else if (shift)     m_player.SeekRelative(30.0);
+                else if (seekFine)  m_player.SeekRelative(1.0);
+                else                m_player.SeekRelative(5.0);
                 break;
             case SDLK_COMMA:
                 m_player.StepFrame(-1);
@@ -227,11 +262,12 @@ void App::ProcessEvents() {
                     m_segments.SetMarkOut(m_player.GetPlaybackTime());
                 break;
             case SDLK_DELETE:
+            case SDLK_BACKSPACE:
                 if (m_segments.GetCount() > 0)
                     m_segments.RemoveSegment(m_segments.GetCount() - 1);
                 break;
             case SDLK_E:
-                if (ctrl && m_segments.GetCount() > 0 && !m_exporter.IsRunning()) {
+                if (cmd && m_segments.GetCount() > 0 && !m_exporter.IsRunning()) {
                     m_showExportDialog = true;
                     auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
                     auto stem = std::filesystem::path(m_currentFilePath).stem().string();
@@ -239,6 +275,9 @@ void App::ProcessEvents() {
                     snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
                     m_pendingExport = ExportSettings{};
                 }
+                break;
+            case SDLK_Q:
+                if (cmd) m_running = false;
                 break;
             case SDLK_SLASH:
                 // ? key (slash + shift)
@@ -268,10 +307,10 @@ void App::Render() {
     // Menu bar
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+            if (ImGui::MenuItem("Open...", (std::string(kKeys.cmdName) + "+O").c_str())) {
                 // TODO: file dialog
             }
-            if (ImGui::MenuItem("Export Segments...", "Ctrl+E",
+            if (ImGui::MenuItem("Export Segments...", (std::string(kKeys.cmdName) + "+E").c_str(),
                                 false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
                 m_showExportDialog = true;
                 // Pre-fill defaults
@@ -282,7 +321,7 @@ void App::Render() {
                 m_pendingExport = ExportSettings{};
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Quit", "Alt+F4")) {
+            if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {
                 m_running = false;
             }
             ImGui::EndMenu();
@@ -668,16 +707,17 @@ void App::Render() {
             };
 
             row("Play / Pause",         "Space");
-            row("Seek +/- 1s",          "Ctrl + Left / Right");
+            row("Seek +/- 1s",          (std::string(kKeys.seekFineName) + " + Left / Right").c_str());
             row("Seek +/- 5s",          "Left / Right");
             row("Seek +/- 30s",         "Shift + Left / Right");
-            row("Frame step",           "Alt + Left / Right  or  , / .");
+            row("Frame step",           (std::string(kKeys.frameStepName) + " + Left / Right  or  , / .").c_str());
             row("Speed up / down",      "+ / -");
-            row("Jump to start / end",  "Home / End");
+            row("Jump to start / end",  kKeys.jumpName);
             row("Mark In",              "I");
             row("Mark Out",             "O");
-            row("Remove last segment",  "Delete");
-            row("Export segments",      "Ctrl + E");
+            row("Remove last segment",  kKeys.deleteName);
+            row("Export segments",      (std::string(kKeys.cmdName) + " + E").c_str());
+            row("Quit",                 kKeys.quitShortcut);
             row("Toggle help",          "?");
 
             ImGui::EndTable();
