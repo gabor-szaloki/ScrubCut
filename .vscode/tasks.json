@@ -31,6 +31,16 @@
                 "isDefault": true
             },
             "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "Install Release",
+            "type": "shell",
+            "command": "cmake --build --preset release && cmake --install build/release --prefix /Applications",
+            "group": "build",
+            "problemMatcher": "$msCompile",
+            "windows": {
+                "command": "cmake --build --preset release && cmake --install build/release"
+            }
         }
     ]
 }

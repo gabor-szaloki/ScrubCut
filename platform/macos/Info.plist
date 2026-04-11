@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>ScrubCut</string>
+    <key>CFBundleDisplayName</key>
+    <string>ScrubCut</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.scrubcut.app</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>ScrubCut</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Video File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.movie</string>
+                <string>public.video</string>
+                <string>public.mpeg-4</string>
+                <string>public.avi</string>
+                <string>com.apple.quicktime-movie</string>
+                <string>org.matroska.mkv</string>
+                <string>public.mpeg</string>
+                <string>public.3gpp</string>
+                <string>com.microsoft.windows-media-wmv</string>
+                <string>public.flv</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

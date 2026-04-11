@@ -2,6 +2,7 @@
 #include "util/Log.h"
 #include "util/Trace.h"
 #include "util/CommandLine.h"
+#include "util/AppPaths.h"
 
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -84,11 +85,18 @@ bool App::Init() {
     }
 
     if (CommandLine::Get().HasFlag("-trace")) {
-        TraceFile::Get().Open("logs/scrubcut_trace.csv");
-        LOG_INFO("Tracing enabled -> logs/scrubcut_trace.csv");
+        auto tracePath = (GetAppDataDir() / "logs" / "scrubcut_trace.csv").string();
+        TraceFile::Get().Open(tracePath.c_str());
+        LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
     LOG_INFO("ScrubCut initialized");
     m_running = true;
+
+    // Open file passed on the command line (e.g. via file association on Windows)
+    std::string fileArg = CommandLine::Get().GetFileArg();
+    if (!fileArg.empty())
+        OpenFile(fileArg);
+
     return true;
 }
 

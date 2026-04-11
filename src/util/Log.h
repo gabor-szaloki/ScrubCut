@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include "util/AppPaths.h"
 
 class LogFile {
 public:
@@ -12,8 +13,9 @@ public:
 
     void Open() {
         if (m_file) return;
-        std::filesystem::create_directories("logs");
-        m_file = std::fopen("logs/scrubcut.log", "w");
+        auto logDir = GetAppDataDir() / "logs";
+        std::filesystem::create_directories(logDir);
+        m_file = std::fopen((logDir / "scrubcut.log").string().c_str(), "w");
     }
 
     void Close() {

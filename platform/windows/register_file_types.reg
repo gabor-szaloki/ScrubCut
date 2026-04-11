@@ -1,0 +1,48 @@
+Windows Registry Editor Version 5.00
+
+; ScrubCut file association registration
+; Edit the path below to match your ScrubCut install location, then double-click to import.
+
+[HKEY_CURRENT_USER\Software\Classes\ScrubCut.Video]
+@="Video File - ScrubCut"
+
+[HKEY_CURRENT_USER\Software\Classes\ScrubCut.Video\shell\open\command]
+@="\"C:\\Program Files\\ScrubCut\\ScrubCut.exe\" \"%1\""
+
+; --- File extensions ---
+
+[HKEY_CURRENT_USER\Software\Classes\.mp4\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.mkv\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.avi\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.mov\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.wmv\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.flv\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.webm\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.mpg\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.mpeg\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.3gp\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.ts\OpenWithProgids]
+"ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.m4v\OpenWithProgids]
+"ScrubCut.Video"=""

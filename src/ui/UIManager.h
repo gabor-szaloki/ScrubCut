@@ -1,6 +1,7 @@
 #pragma once
 
 #include <SDL3/SDL.h>
+#include <string>
 
 class UIManager {
 public:
@@ -13,4 +14,5 @@ public:
 private:
     void SetupDockspace();
     bool m_layoutInitialized = false;
+    std::string m_iniPath;
 };

@@ -26,6 +26,15 @@ public:
         return defaultValue;
     }
 
+    // Returns the first non-flag argument (i.e., a file path passed on the command line)
+    std::string GetFileArg() const {
+        for (size_t i = 1; i < m_args.size(); ++i) {
+            if (!m_args[i].empty() && m_args[i][0] != '-')
+                return m_args[i];
+        }
+        return "";
+    }
+
 private:
     CommandLine() = default;
     std::vector<std::string> m_args;

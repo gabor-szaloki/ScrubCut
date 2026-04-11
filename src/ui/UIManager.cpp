@@ -4,6 +4,7 @@
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
+#include "util/AppPaths.h"
 
 bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     (void)glContext;
@@ -13,6 +14,9 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    m_iniPath = (GetAppDataDir() / "imgui.ini").string();
+    io.IniFilename = m_iniPath.c_str();
 
     ImGui::StyleColorsDark();
 

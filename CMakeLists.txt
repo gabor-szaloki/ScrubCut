@@ -24,6 +24,7 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
 
 add_executable(ScrubCut ${SOURCES})
 
+
 target_include_directories(ScrubCut PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
@@ -40,4 +41,14 @@ target_link_libraries(ScrubCut PRIVATE
 # Link ws2_32 and friends on Windows (needed by FFmpeg)
 if(WIN32)
     target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids)
+endif()
+
+# --- Install ---
+if(APPLE)
+    # Package as .app bundle at install time
+    install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
+    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist" DESTINATION "ScrubCut.app/Contents")
+    install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
+elseif(WIN32)
+    install(TARGETS ScrubCut RUNTIME DESTINATION ".")
 endif()
