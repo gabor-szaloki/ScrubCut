@@ -22,7 +22,12 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
 
-add_executable(ScrubCut ${SOURCES})
+# --- App icon ---
+if(WIN32)
+    set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.rc")
+endif()
+
+add_executable(ScrubCut ${SOURCES} ${APP_ICON_RC})
 
 
 target_include_directories(ScrubCut PRIVATE
@@ -48,6 +53,7 @@ if(APPLE)
     # Package as .app bundle at install time
     install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist" DESTINATION "ScrubCut.app/Contents")
+    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
     install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
 elseif(WIN32)
     install(TARGETS ScrubCut RUNTIME DESTINATION ".")

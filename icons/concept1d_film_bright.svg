@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <clipPath id="rs">
+      <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228"/>
+    </clipPath>
+    <linearGradient id="cutGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00e5ff"/>
+      <stop offset="100%" stop-color="#00bfa5"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0%" stop-color="#1a1a26"/>
+      <stop offset="100%" stop-color="#0e0e18"/>
+    </linearGradient>
+    <linearGradient id="filmBody" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#78788e"/>
+      <stop offset="100%" stop-color="#606078"/>
+    </linearGradient>
+    <filter id="cutGlowF">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="filmShadow">
+      <feDropShadow dx="0" dy="6" stdDeviation="14" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+    <filter id="bladeShadow">
+      <feDropShadow dx="2" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#rs)">
+    <!-- Background — darker to push the film strip forward -->
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+
+    <!-- ======= FILM STRIP ======= -->
+    <g transform="translate(512, 490) rotate(-18) translate(-512, -490)" filter="url(#filmShadow)">
+
+      <!-- Film strip main body -->
+      <rect x="80" y="260" width="864" height="460" rx="16" fill="url(#filmBody)" stroke="#8e8ea6" stroke-width="4"/>
+
+      <!-- Top border stripe -->
+      <rect x="80" y="260" width="864" height="80" rx="16" fill="#6a6a82"/>
+      <rect x="80" y="324" width="864" height="16" fill="url(#filmBody)"/>
+      <!-- Bottom border stripe -->
+      <rect x="80" y="640" width="864" height="80" rx="16" fill="#6a6a82"/>
+      <rect x="80" y="640" width="864" height="16" fill="url(#filmBody)"/>
+
+      <!-- Sprocket holes — top row -->
+      <rect x="112" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="192" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="272" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="352" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="432" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="512" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="592" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="672" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="752" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="832" y="274" width="48" height="52" rx="10" fill="#0e0e18"/>
+
+      <!-- Sprocket holes — bottom row -->
+      <rect x="112" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="192" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="272" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="352" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="432" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="512" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="592" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="672" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="752" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+      <rect x="832" y="654" width="48" height="52" rx="10" fill="#0e0e18"/>
+
+      <!-- Film frames — brighter inner frames with more contrast -->
+      <rect x="108" y="356" width="190" height="268" rx="6" fill="#3a3a52" stroke="#8e8ea6" stroke-width="2"/>
+      <rect x="318" y="356" width="190" height="268" rx="6" fill="#3e3e5a" stroke="#8e8ea6" stroke-width="2"/>
+      <rect x="528" y="356" width="190" height="268" rx="6" fill="#3a3a52" stroke="#8e8ea6" stroke-width="2"/>
+      <rect x="738" y="356" width="190" height="268" rx="6" fill="#3e3e5a" stroke="#8e8ea6" stroke-width="2"/>
+
+      <!-- Content hints inside frames — brighter -->
+      <rect x="130" y="410" width="146" height="82" rx="3" fill="#4a4a66" opacity="0.7"/>
+      <rect x="130" y="508" width="90" height="10" rx="3" fill="#5a5a74" opacity="0.5"/>
+      <rect x="130" y="528" width="120" height="10" rx="3" fill="#5a5a74" opacity="0.4"/>
+
+      <rect x="340" y="410" width="146" height="82" rx="3" fill="#4a4a66" opacity="0.7"/>
+      <rect x="340" y="508" width="100" height="10" rx="3" fill="#5a5a74" opacity="0.5"/>
+      <rect x="340" y="528" width="80" height="10" rx="3" fill="#5a5a74" opacity="0.4"/>
+
+      <rect x="550" y="410" width="146" height="82" rx="3" fill="#4a4a66" opacity="0.7"/>
+      <rect x="550" y="508" width="110" height="10" rx="3" fill="#5a5a74" opacity="0.5"/>
+      <rect x="550" y="528" width="70" height="10" rx="3" fill="#5a5a74" opacity="0.4"/>
+
+      <rect x="760" y="410" width="146" height="82" rx="3" fill="#4a4a66" opacity="0.7"/>
+      <rect x="760" y="508" width="80" height="10" rx="3" fill="#5a5a74" opacity="0.5"/>
+      <rect x="760" y="528" width="130" height="10" rx="3" fill="#5a5a74" opacity="0.4"/>
+
+      <!-- Subtle top highlight on the strip for a slight 3D effect -->
+      <rect x="80" y="260" width="864" height="6" rx="3" fill="#ffffff" opacity="0.08"/>
+    </g>
+
+    <!-- ======= DIAGONAL CUT ======= -->
+    <!-- Wide glow behind the cut -->
+    <line x1="140" y1="180" x2="884" y2="844" stroke="url(#cutGlow)" stroke-width="48" opacity="0.18" stroke-linecap="round"/>
+
+    <!-- Main cut line -->
+    <line x1="140" y1="180" x2="884" y2="844" stroke="url(#cutGlow)" stroke-width="9" filter="url(#cutGlowF)" stroke-linecap="round"/>
+    <line x1="140" y1="180" x2="884" y2="844" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.9"/>
+
+    <!-- ======= RAZOR BLADE ======= -->
+    <g transform="translate(512, 512) rotate(45)" filter="url(#bladeShadow)">
+      <!-- Blade body — larger and brighter -->
+      <path d="M-170,-14 L170,-14 L198,0 L170,14 L-170,14 L-198,0 Z" fill="#d8d8e8" opacity="0.95"/>
+      <!-- Blade bevel — bright center -->
+      <path d="M-155,-4 L155,-4 L180,0 L155,4 L-155,4 L-180,0 Z" fill="#eeeefc"/>
+      <!-- Cutting edge highlight — sharp white -->
+      <line x1="-170" y1="-14" x2="170" y2="-14" stroke="#ffffff" stroke-width="2" opacity="0.9"/>
+      <!-- Secondary edge highlight -->
+      <line x1="-160" y1="-11" x2="160" y2="-11" stroke="#ffffff" stroke-width="1" opacity="0.4"/>
+      <!-- Blade spine -->
+      <line x1="-170" y1="14" x2="170" y2="14" stroke="#9999b0" stroke-width="1.5" opacity="0.6"/>
+    </g>
+  </g>
+</svg>
