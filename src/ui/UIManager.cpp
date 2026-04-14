@@ -80,23 +80,35 @@ void UIManager::SetupDockspace() {
             ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
             ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
-            // Split: top ~84% / bottom ~16% (compact timeline)
-            ImGuiID topId, bottomId;
-            ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Down, 0.16f, &bottomId, &topId);
-
-            // Split top: left 75% (viewport) / right 25% (segments)
-            ImGuiID viewportId, segmentsId;
-            ImGui::DockBuilderSplitNode(topId, ImGuiDir_Right, 0.25f, &segmentsId, &viewportId);
-
-            ImGui::DockBuilderDockWindow("Viewport", viewportId);
-            ImGui::DockBuilderDockWindow("Segments", segmentsId);
-            ImGui::DockBuilderDockWindow("Timeline", bottomId);
-
+            // Viewport fills the entire dockspace, no splits
+            ImGui::DockBuilderDockWindow("Viewport", dockspaceId);
             ImGui::DockBuilderFinish(dockspaceId);
         }
     }
 
-    ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f),
+        ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_AutoHideTabBar);
 
     ImGui::End();
+}
+
+void UIManager::ResetLayout() {
+    DeleteLayoutFile();
+    ImGui::ClearIniSettings();
+    ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
+    ImGui::DockBuilderRemoveNode(dockspaceId);
+    m_layoutInitialized = false;
+    m_layoutResetPending = true;
+}
+
+void UIManager::DeleteLayoutFile() {
+    std::filesystem::remove(m_iniPath);
+}
+
+bool UIManager::IsLayoutResetPending() {
+    if (m_layoutResetPending) {
+        m_layoutResetPending = false;
+        return true;
+    }
+    return false;
 }

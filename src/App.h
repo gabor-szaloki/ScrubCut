@@ -33,7 +33,10 @@ private:
     SegmentManager m_segments;
     Exporter m_exporter;
 
-    // UI state
+    // UI state — window visibility
+    bool m_showTimeline = true;
+    bool m_showSegments = false;
+    bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
     ExportSettings m_pendingExport;

@@ -10,9 +10,13 @@ public:
 
     void BeginFrame();
     void EndFrame();
+    void ResetLayout();
+    void DeleteLayoutFile();
+    bool IsLayoutResetPending();
 
 private:
     void SetupDockspace();
     bool m_layoutInitialized = false;
+    bool m_layoutResetPending = false;
     std::string m_iniPath;
 };

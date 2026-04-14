@@ -89,6 +89,9 @@ bool App::Init() {
         TraceFile::Get().Open(tracePath.c_str());
         LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
+    if (CommandLine::Get().HasFlag("--resetlayout"))
+        m_ui.DeleteLayoutFile();
+
     LOG_INFO("ScrubCut initialized");
     m_running = true;
 
@@ -171,6 +174,7 @@ void App::OpenFile(const std::string& path) {
 
     m_currentFilePath = path;
     m_segments.Clear();
+    m_segmentsClosedManually = false;
 
     m_videoWidth = m_player.GetVideoWidth();
     m_videoHeight = m_player.GetVideoHeight();
@@ -262,12 +266,20 @@ void App::ProcessEvents() {
                 break;
             }
             case SDLK_I:
-                if (m_player.HasMedia())
+                if (m_player.HasMedia()) {
+                    int before = m_segments.GetCount();
                     m_segments.SetMarkIn(m_player.GetPlaybackTime());
+                    if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                        m_showSegments = true;
+                }
                 break;
             case SDLK_O:
-                if (m_player.HasMedia())
+                if (m_player.HasMedia()) {
+                    int before = m_segments.GetCount();
                     m_segments.SetMarkOut(m_player.GetPlaybackTime());
+                    if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                        m_showSegments = true;
+                }
                 break;
             case SDLK_DELETE:
             case SDLK_BACKSPACE:
@@ -282,6 +294,15 @@ void App::ProcessEvents() {
                     snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
                     snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
                     m_pendingExport = ExportSettings{};
+                }
+                break;
+            case SDLK_T:
+                if (cmd) m_showTimeline = !m_showTimeline;
+                break;
+            case SDLK_S:
+                if (cmd) {
+                    m_showSegments = !m_showSegments;
+                    if (!m_showSegments) m_segmentsClosedManually = true;
                 }
                 break;
             case SDLK_Q:
@@ -312,6 +333,8 @@ void App::Render() {
 
     m_ui.BeginFrame();
 
+    ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+
     // Menu bar
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
@@ -334,6 +357,23 @@ void App::Render() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Timeline", (std::string(kKeys.cmdName) + "+T").c_str(), m_showTimeline))
+                m_showTimeline = !m_showTimeline;
+            if (ImGui::MenuItem("Segments", (std::string(kKeys.cmdName) + "+S").c_str(), m_showSegments)) {
+                m_showSegments = !m_showSegments;
+                if (!m_showSegments) m_segmentsClosedManually = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset Layout")) {
+                m_ui.ResetLayout();
+                m_showTimeline = true;
+                m_showSegments = false;
+                m_showHelpPanel = false;
+                m_segmentsClosedManually = false;
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Help", "?")) {
                 m_showHelpPanel = !m_showHelpPanel;
@@ -342,6 +382,8 @@ void App::Render() {
         }
         ImGui::EndMainMenuBar();
     }
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
 
     // Viewport panel
     ImGui::Begin("Viewport");
@@ -367,10 +409,22 @@ void App::Render() {
     ImGui::End();
 
     // Timeline panel (unified controls + timeline bar)
-    ImGui::Begin("Timeline");
-    if (m_player.HasMedia()) {
-        double currentTime = m_seekTarget;
-        double duration = m_player.GetDuration();
+    if (m_showTimeline) {
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    float tlPad = 40.0f;
+    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1000.0f);
+    float tlHeight = 110.0f;
+    ImGui::SetNextWindowPos(
+        ImVec2(vp->WorkPos.x + (vp->WorkSize.x - tlWidth) * 0.5f, vp->WorkPos.y + vp->WorkSize.y - tlHeight - tlPad),
+        layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(tlWidth, tlHeight), layoutCond);
+    ImGui::Begin("Timeline", &m_showTimeline);
+    {
+        bool hasMedia = m_player.HasMedia();
+        if (!hasMedia) ImGui::BeginDisabled();
+
+        double currentTime = hasMedia ? m_seekTarget : 0.0;
+        double duration = hasMedia ? m_player.GetDuration() : 1.0;
 
         // --- Row 1: [left: speed] [center: transport] [right: volume] ---
         float panelWidth = ImGui::GetContentRegionAvail().x;
@@ -419,20 +473,27 @@ void App::Render() {
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
 
         // Right: Mute + volume slider
-        if (m_player.HasAudio()) {
+        {
             float volumeAreaWidth = 140.0f;
             ImGui::SameLine(panelWidth - volumeAreaWidth);
+            bool noAudio = hasMedia && !m_player.HasAudio();
+            if (noAudio) ImGui::BeginDisabled();
             bool muted = m_player.IsMuted();
             if (ImGui::Button(muted ? "Unmute" : "Mute")) {
                 m_player.SetMuted(!muted);
             }
             ImGui::SameLine();
-            float volPct = m_player.GetVolume() * 100.0f;
-            ImGui::SetNextItemWidth(80.0f);
-            if (ImGui::SliderFloat("##vol", &volPct, 0.0f, 100.0f, "%.0f%%")) {
-                m_player.SetVolume(volPct / 100.0f);
-                if (volPct > 0.0f && m_player.IsMuted()) m_player.SetMuted(false);
+            if (noAudio) {
+                ImGui::Text("No Audio");
+            } else {
+                float volPct = m_player.GetVolume() * 100.0f;
+                ImGui::SetNextItemWidth(80.0f);
+                if (ImGui::SliderFloat("##vol", &volPct, 0.0f, 100.0f, "%.0f%%")) {
+                    m_player.SetVolume(volPct / 100.0f);
+                    if (volPct > 0.0f && m_player.IsMuted()) m_player.SetMuted(false);
+                }
             }
+            if (noAudio) ImGui::EndDisabled();
         }
 
         // --- Row 2: Timeline bar ---
@@ -612,13 +673,19 @@ void App::Render() {
         float infoRightWidth = ImGui::CalcTextSize(infoRight).x;
         ImGui::SameLine(panelWidth - infoRightWidth);
         ImGui::Text("%s", infoRight);
-    } else {
-        ImGui::Text("No video loaded. Drag and drop a video file.");
+
+        if (!hasMedia) ImGui::EndDisabled();
     }
     ImGui::End();
+    } // m_showTimeline
 
     // Segments panel
-    ImGui::Begin("Segments");
+    if (m_showSegments) {
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350 - 40, vp->WorkPos.y + 40), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(350, 150), layoutCond);
+    bool segmentsWasOpen = m_showSegments;
+    ImGui::Begin("Segments", &m_showSegments);
     if (m_player.HasMedia()) {
         double displayTime = m_seekTarget;
 
@@ -699,6 +766,8 @@ void App::Render() {
     }
     } // end if (m_player.HasMedia())
     ImGui::End();
+    if (segmentsWasOpen && !m_showSegments) m_segmentsClosedManually = true;
+    } // m_showSegments
 
     // Help panel (toggled with ?)
     if (m_showHelpPanel) {
@@ -725,6 +794,8 @@ void App::Render() {
             row("Mark Out",             "O");
             row("Remove last segment",  kKeys.deleteName);
             row("Export segments",      (std::string(kKeys.cmdName) + " + E").c_str());
+            row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());
+            row("Toggle segments",     (std::string(kKeys.cmdName) + " + S").c_str());
             row("Quit",                 kKeys.quitShortcut);
             row("Toggle help",          "?");
 
