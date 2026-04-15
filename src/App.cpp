@@ -89,8 +89,24 @@ bool App::Init() {
         TraceFile::Get().Open(tracePath.c_str());
         LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
-    if (CommandLine::Get().HasFlag("--resetlayout"))
+    m_settings.Load(GetAppDataDir() / "settings.ini");
+    if (CommandLine::Get().HasFlag("--resetlayout")) {
         m_ui.DeleteLayoutFile();
+        std::filesystem::remove(GetAppDataDir() / "settings.ini");
+    } else {
+        // Restore saved window state
+        m_settings.Load(GetAppDataDir() / "settings.ini");
+        int ww = m_settings.GetInt("window_width", 0);
+        int wh = m_settings.GetInt("window_height", 0);
+        if (ww > 0 && wh > 0)
+            SDL_SetWindowSize(m_window, ww, wh);
+        int wx = m_settings.GetInt("window_x", SDL_WINDOWPOS_UNDEFINED);
+        int wy = m_settings.GetInt("window_y", SDL_WINDOWPOS_UNDEFINED);
+        if (wx != SDL_WINDOWPOS_UNDEFINED && wy != SDL_WINDOWPOS_UNDEFINED)
+            SDL_SetWindowPosition(m_window, wx, wy);
+        m_showTimeline = m_settings.GetBool("show_timeline", true);
+        m_showSegments = m_settings.GetBool("show_segments", false);
+    }
 
     LOG_INFO("ScrubCut initialized");
     m_running = true;
@@ -138,6 +154,20 @@ void App::Run() {
 
 void App::Shutdown() {
     m_player.Close();
+
+    // Save window state before destroying
+    if (m_window) {
+        int wx, wy, ww, wh;
+        SDL_GetWindowPosition(m_window, &wx, &wy);
+        SDL_GetWindowSize(m_window, &ww, &wh);
+        m_settings.SetInt("window_x", wx);
+        m_settings.SetInt("window_y", wy);
+        m_settings.SetInt("window_width", ww);
+        m_settings.SetInt("window_height", wh);
+        m_settings.SetBool("show_timeline", m_showTimeline);
+        m_settings.SetBool("show_segments", m_showSegments);
+        m_settings.Save();
+    }
 
     if (m_videoTexture) {
         glDeleteTextures(1, &m_videoTexture);
@@ -371,6 +401,9 @@ void App::Render() {
                 m_showSegments = false;
                 m_showHelpPanel = false;
                 m_segmentsClosedManually = false;
+                SDL_SetWindowSize(m_window, 1280, 720);
+                SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                std::filesystem::remove(GetAppDataDir() / "settings.ini");
             }
             ImGui::EndMenu();
         }

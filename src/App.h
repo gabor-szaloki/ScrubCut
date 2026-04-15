@@ -4,6 +4,7 @@
 #include "core/Player.h"
 #include "core/SegmentManager.h"
 #include "export/Exporter.h"
+#include "util/Settings.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
@@ -27,6 +28,7 @@ private:
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
     UIManager m_ui;
+    Settings m_settings;
     bool m_running = false;
 
     Player m_player;
