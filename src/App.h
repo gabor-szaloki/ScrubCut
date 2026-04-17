@@ -41,6 +41,10 @@ private:
     bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    bool m_autoHideUI = true;
+    bool m_uiHidden = false;
+    float m_uiAlpha = 1.0f;
+    uint64_t m_lastUIActivityNS = 0;
     ExportSettings m_pendingExport;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";

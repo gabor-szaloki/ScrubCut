@@ -106,6 +106,7 @@ bool App::Init() {
             SDL_SetWindowPosition(m_window, wx, wy);
         m_showTimeline = m_settings.GetBool("show_timeline", true);
         m_showSegments = m_settings.GetBool("show_segments", false);
+        m_autoHideUI = m_settings.GetBool("auto_hide_ui", true);
     }
 
     LOG_INFO("ScrubCut initialized");
@@ -166,6 +167,7 @@ void App::Shutdown() {
         m_settings.SetInt("window_height", wh);
         m_settings.SetBool("show_timeline", m_showTimeline);
         m_settings.SetBool("show_segments", m_showSegments);
+        m_settings.SetBool("auto_hide_ui", m_autoHideUI);
         m_settings.Save();
     }
 
@@ -223,6 +225,15 @@ void App::ProcessEvents() {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         ImGui_ImplSDL3_ProcessEvent(&event);
+
+        if (event.type == SDL_EVENT_MOUSE_MOTION ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+            event.type == SDL_EVENT_MOUSE_WHEEL) {
+            m_lastUIActivityNS = SDL_GetTicksNS();
+            if (m_autoHideUI)
+                m_uiHidden = false;
+        }
 
         if (event.type == SDL_EVENT_QUIT) {
             m_running = false;
@@ -301,6 +312,8 @@ void App::ProcessEvents() {
                     m_segments.SetMarkIn(m_player.GetPlaybackTime());
                     if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
+                    m_lastUIActivityNS = SDL_GetTicksNS();
+                    if (m_autoHideUI) m_uiHidden = false;
                 }
                 break;
             case SDLK_O:
@@ -309,12 +322,17 @@ void App::ProcessEvents() {
                     m_segments.SetMarkOut(m_player.GetPlaybackTime());
                     if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
+                    m_lastUIActivityNS = SDL_GetTicksNS();
+                    if (m_autoHideUI) m_uiHidden = false;
                 }
                 break;
             case SDLK_DELETE:
             case SDLK_BACKSPACE:
-                if (m_segments.GetCount() > 0)
+                if (m_segments.GetCount() > 0) {
                     m_segments.RemoveSegment(m_segments.GetCount() - 1);
+                    m_lastUIActivityNS = SDL_GetTicksNS();
+                    if (m_autoHideUI) m_uiHidden = false;
+                }
                 break;
             case SDLK_E:
                 if (cmd && m_segments.GetCount() > 0 && !m_exporter.IsRunning()) {
@@ -333,6 +351,12 @@ void App::ProcessEvents() {
                 if (cmd) {
                     m_showSegments = !m_showSegments;
                     if (!m_showSegments) m_segmentsClosedManually = true;
+                }
+                break;
+            case SDLK_H:
+                if (!m_autoHideUI) {
+                    m_uiHidden = !m_uiHidden;
+                    m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
                 }
                 break;
             case SDLK_Q:
@@ -362,6 +386,22 @@ void App::Render() {
     }
 
     m_ui.BeginFrame();
+
+    // Auto-hide UI after 5 seconds of no mouse activity (with 0.5s fade)
+    if (m_autoHideUI && m_lastUIActivityNS > 0) {
+        uint64_t elapsed = SDL_GetTicksNS() - m_lastUIActivityNS;
+        if (elapsed > 5300000000ULL) {
+            m_uiHidden = true;
+            m_uiAlpha = 0.0f;
+        } else if (elapsed > 5000000000ULL) {
+            float fadeProgress = static_cast<float>(elapsed - 5000000000ULL) / 300000000.0f;
+            m_uiAlpha = 1.0f - fadeProgress;
+        } else {
+            m_uiAlpha = 1.0f;
+        }
+    } else if (!m_uiHidden) {
+        m_uiAlpha = 1.0f;
+    }
 
     ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
 
@@ -393,6 +433,12 @@ void App::Render() {
             if (ImGui::MenuItem("Segments", (std::string(kKeys.cmdName) + "+S").c_str(), m_showSegments)) {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
+            }
+            if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
+                m_autoHideUI = !m_autoHideUI;
+            if (ImGui::MenuItem("Show/Hide UI", "H", false, !m_autoHideUI)) {
+                m_uiHidden = !m_uiHidden;
+                m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Reset Layout")) {
@@ -442,8 +488,9 @@ void App::Render() {
     ImGui::End();
 
     // Timeline panel (unified controls + timeline bar)
-    if (m_showTimeline) {
-    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (m_showTimeline && !m_uiHidden) {
+    ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float tlPad = 40.0f;
     float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1000.0f);
     float tlHeight = 110.0f;
@@ -534,10 +581,15 @@ void App::Render() {
         float barWidth = ImGui::GetContentRegionAvail().x;
         float barHeight = 32.0f;
         ImDrawList* drawList = ImGui::GetWindowDrawList();
+        auto fadeCol = [this](int r, int g, int b, int a) -> ImU32 {
+            return IM_COL32(r, g, b, static_cast<int>(a * m_uiAlpha));
+        };
 
-        // Background
+        // Background (matches ImGui's FrameBg color)
+        ImVec4 frameBg = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
         drawList->AddRectFilled(barPos, ImVec2(barPos.x + barWidth, barPos.y + barHeight),
-                                IM_COL32(40, 40, 40, 255));
+                                IM_COL32(static_cast<int>(frameBg.x * 255), static_cast<int>(frameBg.y * 255),
+                                         static_cast<int>(frameBg.z * 255), static_cast<int>(frameBg.w * 255 * m_uiAlpha)));
 
         // Segments
         const auto& segs = m_segments.GetSegments();
@@ -546,9 +598,9 @@ void App::Render() {
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
             // Color by export mode
             ImU32 fillCol = (segs[i].mode == ExportMode::GIF)
-                ? IM_COL32(180, 120, 220, 120) : IM_COL32(80, 140, 220, 120);
+                ? fadeCol(180, 120, 220, 120) : fadeCol(80, 140, 220, 120);
             ImU32 borderCol = (segs[i].mode == ExportMode::GIF)
-                ? IM_COL32(200, 150, 255, 200) : IM_COL32(100, 170, 255, 200);
+                ? fadeCol(200, 150, 255, 200) : fadeCol(100, 170, 255, 200);
             drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
             drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol);
         }
@@ -560,7 +612,7 @@ void App::Render() {
                 float yEnd = y + 3.0f;
                 if (yEnd > barPos.y + barHeight) yEnd = barPos.y + barHeight;
                 drawList->AddLine(ImVec2(mx, y), ImVec2(mx, yEnd),
-                                  IM_COL32(255, 200, 50, 180), 2.0f);
+                                  fadeCol(255, 200, 50, 180), 2.0f);
             }
         }
 
@@ -568,7 +620,7 @@ void App::Render() {
         if (duration > 0.0) {
             float px = barPos.x + static_cast<float>(currentTime / duration) * barWidth;
             drawList->AddLine(ImVec2(px, barPos.y), ImVec2(px, barPos.y + barHeight),
-                              IM_COL32(255, 255, 255, 220), 2.0f);
+                              fadeCol(255, 255, 255, 220), 2.0f);
         }
 
         // --- Interaction: segment edge handles first, then bar click-to-seek ---
@@ -710,11 +762,13 @@ void App::Render() {
         if (!hasMedia) ImGui::EndDisabled();
     }
     ImGui::End();
+    ImGui::PopStyleVar();
     } // m_showTimeline
 
     // Segments panel
-    if (m_showSegments) {
-    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (m_showSegments && !m_uiHidden) {
+    ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350 - 40, vp->WorkPos.y + 40), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(350, 150), layoutCond);
     bool segmentsWasOpen = m_showSegments;
@@ -800,10 +854,13 @@ void App::Render() {
     } // end if (m_player.HasMedia())
     ImGui::End();
     if (segmentsWasOpen && !m_showSegments) m_segmentsClosedManually = true;
+    ImGui::PopStyleVar();
     } // m_showSegments
 
     // Help panel (toggled with ?)
-    if (m_showHelpPanel) {
+    if (m_showHelpPanel && !m_uiHidden) {
+        ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
         ImGui::Begin("Help", &m_showHelpPanel);
         if (ImGui::BeginTable("##shortcuts", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
@@ -835,6 +892,7 @@ void App::Render() {
             ImGui::EndTable();
         }
         ImGui::End();
+        ImGui::PopStyleVar();
     }
 
     // Export dialog
