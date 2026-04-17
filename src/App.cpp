@@ -5,6 +5,7 @@
 #include "util/AppPaths.h"
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <cmath>
 #include <filesystem>
@@ -387,7 +388,16 @@ void App::Render() {
 
     m_ui.BeginFrame();
 
-    // Auto-hide UI after 5 seconds of no mouse activity (with 0.5s fade)
+    // Keep UI visible while hovering any panel or menu (except the Viewport)
+    bool hoveringUI = false;
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+        ImGuiWindow* hovered = ImGui::GetCurrentContext()->HoveredWindow;
+        hoveringUI = hovered && strcmp(hovered->Name, "Viewport") != 0;
+    }
+    if (hoveringUI || ImGui::IsAnyItemHovered())
+        m_lastUIActivityNS = SDL_GetTicksNS();
+
+    // Auto-hide UI after 5 seconds of no mouse activity (with 0.3s fade)
     if (m_autoHideUI && m_lastUIActivityNS > 0) {
         uint64_t elapsed = SDL_GetTicksNS() - m_lastUIActivityNS;
         if (elapsed > 5300000000ULL) {
