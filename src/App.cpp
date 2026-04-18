@@ -443,6 +443,7 @@ void App::ProcessEvents() {
 }
 
 void App::Render() {
+    m_hoveredSegmentThisFrame = -1;
     int w, h;
     SDL_GetWindowSizeInPixels(m_window, &w, &h);
     glViewport(0, 0, w, h);
@@ -790,14 +791,39 @@ void App::Render() {
 
         // Segments
         const auto& segs = m_segments.GetSegments();
+        ImVec2 mousePos = ImGui::GetIO().MousePos;
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
             float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
-            // Color by segment palette
-            ImU32 fillCol = GetSegmentColor(segs[i].colorIndex, 0.45f * m_uiAlpha);
-            ImU32 borderCol = GetSegmentColor(segs[i].colorIndex, 0.8f * m_uiAlpha);
+
+            // Check if mouse is hovering this segment on the timeline bar
+            bool barHovered = mousePos.x >= x0 && mousePos.x <= x1 &&
+                              mousePos.y >= barPos.y && mousePos.y <= barPos.y + barHeight;
+            if (barHovered)
+                m_hoveredSegmentThisFrame = i;
+
+            bool highlighted = (m_hoveredSegment == i);
+            float fillAlpha = highlighted ? 0.7f : 0.45f;
+            float borderAlpha = highlighted ? 1.0f : 0.8f;
+            ImU32 fillCol = GetSegmentColor(segs[i].colorIndex, fillAlpha * m_uiAlpha);
+            ImU32 borderCol = GetSegmentColor(segs[i].colorIndex, borderAlpha * m_uiAlpha);
             drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
-            drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol);
+            drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol,
+                              0.0f, 0, highlighted ? 3.0f : 1.0f);
+
+            // Diagonal line pattern on highlighted segments
+            if (highlighted) {
+                ImU32 lineCol = GetSegmentColor(segs[i].colorIndex, 0.6f * m_uiAlpha);
+                float spacing = 8.0f;
+                drawList->PushClipRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), true);
+                for (float offset = -barHeight; offset < (x1 - x0) + barHeight; offset += spacing) {
+                    drawList->AddLine(
+                        ImVec2(x0 + offset, barPos.y + barHeight),
+                        ImVec2(x0 + offset + barHeight, barPos.y),
+                        lineCol, 2.0f);
+                }
+                drawList->PopClipRect();
+            }
         }
 
         // Pending mark-in indicator
@@ -964,8 +990,8 @@ void App::Render() {
     if (m_showSegments && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 300 - 40, vp->WorkPos.y + 40), layoutCond);
-    ImGui::SetNextWindowSize(ImVec2(300, 250), layoutCond);
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350 - 40, vp->WorkPos.y + 40), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(350, 250), layoutCond);
     bool segmentsWasOpen = m_showSegments;
     ImGui::Begin("Segments", &m_showSegments);
 
@@ -988,6 +1014,9 @@ void App::Render() {
                 ImGui::PushID(i);
                 const ImVec4& segColor = kSegmentColors[segs[i].colorIndex % kSegmentColorCount];
 
+                float cardPad = 4.0f;
+                ImVec2 cardStart = ImGui::GetCursorScreenPos();
+                ImGui::SetCursorScreenPos(ImVec2(cardStart.x + cardPad, cardStart.y + cardPad));
                 ImGui::BeginGroup();
 
                 // Row 1: color square, name field, delete button
@@ -1014,36 +1043,72 @@ void App::Render() {
                 }
                 ImGui::PopStyleColor(3);
 
-                // Row 2: time range (clickable to seek)
+                // Row 2: start and end times as individual seek buttons
                 int sMin = static_cast<int>(segs[i].startSec) / 60;
                 int sSec = static_cast<int>(segs[i].startSec) % 60;
                 int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
                 int eMin = static_cast<int>(segs[i].endSec) / 60;
                 int eSec = static_cast<int>(segs[i].endSec) % 60;
                 int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
-                char timeBuf[64];
-                snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d.%03d -> %02d:%02d.%03d",
-                         sMin, sSec, sMs, eMin, eSec, eMs);
-                if (ImGui::Selectable(timeBuf, false, 0)) {
-                    m_player.SeekTo(segs[i].startSec);
+                char startBuf[32], endBuf[32];
+                snprintf(startBuf, sizeof(startBuf), "%02d:%02d.%03d##start", sMin, sSec, sMs);
+                snprintf(endBuf, sizeof(endBuf), "%02d:%02d.%03d##end", eMin, eSec, eMs);
+                double playhead = m_seekTarget;
+                bool canSetStart = playhead < segs[i].endSec;
+                bool canSetEnd = playhead > segs[i].startSec;
+                if (!canSetStart) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("[##setstart")) {
+                    m_segments.UpdateSegment(i, playhead, segs[i].endSec);
                 }
-
-                // Row 3: duration + mode toggle
+                if (!canSetStart) ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::SmallButton(startBuf))
+                    m_player.SeekTo(segs[i].startSec);
+                ImGui::SameLine();
+                ImGui::Text("->");
+                ImGui::SameLine();
+                if (ImGui::SmallButton(endBuf))
+                    m_player.SeekTo(segs[i].endSec);
+                ImGui::SameLine();
+                if (!canSetEnd) ImGui::BeginDisabled();
+                if (ImGui::SmallButton("]##setend")) {
+                    m_segments.UpdateSegment(i, segs[i].startSec, playhead);
+                }
+                if (!canSetEnd) ImGui::EndDisabled();
                 double dur = segs[i].endSec - segs[i].startSec;
-                ImGui::Text("Duration: %.1fs", dur);
-                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 40);
-                const char* modeLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(segColor.x, segColor.y, segColor.z, 0.7f));
-                char modeBuf[32];
-                snprintf(modeBuf, sizeof(modeBuf), "%s##mode", modeLabel);
-                if (ImGui::SmallButton(modeBuf)) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.1fs)", dur);
+                ImGui::SameLine();
+                const char* fmtLabel = (segs[i].mode == ExportMode::GIF) ? "GIF##fmt" : "MP4##fmt";
+                if (ImGui::SmallButton(fmtLabel)) {
                     ExportMode newMode = (segs[i].mode == ExportMode::GIF)
                         ? ExportMode::SourceFormat : ExportMode::GIF;
                     m_segments.SetSegmentMode(i, newMode);
                 }
-                ImGui::PopStyleColor();
 
                 ImGui::EndGroup();
+
+                // Card bounds with padding
+                ImVec2 cardEnd = ImVec2(
+                    ImGui::GetItemRectMax().x + cardPad,
+                    ImGui::GetItemRectMax().y + cardPad);
+                // Advance cursor past the bottom padding
+                ImGui::SetCursorScreenPos(ImVec2(cardStart.x, cardEnd.y));
+                ImGui::Dummy(ImVec2(0, 0));
+
+                // Detect hover on this card
+                bool cardHovered = ImGui::IsMouseHoveringRect(cardStart, cardEnd);
+                if (cardHovered)
+                    m_hoveredSegmentThisFrame = i;
+
+                // Draw highlight if this segment is hovered (from panel or timeline)
+                if (m_hoveredSegment == i) {
+                    ImDrawList* dl2 = ImGui::GetWindowDrawList();
+                    dl2->AddRectFilled(cardStart, cardEnd,
+                        GetSegmentColor(segs[i].colorIndex, 0.15f), 3.0f);
+                    dl2->AddRect(cardStart, cardEnd,
+                        GetSegmentColor(segs[i].colorIndex, 0.5f), 3.0f);
+                }
 
                 if (i < static_cast<int>(segs.size()) - 1)
                     ImGui::Separator();
@@ -1420,6 +1485,8 @@ void App::Render() {
     }
 
     m_ui.EndFrame();
+
+    m_hoveredSegment = m_hoveredSegmentThisFrame;
 
     SDL_GL_SwapWindow(m_window);
 }

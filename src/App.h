@@ -67,6 +67,10 @@ private:
     int m_videoWidth = 0;
     int m_videoHeight = 0;
 
+    // Segment hover state (shared between timeline bar and segments panel)
+    int m_hoveredSegment = -1;       // last frame's value, used for rendering
+    int m_hoveredSegmentThisFrame = -1;  // being built this frame
+
     // Seek/scrub state
     double m_seekTarget = 0.0;
     uint64_t m_lastSeekTime = 0;
