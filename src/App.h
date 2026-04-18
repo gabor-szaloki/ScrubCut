@@ -10,6 +10,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
 #include <string>
+#include <vector>
 
 class App {
 public:
@@ -18,6 +19,7 @@ public:
     void Shutdown();
 
     void OpenFile(const std::string& path);
+    void RequestOpenFile(const std::string& path);
 
 private:
     void ProcessEvents();
@@ -51,6 +53,11 @@ private:
     uint64_t m_lastUIActivityNS = 0;
     ImVec2 m_prevViewportSize = {0, 0};
     ExportSettings m_pendingExport;
+    std::vector<bool> m_exportChecked;
+    bool m_showOverwriteConfirm = false;
+    bool m_showOpenFileConfirm = false;
+    std::string m_pendingOpenFilePath;
+    std::vector<std::string> m_conflictingFiles;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";
     std::string m_currentFilePath;

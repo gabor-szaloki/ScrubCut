@@ -218,6 +218,15 @@ void App::Shutdown() {
     LOG_INFO("ScrubCut shutdown");
 }
 
+void App::RequestOpenFile(const std::string& path) {
+    if (m_segments.GetCount() > 0) {
+        m_pendingOpenFilePath = path;
+        m_showOpenFileConfirm = true;
+    } else {
+        OpenFile(path);
+    }
+}
+
 void App::OpenFile(const std::string& path) {
     m_player.Close();
 
@@ -274,7 +283,7 @@ void App::ProcessEvents() {
             m_running = false;
         }
         if (event.type == SDL_EVENT_DROP_FILE) {
-            OpenFile(event.drop.data);
+            RequestOpenFile(event.drop.data);
         }
         if (event.type == SDL_EVENT_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
             SDL_Keymod mod = SDL_GetModState();
@@ -350,6 +359,18 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_O:
+                if (cmd) {
+                    static const SDL_DialogFileFilter videoFilters[] = {
+                        {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v"},
+                        {"All files", "*"},
+                    };
+                    SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {
+                        if (filelist && filelist[0])
+                            static_cast<App*>(userdata)->RequestOpenFile(filelist[0]);
+                    }, this, m_window, videoFilters, 2, nullptr, false);
+                    break;
+                }
+                [[fallthrough]];
             case SDLK_RIGHTBRACKET:
                 if (m_player.HasMedia()) {
                     double now_t = m_player.GetPlaybackTime();
@@ -523,7 +544,14 @@ void App::Render() {
     if (showMenuBar && ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open...", (std::string(kKeys.cmdName) + "+O").c_str())) {
-                // TODO: file dialog
+                static const SDL_DialogFileFilter videoFilters[] = {
+                    {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v"},
+                    {"All files", "*"},
+                };
+                SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {
+                    if (filelist && filelist[0])
+                        static_cast<App*>(userdata)->RequestOpenFile(filelist[0]);
+                }, this, m_window, videoFilters, 2, nullptr, false);
             }
             if (ImGui::MenuItem("Export Segments...", (std::string(kKeys.cmdName) + "+E").c_str(),
                                 false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
@@ -1097,6 +1125,7 @@ void App::Render() {
     // Export dialog
     if (m_showExportDialog) {
         m_exporter.ResetProgress();
+        m_exportChecked.assign(m_segments.GetCount(), true);
         ImGui::OpenPopup("Export Segments");
         m_showExportDialog = false;
     }
@@ -1107,19 +1136,97 @@ void App::Render() {
         if (!progress.running && !progress.finished) {
             // --- Settings form ---
             ImGui::Text("Output Directory:");
-            ImGui::SetNextItemWidth(400);
+            ImGui::SetNextItemWidth(500 - ImGui::CalcTextSize("Browse").x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ItemSpacing.x);
             ImGui::InputText("##dir", m_exportDir, sizeof(m_exportDir));
+            ImGui::SameLine();
+            if (ImGui::Button("Browse")) {
+                SDL_ShowOpenFolderDialog([](void* userdata, const char* const* filelist, int) {
+                    if (filelist && filelist[0]) {
+                        char* dst = static_cast<char*>(userdata);
+                        snprintf(dst, 512, "%s", filelist[0]);
+                    }
+                }, m_exportDir, m_window, m_exportDir, false);
+            }
 
             ImGui::Text("Filename Base:");
-            ImGui::SetNextItemWidth(400);
+            ImGui::SetNextItemWidth(500);
             ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
 
             // GIF settings (apply to all GIF segments)
-            bool hasGif = false;
             const auto& segs = m_segments.GetSegments();
-            for (const auto& s : segs) {
-                if (s.mode == ExportMode::GIF) { hasGif = true; break; }
+
+            // Segment list with checkboxes in scrollable table
+            ImGui::Spacing();
+            ImGui::Text("Segments to export:");
+            int segCount = static_cast<int>(segs.size());
+            float rowH = ImGui::GetTextLineHeightWithSpacing() + 4;
+            ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
+            ImVec2 tableSize(0, 0);
+            if (segCount > 10) {
+                tableFlags |= ImGuiTableFlags_ScrollY;
+                tableSize.y = 10 * rowH + 30;
             }
+            if (ImGui::BeginTable("##export_segs", 5, tableFlags, tableSize)) {
+                ImGui::TableSetupColumn("##chk", ImGuiTableColumnFlags_WidthFixed, 24);
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Range", ImGuiTableColumnFlags_WidthFixed, 160);
+                ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 60);
+                ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed, 50);
+                ImGui::TableHeadersRow();
+
+                for (int i = 0; i < segCount; i++) {
+                    ImGui::PushID(i);
+                    ImGui::TableNextRow();
+
+                    // Checkbox
+                    ImGui::TableNextColumn();
+                    bool checked = (i < static_cast<int>(m_exportChecked.size())) && m_exportChecked[i];
+                    if (ImGui::Checkbox("##chk", &checked))
+                        m_exportChecked[i] = checked;
+
+                    // Editable name
+                    ImGui::TableNextColumn();
+                    char nameBuf[64];
+                    snprintf(nameBuf, sizeof(nameBuf), "%s", segs[i].name.c_str());
+                    ImGui::SetNextItemWidth(-1);
+                    if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
+                        m_segments.SetSegmentName(i, nameBuf);
+
+                    // Time range
+                    ImGui::TableNextColumn();
+                    int sMin = static_cast<int>(segs[i].startSec) / 60;
+                    int sSec = static_cast<int>(segs[i].startSec) % 60;
+                    int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
+                    int eMin = static_cast<int>(segs[i].endSec) / 60;
+                    int eSec = static_cast<int>(segs[i].endSec) % 60;
+                    int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
+                    ImGui::Text("%02d:%02d.%03d-%02d:%02d.%03d", sMin, sSec, sMs, eMin, eSec, eMs);
+
+                    // Duration
+                    ImGui::TableNextColumn();
+                    double dur = segs[i].endSec - segs[i].startSec;
+                    ImGui::Text("%.1fs", dur);
+
+                    // Format (editable toggle)
+                    ImGui::TableNextColumn();
+                    const char* fmtLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 0.6f));
+                    if (ImGui::SmallButton(fmtLabel)) {
+                        ExportMode newMode = (segs[i].mode == ExportMode::GIF)
+                            ? ExportMode::SourceFormat : ExportMode::GIF;
+                        m_segments.SetSegmentMode(i, newMode);
+                    }
+                    ImGui::PopStyleColor();
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+
+            // GIF settings (shown if any segment is set to GIF)
+            bool hasGif = false;
+            for (const auto& s : segs)
+                if (s.mode == ExportMode::GIF) { hasGif = true; break; }
             if (hasGif) {
                 ImGui::Spacing();
                 ImGui::Text("GIF Settings:");
@@ -1132,32 +1239,55 @@ void App::Render() {
                 ImGui::Unindent();
             }
 
-            // Segment list
-            ImGui::Spacing();
-            ImGui::Text("Segments to export:");
-            for (int i = 0; i < static_cast<int>(segs.size()); i++) {
-                int sMin = static_cast<int>(segs[i].startSec) / 60;
-                int sSec = static_cast<int>(segs[i].startSec) % 60;
-                int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
-                int eMin = static_cast<int>(segs[i].endSec) / 60;
-                int eSec = static_cast<int>(segs[i].endSec) % 60;
-                int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
-                const char* fmt = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
-                ImGui::BulletText("[%d] %02d:%02d.%03d - %02d:%02d.%03d  (%s)",
-                                  i + 1, sMin, sSec, sMs, eMin, eSec, eMs, fmt);
-            }
-
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
 
-            if (ImGui::Button("Export", ImVec2(120, 0))) {
-                m_pendingExport.segments = m_segments.GetSegments();
-                m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
-                m_exporter.Start(m_currentFilePath, m_pendingExport);
+            // Validate: check for empty names and any checked
+            bool anyChecked = false;
+            bool hasEmptyName = false;
+            for (int i = 0; i < segCount; i++) {
+                if (i < static_cast<int>(m_exportChecked.size()) && m_exportChecked[i]) {
+                    anyChecked = true;
+                    if (segs[i].name.empty()) hasEmptyName = true;
+                }
             }
+            if (hasEmptyName)
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "All segments must have a name.");
+
+            if (!anyChecked || hasEmptyName) ImGui::BeginDisabled();
+            float expBtnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
+            if (ImGui::Button("Export", ImVec2(expBtnWidth, 0))) {
+                m_pendingExport.segments.clear();
+                for (int i = 0; i < segCount; i++)
+                    if (i < static_cast<int>(m_exportChecked.size()) && m_exportChecked[i])
+                        m_pendingExport.segments.push_back(segs[i]);
+                m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
+
+                // Check for existing files
+                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
+                std::filesystem::path base(m_pendingExport.outputPath);
+                std::string stem = base.stem().string();
+                std::string dir = base.parent_path().string();
+                m_conflictingFiles.clear();
+                for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
+                    const auto& seg = m_pendingExport.segments[i];
+                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                    std::string suffix = "_" + seg.name;
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + suffix + ext);
+                    if (std::filesystem::exists(outPath))
+                        m_conflictingFiles.push_back(outPath.filename().string());
+                }
+
+                if (m_conflictingFiles.empty()) {
+                    m_exporter.Start(m_currentFilePath, m_pendingExport);
+                } else {
+                    m_showOverwriteConfirm = true;
+                }
+            }
+            if (!anyChecked || hasEmptyName) ImGui::EndDisabled();
             ImGui::SameLine();
-            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            if (ImGui::Button("Cancel", ImVec2(-1, 0))) {
                 ImGui::CloseCurrentPopup();
             }
         } else if (progress.running) {
@@ -1173,8 +1303,37 @@ void App::Render() {
             }
         } else if (progress.finished) {
             // --- Done ---
+            ImGui::Dummy(ImVec2(500, 0)); // maintain minimum width
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Export complete!");
-            if (ImGui::Button("Close", ImVec2(120, 0))) {
+            ImGui::Spacing();
+
+            std::filesystem::path basePath(m_pendingExport.outputPath);
+            std::string dir = basePath.parent_path().string();
+            std::string stem = basePath.stem().string();
+            ImGui::Text("Output folder:");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  %s", dir.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open")) {
+#ifdef __APPLE__
+                std::string cmd = "open \"" + dir + "\"";
+#else
+                std::string cmd = "explorer \"" + dir + "\"";
+#endif
+                system(cmd.c_str());
+            }
+            ImGui::Spacing();
+            ImGui::Text("Exported files:");
+            for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
+                const auto& seg = m_pendingExport.segments[i];
+                std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : basePath.extension().string();
+                if (ext.empty()) ext = ".mp4";
+                std::string suffix = seg.name.empty() ? "_" + std::to_string(i + 1) : "_" + seg.name;
+                std::string filename = stem + suffix + ext;
+                ImGui::BulletText("%s", filename.c_str());
+            }
+            ImGui::Spacing();
+
+            if (ImGui::Button("Close", ImVec2(-1, 0))) {
                 ImGui::CloseCurrentPopup();
             }
         } else if (progress.error) {
@@ -1186,6 +1345,77 @@ void App::Render() {
             }
         }
 
+        // Overwrite confirmation sub-popup
+        if (m_showOverwriteConfirm) {
+            ImGui::OpenPopup("Overwrite Files?");
+            m_showOverwriteConfirm = false;
+        }
+        if (ImGui::BeginPopupModal("Overwrite Files?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Dummy(ImVec2(400, 0));
+            ImGui::Text("The following files already exist:");
+            ImGui::Spacing();
+            for (const auto& f : m_conflictingFiles)
+                ImGui::BulletText("%s", f.c_str());
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3;
+            if (ImGui::Button("Overwrite", ImVec2(btnW, 0))) {
+                m_exporter.Start(m_currentFilePath, m_pendingExport);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Skip Existing", ImVec2(btnW, 0))) {
+                // Remove conflicting segments from pending export
+                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
+                std::filesystem::path base(m_pendingExport.outputPath);
+                std::string stem = base.stem().string();
+                std::string dir = base.parent_path().string();
+                std::vector<TimeRange> filtered;
+                for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
+                    const auto& seg = m_pendingExport.segments[i];
+                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + seg.name + ext);
+                    if (!std::filesystem::exists(outPath))
+                        filtered.push_back(seg);
+                }
+                m_pendingExport.segments = filtered;
+                if (!filtered.empty())
+                    m_exporter.Start(m_currentFilePath, m_pendingExport);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(btnW, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+
+    // Open file confirmation (segments will be lost)
+    if (m_showOpenFileConfirm) {
+        ImGui::OpenPopup("Open New File?");
+        m_showOpenFileConfirm = false;
+    }
+    if (ImGui::BeginPopupModal("Open New File?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Opening a new file will clear all segments.");
+        ImGui::Text("Are you sure you want to proceed?");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("Proceed", ImVec2(btnW, 0))) {
+            OpenFile(m_pendingOpenFilePath);
+            m_pendingOpenFilePath.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(-1, 0))) {
+            m_pendingOpenFilePath.clear();
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::EndPopup();
     }
 
