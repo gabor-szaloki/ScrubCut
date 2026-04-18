@@ -68,9 +68,10 @@ public:
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
 
+    void SetProfileSeek(bool enable) { m_profileSeek = enable; }
+
     void SetScrubbing(bool scrubbing) {
         m_scrubbing.store(scrubbing, std::memory_order_relaxed);
-        m_videoDecoder.SetFastDecode(scrubbing);
     }
 
     void SetVolume(float volume);
@@ -100,9 +101,7 @@ private:
     // Flushes decoder. Threads must be stopped.
     bool SyncSeekAndDecode(double targetSec);
 
-    // Decode forward from current position to targetSec without re-seeking.
-    // Returns false if it can't reach the target (e.g. crossed a keyframe boundary).
-    bool SyncDecodeForwardTo(double targetSec);
+
 
     // Background seek thread
     void SeekThread();
@@ -117,6 +116,7 @@ private:
     std::atomic<bool> m_stopSeekThread{false};
     std::atomic<bool> m_scrubbing{false};    // true during timeline drag (keyframe-only mode)
     bool m_seekThreadRunning = false;
+    bool m_profileSeek = false;
 
     // Sticky flag: true when the user intends playback to continue after seeking.
     // Set by SeekTo when playback was active, cleared only when Play() is called.

@@ -239,42 +239,31 @@ void Player::SeekThread() {
 
         bool scrubbing = m_scrubbing.load(std::memory_order_relaxed);
 
-        if (scrubbing) {
+        // Skip seek if already at the right frame (within one frame duration)
+        {
             double currentSec = m_clock.GetTime();
             double delta = target - currentSec;
             double frameDur = GetFrameDuration();
-            bool decoded = false;
-
             if (!m_decoderDirty && delta > -frameDur && delta <= 0.0) {
-                // Already at/past the target by less than one frame — reuse current frame
-                decoded = true;
-            } else if (!m_decoderDirty && delta > 0.0 && delta < 10.0) {
-                decoded = SyncDecodeForwardTo(target);
-            }
-            if (!decoded) {
-                // Check if a newer request arrived — skip this expensive decode
-                {
-                    std::lock_guard<std::mutex> lock(m_seekMutex);
-                    if (m_seekRequest >= 0.0) {
-                        m_seekBusy = false;
-                        continue;
-                    }
-                }
-                SyncSeekAndDecode(target);
-            }
-        } else {
-            // Full precision seek (non-scrubbing)
-            double currentSec = m_clock.GetTime();
-            double delta = target - currentSec;
-            bool decoded = false;
-            if (!m_decoderDirty && delta > 0.0 && delta < 2.0) {
-                decoded = SyncDecodeForwardTo(target);
-            }
-            if (!decoded) {
-                SyncSeekAndDecode(target);
+                if (m_profileSeek) LOG_INFO("Seek: REUSE delta=%.3f", delta);
+                goto seekDone;
             }
         }
 
+        // Check if a newer request arrived — skip this expensive decode
+        {
+            std::lock_guard<std::mutex> lock(m_seekMutex);
+            if (m_seekRequest >= 0.0) {
+                if (m_profileSeek) LOG_INFO("Seek: SKIPPED (newer request)");
+                m_seekBusy = false;
+                continue;
+            }
+        }
+
+        if (m_profileSeek) LOG_INFO("Seek: FULL scrub=%d dirty=%d", scrubbing, (int)m_decoderDirty);
+        SyncSeekAndDecode(target);
+
+    seekDone:
         // Check if a newer seek request arrived while we were decoding
         {
             std::lock_guard<std::mutex> lock(m_seekMutex);
@@ -308,7 +297,6 @@ void Player::PollSeekComplete() {
 
     if (!m_seekDone.load(std::memory_order_acquire)) return;
     m_seekDone = false;
-    m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
     if (m_seekShouldResume.load(std::memory_order_relaxed)) {
         m_seekShouldResume = false;
@@ -553,6 +541,8 @@ bool Player::SyncDecodeNextFrame() {
 
 bool Player::SyncSeekAndDecode(double targetSec) {
     TRACE_EVENT("SyncSeekAndDecode");
+    uint64_t t0 = m_profileSeek ? SDL_GetTicksNS() : 0;
+
     // Flush decoder state — we're seeking to a new position
     m_videoDecoder.Flush();
     if (m_hasAudio) m_audioDecoder.Flush();
@@ -568,6 +558,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
         m_audioOutput.ResetPosition(targetSec);
     }
 
+    uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
     // Seek demuxer to keyframe at or before target
     m_demuxer.Seek(targetSec);
     m_eof = false;
@@ -577,10 +568,12 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     AVRational tb = m_demuxer.GetVideoTimeBase();
     int64_t targetPts = static_cast<int64_t>(targetSec / av_q2d(tb));
 
+    uint64_t tSeek = m_profileSeek ? SDL_GetTicksNS() : 0;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     AVFrame* bestFrame = nullptr;
     int maxPackets = 500;
+    int videoFrames = 0;
 
     while (maxPackets-- > 0) {
         int ret = m_demuxer.ReadPacket(pkt);
@@ -604,6 +597,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
+            videoFrames++;
             if (!bestFrame) {
                 bestFrame = av_frame_alloc();
             } else {
@@ -618,6 +612,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     }
 
 done:
+    uint64_t tDecode = m_profileSeek ? SDL_GetTicksNS() : 0;
     av_packet_free(&pkt);
     av_frame_free(&frame);
 
@@ -638,82 +633,18 @@ done:
             m_hasCachedFrame = true;
         }
 
+        if (m_profileSeek) {
+            uint64_t tConvert = SDL_GetTicksNS();
+            LOG_INFO("SyncSeek: flush=%.1fms seek=%.1fms decode=%.1fms(%d frm) rgba=%.1fms total=%.1fms",
+                     (tFlush-t0)/1e6, (tSeek-tFlush)/1e6, (tDecode-tSeek)/1e6,
+                     videoFrames, (tConvert-tDecode)/1e6, (tConvert-t0)/1e6);
+        }
+
         av_frame_free(&bestFrame);
         return m_hasCachedFrame;
     }
 
     m_clock.SetTime(targetSec);
-    return false;
-}
-
-bool Player::SyncDecodeForwardTo(double targetSec) {
-    TRACE_EVENT("SyncDecodeForwardTo");
-    AVRational tb = m_demuxer.GetVideoTimeBase();
-    int64_t targetPts = static_cast<int64_t>(targetSec / av_q2d(tb));
-
-    if (m_lastDisplayedPts != AV_NOPTS_VALUE && targetPts <= m_lastDisplayedPts) {
-        return false; // target is behind us, can't decode forward
-    }
-
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* bestFrame = nullptr;
-    int maxPackets = 200;
-
-    while (maxPackets-- > 0) {
-        int ret = m_demuxer.ReadPacket(pkt);
-        if (ret == AVERROR_EOF || ret < 0) break;
-
-        if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
-            av_packet_unref(pkt);
-            continue;
-        }
-
-        ret = m_videoDecoder.SendPacket(pkt);
-        av_packet_unref(pkt);
-        if (ret < 0) continue;
-
-        while (true) {
-            ret = m_videoDecoder.ReceiveFrame(frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-            if (ret < 0) break;
-
-            if (!bestFrame)
-                bestFrame = av_frame_alloc();
-            else
-                av_frame_unref(bestFrame);
-            av_frame_move_ref(bestFrame, frame);
-
-            if (bestFrame->pts >= targetPts)
-                goto fwdDone;
-        }
-    }
-
-fwdDone:
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-
-    if (bestFrame && bestFrame->pts > m_lastDisplayedPts) {
-        double frameSec = static_cast<double>(bestFrame->pts) * av_q2d(tb);
-        m_clock.SetTime(frameSec);
-        m_lastDisplayedPts = bestFrame->pts;
-
-        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
-        if (rgba) {
-            m_frameCache.Put(bestFrame->pts, rgba,
-                             m_frameConverter.GetWidth(),
-                             m_frameConverter.GetHeight());
-            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
-            m_cachedWidth = m_frameConverter.GetWidth();
-            m_cachedHeight = m_frameConverter.GetHeight();
-            m_hasCachedFrame = true;
-        }
-
-        av_frame_free(&bestFrame);
-        return m_hasCachedFrame;
-    }
-
-    if (bestFrame) av_frame_free(&bestFrame);
     return false;
 }
 

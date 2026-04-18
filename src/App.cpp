@@ -119,6 +119,10 @@ bool App::Init() {
         TraceFile::Get().Open(tracePath.c_str());
         LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
+    if (CommandLine::Get().HasFlag("-profileseek")) {
+        m_player.SetProfileSeek(true);
+        LOG_INFO("Seek profiling enabled");
+    }
     m_layoutSettings.Load(GetAppDataDir() / "layout.ini");
     m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
 
@@ -919,8 +923,12 @@ void App::Render() {
             if (ImGui::IsItemHovered() || ImGui::IsItemActive())
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
-                m_player.SetScrubbing(false);
-                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+                if (m_wasPlayingBeforeTimelineSeek) {
+                    m_player.SetScrubbing(false);
+                    m_player.SeekTo(m_seekTarget, true);
+                } else {
+                    m_player.SetScrubbing(false);
+                }
                 m_isTimelineSeeking = false;
             }
 
@@ -952,7 +960,8 @@ void App::Render() {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
                 m_player.SetScrubbing(false);
-                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+                if (m_wasPlayingBeforeTimelineSeek)
+                    m_player.SeekTo(m_seekTarget, true);
                 m_isTimelineSeeking = false;
             }
         }
@@ -981,7 +990,8 @@ void App::Render() {
         }
         if (m_isTimelineSeeking && !ImGui::IsItemActive()) {
             m_player.SetScrubbing(false);
-            m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
+            if (m_wasPlayingBeforeTimelineSeek)
+                m_player.SeekTo(m_seekTarget, true);
             m_isTimelineSeeking = false;
         }
 
