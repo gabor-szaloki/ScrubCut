@@ -9,6 +9,8 @@ struct TimeRange {
     double startSec = 0.0;
     double endSec = 0.0;
     ExportMode mode = ExportMode::SourceFormat;
+    std::string name;
+    int colorIndex = 0;
 };
 
 struct ExportSettings {

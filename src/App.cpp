@@ -41,6 +41,25 @@ static constexpr PlatformKeys kKeys = {
 };
 #endif
 
+// Fixed cycling color palette for segments
+static const ImVec4 kSegmentColors[] = {
+    {0.30f, 0.55f, 0.85f, 1.0f},  // blue
+    {0.90f, 0.55f, 0.20f, 1.0f},  // orange
+    {0.35f, 0.75f, 0.40f, 1.0f},  // green
+    {0.85f, 0.35f, 0.35f, 1.0f},  // red
+    {0.65f, 0.45f, 0.80f, 1.0f},  // purple
+    {0.30f, 0.75f, 0.80f, 1.0f},  // cyan
+    {0.85f, 0.75f, 0.25f, 1.0f},  // yellow
+    {0.85f, 0.50f, 0.65f, 1.0f},  // pink
+};
+static const int kSegmentColorCount = sizeof(kSegmentColors) / sizeof(kSegmentColors[0]);
+
+static ImU32 GetSegmentColor(int colorIndex, float alpha = 1.0f) {
+    const ImVec4& c = kSegmentColors[colorIndex % kSegmentColorCount];
+    return IM_COL32(static_cast<int>(c.x * 255), static_cast<int>(c.y * 255),
+                    static_cast<int>(c.z * 255), static_cast<int>(alpha * 255));
+}
+
 bool App::Init() {
     LogFile::Get().Open();
 
@@ -80,6 +99,13 @@ bool App::Init() {
     SDL_GL_MakeCurrent(m_window, m_glContext);
     SDL_GL_SetSwapInterval(1);
 
+    // Delete layout/settings files before ImGui loads them
+    bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
+    if (resetLayout) {
+        std::filesystem::remove(GetAppDataDir() / "imgui.ini");
+        std::filesystem::remove(GetAppDataDir() / "settings.ini");
+    }
+
     if (!m_ui.Init(m_window, m_glContext)) {
         LOG_ERROR("UIManager::Init failed");
         return false;
@@ -91,12 +117,9 @@ bool App::Init() {
         LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
     m_settings.Load(GetAppDataDir() / "settings.ini");
-    if (CommandLine::Get().HasFlag("--resetlayout")) {
-        m_ui.DeleteLayoutFile();
-        std::filesystem::remove(GetAppDataDir() / "settings.ini");
+    if (resetLayout) {
+        // files already deleted, nothing to restore
     } else {
-        // Restore saved window state
-        m_settings.Load(GetAppDataDir() / "settings.ini");
         int ww = m_settings.GetInt("window_width", 0);
         int wh = m_settings.GetInt("window_height", 0);
         if (ww > 0 && wh > 0)
@@ -316,6 +339,7 @@ void App::ProcessEvents() {
                 break;
             }
             case SDLK_I:
+            case SDLK_LEFTBRACKET:
                 if (m_player.HasMedia()) {
                     int before = m_segments.GetCount();
                     m_segments.SetMarkIn(m_player.GetPlaybackTime());
@@ -326,11 +350,18 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_O:
+            case SDLK_RIGHTBRACKET:
                 if (m_player.HasMedia()) {
-                    int before = m_segments.GetCount();
-                    m_segments.SetMarkOut(m_player.GetPlaybackTime());
-                    if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
-                        m_showSegments = true;
+                    double now_t = m_player.GetPlaybackTime();
+                    if (m_segments.HasPendingMarkIn()) {
+                        int before = m_segments.GetCount();
+                        m_segments.SetMarkOut(now_t);
+                        if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                            m_showSegments = true;
+                    } else if (m_segments.GetCount() > 0) {
+                        int last = m_segments.GetCount() - 1;
+                        m_segments.UpdateSegment(last, m_segments.GetSegments()[last].startSec, now_t);
+                    }
                     m_lastUIActivityNS = SDL_GetTicksNS();
                     if (m_autoHideUI) m_uiHidden = false;
                 }
@@ -406,11 +437,15 @@ void App::Render() {
 
     m_ui.BeginFrame(m_fullscreen);
 
+    ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+
     // Reposition floating windows proportionally when viewport size changes
+    // (skip during layout reset — let the default positions apply)
     {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         ImVec2 newSize = mvp->WorkSize;
-        if (m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
+        if (layoutCond != ImGuiCond_Always &&
+            m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
             (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
 
             const char* floatingWindows[] = { "Timeline", "Segments", "Help" };
@@ -478,8 +513,6 @@ void App::Render() {
     } else {
         SDL_ShowCursor();
     }
-
-    ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
 
     // Menu bar — in fullscreen: overlay with fade, subject to auto-hide
     bool showMenuBar = !m_fullscreen || !m_uiHidden;
@@ -647,13 +680,54 @@ void App::Render() {
         ImGui::SameLine();
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
 
+        // Segment mark buttons — centered between transport and audio controls
+        {
+            float afterTransport = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x;
+            bool muted_ = m_player.IsMuted();
+            float muteW_ = ImGui::CalcTextSize(muted_ ? "Unmute" : "Mute").x + ImGui::GetStyle().FramePadding.x * 2;
+            float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f;
+            float bracketW = ImGui::CalcTextSize(" [ ").x + ImGui::GetStyle().FramePadding.x * 2;
+            float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x;
+            float segStart = afterTransport + (audioStart - afterTransport - segBtnsW) * 0.5f;
+            ImGui::SameLine(segStart);
+        }
+        if (ImGui::Button(" [ ")) {
+            int before = m_segments.GetCount();
+            m_segments.SetMarkIn(m_player.GetPlaybackTime());
+            if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                m_showSegments = true;
+            m_lastUIActivityNS = SDL_GetTicksNS();
+            if (m_autoHideUI) m_uiHidden = false;
+        }
+        ImGui::SameLine();
+        bool canMarkOut = m_segments.HasPendingMarkIn() || m_segments.GetCount() > 0;
+        if (!canMarkOut) ImGui::BeginDisabled();
+        if (ImGui::Button(" ] ")) {
+            double now_t = m_player.GetPlaybackTime();
+            if (m_segments.HasPendingMarkIn()) {
+                int before = m_segments.GetCount();
+                m_segments.SetMarkOut(now_t);
+                if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                    m_showSegments = true;
+            } else if (m_segments.GetCount() > 0) {
+                int last = m_segments.GetCount() - 1;
+                m_segments.UpdateSegment(last, m_segments.GetSegments()[last].startSec, now_t);
+            }
+            m_lastUIActivityNS = SDL_GetTicksNS();
+            if (m_autoHideUI) m_uiHidden = false;
+        }
+        if (!canMarkOut) ImGui::EndDisabled();
+
         // Right: Mute + volume slider
         {
-            float volumeAreaWidth = 140.0f;
-            ImGui::SameLine(panelWidth - volumeAreaWidth);
-            bool noAudio = hasMedia && !m_player.HasAudio();
-            if (noAudio) ImGui::BeginDisabled();
             bool muted = m_player.IsMuted();
+            bool noAudio = hasMedia && !m_player.HasAudio();
+            float muteW = ImGui::CalcTextSize(muted ? "Unmute" : "Mute").x + ImGui::GetStyle().FramePadding.x * 2;
+            float sliderW = 80.0f;
+            float spacing = ImGui::GetStyle().ItemSpacing.x;
+            float volumeAreaWidth = muteW + spacing + sliderW;
+            ImGui::SameLine(panelWidth - volumeAreaWidth);
+            if (noAudio) ImGui::BeginDisabled();
             if (ImGui::Button(muted ? "Unmute" : "Mute")) {
                 m_player.SetMuted(!muted);
             }
@@ -662,7 +736,7 @@ void App::Render() {
                 ImGui::Text("No Audio");
             } else {
                 float volPct = m_player.GetVolume() * 100.0f;
-                ImGui::SetNextItemWidth(80.0f);
+                ImGui::SetNextItemWidth(sliderW);
                 if (ImGui::SliderFloat("##vol", &volPct, 0.0f, 100.0f, "%.0f%%")) {
                     m_player.SetVolume(volPct / 100.0f);
                     if (volPct > 0.0f && m_player.IsMuted()) m_player.SetMuted(false);
@@ -691,11 +765,9 @@ void App::Render() {
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
             float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
-            // Color by export mode
-            ImU32 fillCol = (segs[i].mode == ExportMode::GIF)
-                ? fadeCol(180, 120, 220, 120) : fadeCol(80, 140, 220, 120);
-            ImU32 borderCol = (segs[i].mode == ExportMode::GIF)
-                ? fadeCol(200, 150, 255, 200) : fadeCol(100, 170, 255, 200);
+            // Color by segment palette
+            ImU32 fillCol = GetSegmentColor(segs[i].colorIndex, 0.45f * m_uiAlpha);
+            ImU32 borderCol = GetSegmentColor(segs[i].colorIndex, 0.8f * m_uiAlpha);
             drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
             drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol);
         }
@@ -864,89 +936,121 @@ void App::Render() {
     if (m_showSegments && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350 - 40, vp->WorkPos.y + 40), layoutCond);
-    ImGui::SetNextWindowSize(ImVec2(350, 150), layoutCond);
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 300 - 40, vp->WorkPos.y + 40), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(300, 250), layoutCond);
     bool segmentsWasOpen = m_showSegments;
     ImGui::Begin("Segments", &m_showSegments);
-    if (m_player.HasMedia()) {
-        double displayTime = m_seekTarget;
 
-        // --- Mark buttons ---
-        if (ImGui::Button("Mark In")) {
-            m_segments.SetMarkIn(displayTime);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Mark Out")) {
-            m_segments.SetMarkOut(displayTime);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear Marks")) {
-            m_segments.ClearPendingMark();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear All")) {
-            m_segments.Clear();
-        }
-        if (m_segments.HasPendingMarkIn()) {
-            double markIn = m_segments.GetPendingMarkIn();
-            int mMin = static_cast<int>(markIn) / 60;
-            int mSec = static_cast<int>(markIn) % 60;
-            int mMs  = static_cast<int>(markIn * 1000) % 1000;
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "  Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
-        }
+    // Pending mark-in indicator
+    if (m_segments.HasPendingMarkIn()) {
+        double markIn = m_segments.GetPendingMarkIn();
+        int mMin = static_cast<int>(markIn) / 60;
+        int mSec = static_cast<int>(markIn) % 60;
+        int mMs  = static_cast<int>(markIn * 1000) % 1000;
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
+    }
 
-        ImGui::Separator();
+    // Scrollable segment list
+    float bottomHeight = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 4;
+    if (ImGui::BeginChild("##seglist", ImVec2(0, -bottomHeight), ImGuiChildFlags_None)) {
+        if (m_segments.GetCount() > 0) {
+            const auto& segs = m_segments.GetSegments();
+            int removeIdx = -1;
+            for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+                ImGui::PushID(i);
+                const ImVec4& segColor = kSegmentColors[segs[i].colorIndex % kSegmentColorCount];
 
-    if (m_segments.GetCount() > 0) {
-        const auto& segs = m_segments.GetSegments();
-        int removeIdx = -1;
-        for (int i = 0; i < static_cast<int>(segs.size()); i++) {
-            int sMin = static_cast<int>(segs[i].startSec) / 60;
-            int sSec = static_cast<int>(segs[i].startSec) % 60;
-            int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
-            int eMin = static_cast<int>(segs[i].endSec) / 60;
-            int eSec = static_cast<int>(segs[i].endSec) % 60;
-            int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
-            double dur = segs[i].endSec - segs[i].startSec;
+                ImGui::BeginGroup();
 
-            char label[128];
-            snprintf(label, sizeof(label), "[%d] %02d:%02d.%03d - %02d:%02d.%03d (%.1fs)",
-                     i + 1, sMin, sSec, sMs, eMin, eSec, eMs, dur);
+                // Row 1: color square, name field, delete button
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                ImVec2 sq = ImGui::GetCursorScreenPos();
+                float sqSize = ImGui::GetTextLineHeight();
+                dl->AddRectFilled(sq, ImVec2(sq.x + sqSize, sq.y + sqSize),
+                    GetSegmentColor(segs[i].colorIndex));
+                ImGui::Dummy(ImVec2(sqSize, sqSize));
+                ImGui::SameLine();
 
-            // Limit selectable width so it doesn't overlap buttons
-            float buttonsWidth = 90.0f;
-            float selectableWidth = ImGui::GetContentRegionAvail().x - buttonsWidth;
-            if (ImGui::Selectable(label, false, 0, ImVec2(selectableWidth, 0))) {
-                m_player.SeekTo(segs[i].startSec);
+                char nameBuf[64];
+                snprintf(nameBuf, sizeof(nameBuf), "%s", segs[i].name.c_str());
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 30);
+                if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf))) {
+                    m_segments.SetSegmentName(i, nameBuf);
+                }
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+                if (ImGui::SmallButton("X")) {
+                    removeIdx = i;
+                }
+                ImGui::PopStyleColor(3);
+
+                // Row 2: time range (clickable to seek)
+                int sMin = static_cast<int>(segs[i].startSec) / 60;
+                int sSec = static_cast<int>(segs[i].startSec) % 60;
+                int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
+                int eMin = static_cast<int>(segs[i].endSec) / 60;
+                int eSec = static_cast<int>(segs[i].endSec) % 60;
+                int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
+                char timeBuf[64];
+                snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d.%03d -> %02d:%02d.%03d",
+                         sMin, sSec, sMs, eMin, eSec, eMs);
+                if (ImGui::Selectable(timeBuf, false, 0)) {
+                    m_player.SeekTo(segs[i].startSec);
+                }
+
+                // Row 3: duration + mode toggle
+                double dur = segs[i].endSec - segs[i].startSec;
+                ImGui::Text("Duration: %.1fs", dur);
+                ImGui::SameLine(ImGui::GetContentRegionAvail().x - 40);
+                const char* modeLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(segColor.x, segColor.y, segColor.z, 0.7f));
+                char modeBuf[32];
+                snprintf(modeBuf, sizeof(modeBuf), "%s##mode", modeLabel);
+                if (ImGui::SmallButton(modeBuf)) {
+                    ExportMode newMode = (segs[i].mode == ExportMode::GIF)
+                        ? ExportMode::SourceFormat : ExportMode::GIF;
+                    m_segments.SetSegmentMode(i, newMode);
+                }
+                ImGui::PopStyleColor();
+
+                ImGui::EndGroup();
+
+                if (i < static_cast<int>(segs.size()) - 1)
+                    ImGui::Separator();
+
+                ImGui::PopID();
             }
-
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - buttonsWidth + 10.0f);
-            const char* modeLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
-            ImU32 modeCol = (segs[i].mode == ExportMode::GIF)
-                ? IM_COL32(200, 150, 255, 255) : IM_COL32(100, 170, 255, 255);
-            ImGui::PushStyleColor(ImGuiCol_Button, modeCol);
-            char modeBuf[32];
-            snprintf(modeBuf, sizeof(modeBuf), "%s##mode_%d", modeLabel, i);
-            if (ImGui::SmallButton(modeBuf)) {
-                ExportMode newMode = (segs[i].mode == ExportMode::GIF)
-                    ? ExportMode::SourceFormat : ExportMode::GIF;
-                m_segments.SetSegmentMode(i, newMode);
+            if (removeIdx >= 0) {
+                m_segments.RemoveSegment(removeIdx);
             }
-            ImGui::PopStyleColor();
-
-            ImGui::SameLine();
-            char xBuf[16];
-            snprintf(xBuf, sizeof(xBuf), "X##seg_%d", i);
-            if (ImGui::SmallButton(xBuf)) {
-                removeIdx = i;
-            }
-        }
-        if (removeIdx >= 0) {
-            m_segments.RemoveSegment(removeIdx);
         }
     }
-    } // end if (m_player.HasMedia())
+    ImGui::EndChild();
+
+    // Bottom bar: Export + Clear All (always visible)
+    ImGui::Separator();
+    bool hasSegments = m_segments.GetCount() > 0;
+    bool canExport = hasSegments && !m_exporter.IsRunning();
+    if (!canExport) ImGui::BeginDisabled();
+    float btnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
+    if (ImGui::Button("Export Segments", ImVec2(btnWidth, 0))) {
+        m_showExportDialog = true;
+        auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
+        auto stem = std::filesystem::path(m_currentFilePath).stem().string();
+        snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+        snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
+        m_pendingExport = ExportSettings{};
+    }
+    if (!canExport) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!hasSegments) ImGui::BeginDisabled();
+    if (ImGui::Button("Clear All", ImVec2(-1, 0))) {
+        m_segments.Clear();
+    }
+    if (!hasSegments) ImGui::EndDisabled();
+
     ImGui::End();
     if (segmentsWasOpen && !m_showSegments) m_segmentsClosedManually = true;
     ImGui::PopStyleVar();
@@ -975,8 +1079,8 @@ void App::Render() {
             row("Frame step",           (std::string(kKeys.frameStepName) + " + Left / Right  or  , / .").c_str());
             row("Speed up / down",      "+ / -");
             row("Jump to start / end",  kKeys.jumpName);
-            row("Mark In",              "I");
-            row("Mark Out",             "O");
+            row("Mark In",              "I  or  [");
+            row("Mark Out",             "O  or  ]");
             row("Remove last segment",  kKeys.deleteName);
             row("Export segments",      (std::string(kKeys.cmdName) + " + E").c_str());
             row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());

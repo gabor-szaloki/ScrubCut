@@ -91,8 +91,16 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, int segmentIn
     std::string stem = base.stem().string();
     std::string dir = base.parent_path().string();
 
-    char suffix[32];
-    snprintf(suffix, sizeof(suffix), "_%03d", segmentIndex + 1);
+    // Use segment name if available, otherwise fall back to index
+    std::string suffix;
+    if (segmentIndex < static_cast<int>(m_settings.segments.size()) &&
+        !m_settings.segments[segmentIndex].name.empty()) {
+        suffix = "_" + m_settings.segments[segmentIndex].name;
+    } else {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "_%03d", segmentIndex + 1);
+        suffix = buf;
+    }
 
     std::filesystem::path result = std::filesystem::path(dir) / (stem + suffix + extension);
     return result.string();

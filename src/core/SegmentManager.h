@@ -4,12 +4,16 @@
 #include <vector>
 #include <optional>
 #include <algorithm>
+#include <cstdio>
 
 class SegmentManager {
 public:
     int AddSegment(double startSec, double endSec) {
         if (startSec > endSec) std::swap(startSec, endSec);
-        m_segments.push_back({startSec, endSec});
+        char nameBuf[8];
+        snprintf(nameBuf, sizeof(nameBuf), "%03d", m_nextColorIndex + 1);
+        m_segments.push_back({startSec, endSec, ExportMode::SourceFormat, nameBuf, m_nextColorIndex});
+        m_nextColorIndex++;
         return static_cast<int>(m_segments.size()) - 1;
     }
 
@@ -21,8 +25,8 @@ public:
     void UpdateSegment(int index, double startSec, double endSec) {
         if (index >= 0 && index < static_cast<int>(m_segments.size())) {
             if (startSec > endSec) std::swap(startSec, endSec);
-            ExportMode mode = m_segments[index].mode;
-            m_segments[index] = {startSec, endSec, mode};
+            m_segments[index].startSec = startSec;
+            m_segments[index].endSec = endSec;
         }
     }
 
@@ -31,9 +35,15 @@ public:
             m_segments[index].mode = mode;
     }
 
+    void SetSegmentName(int index, const std::string& name) {
+        if (index >= 0 && index < static_cast<int>(m_segments.size()))
+            m_segments[index].name = name;
+    }
+
     void Clear() {
         m_segments.clear();
         m_pendingMarkIn.reset();
+        m_nextColorIndex = 0;
     }
 
     // Mark-in/mark-out workflow
@@ -58,4 +68,5 @@ public:
 private:
     std::vector<TimeRange> m_segments;
     std::optional<double> m_pendingMarkIn;
+    int m_nextColorIndex = 0;
 };
