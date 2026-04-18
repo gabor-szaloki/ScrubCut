@@ -34,11 +34,12 @@ void UIManager::Shutdown() {
     ImGui::DestroyContext();
 }
 
-void UIManager::BeginFrame() {
+void UIManager::BeginFrame(bool fullscreen) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
+    m_fullscreen = fullscreen;
     SetupDockspace();
 }
 
@@ -49,8 +50,11 @@ void UIManager::EndFrame() {
 
 void UIManager::SetupDockspace() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
+    // In fullscreen, cover the full viewport so video renders behind the menu bar
+    ImVec2 dockPos  = m_fullscreen ? viewport->Pos  : viewport->WorkPos;
+    ImVec2 dockSize = m_fullscreen ? viewport->Size : viewport->WorkSize;
+    ImGui::SetNextWindowPos(dockPos);
+    ImGui::SetNextWindowSize(dockSize);
     ImGui::SetNextWindowViewport(viewport->ID);
 
     ImGuiWindowFlags flags =

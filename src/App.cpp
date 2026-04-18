@@ -107,8 +107,12 @@ bool App::Init() {
             SDL_SetWindowPosition(m_window, wx, wy);
         m_showTimeline = m_settings.GetBool("show_timeline", true);
         m_showSegments = m_settings.GetBool("show_segments", false);
+        m_autoHideCursor = m_settings.GetBool("auto_hide_cursor", true);
         m_autoHideUI = m_settings.GetBool("auto_hide_ui", true);
     }
+
+    SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
+    SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
 
     LOG_INFO("ScrubCut initialized");
     m_running = true;
@@ -157,20 +161,19 @@ void App::Run() {
 void App::Shutdown() {
     m_player.Close();
 
-    // Save window state before destroying
+    // Save windowed mode geometry (tracked while not fullscreen)
     if (m_window) {
-        int wx, wy, ww, wh;
-        SDL_GetWindowPosition(m_window, &wx, &wy);
-        SDL_GetWindowSize(m_window, &ww, &wh);
-        m_settings.SetInt("window_x", wx);
-        m_settings.SetInt("window_y", wy);
-        m_settings.SetInt("window_width", ww);
-        m_settings.SetInt("window_height", wh);
+        m_settings.SetInt("window_x", m_windowedX);
+        m_settings.SetInt("window_y", m_windowedY);
+        m_settings.SetInt("window_width", m_windowedW);
+        m_settings.SetInt("window_height", m_windowedH);
         m_settings.SetBool("show_timeline", m_showTimeline);
         m_settings.SetBool("show_segments", m_showSegments);
+        m_settings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_settings.SetBool("auto_hide_ui", m_autoHideUI);
         m_settings.Save();
     }
+    SDL_ShowCursor();
 
     if (m_videoTexture) {
         glDeleteTextures(1, &m_videoTexture);
@@ -234,6 +237,11 @@ void App::ProcessEvents() {
             m_lastUIActivityNS = SDL_GetTicksNS();
             if (m_autoHideUI)
                 m_uiHidden = false;
+        }
+
+        if (!m_fullscreen && (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)) {
+            SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
+            SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
         }
 
         if (event.type == SDL_EVENT_QUIT) {
@@ -354,6 +362,16 @@ void App::ProcessEvents() {
                     if (!m_showSegments) m_segmentsClosedManually = true;
                 }
                 break;
+            case SDLK_F:
+                m_fullscreen = !m_fullscreen;
+                SDL_SetWindowFullscreen(m_window, m_fullscreen);
+                break;
+            case SDLK_ESCAPE:
+                if (m_fullscreen) {
+                    m_fullscreen = false;
+                    SDL_SetWindowFullscreen(m_window, false);
+                }
+                break;
             case SDLK_H:
                 if (!m_autoHideUI) {
                     m_uiHidden = !m_uiHidden;
@@ -386,7 +404,44 @@ void App::Render() {
         m_seekTarget = m_player.GetPlaybackTime();
     }
 
-    m_ui.BeginFrame();
+    m_ui.BeginFrame(m_fullscreen);
+
+    // Reposition floating windows proportionally when viewport size changes
+    {
+        ImGuiViewport* mvp = ImGui::GetMainViewport();
+        ImVec2 newSize = mvp->WorkSize;
+        if (m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
+            (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
+
+            const char* floatingWindows[] = { "Timeline", "Segments", "Help" };
+            float margin = 20.0f;
+            for (const char* name : floatingWindows) {
+                ImGuiWindow* win = ImGui::FindWindowByName(name);
+                if (!win || win->DockId != 0) continue;
+
+                // Compute center as ratio of old viewport
+                float cx = (win->Pos.x + win->SizeFull.x * 0.5f - mvp->WorkPos.x) / m_prevViewportSize.x;
+                float cy = (win->Pos.y + win->SizeFull.y * 0.5f - mvp->WorkPos.y) / m_prevViewportSize.y;
+
+                // Apply ratio to new viewport to get new center
+                float newCX = mvp->WorkPos.x + cx * newSize.x;
+                float newCY = mvp->WorkPos.y + cy * newSize.y;
+
+                // Derive top-left from center
+                float newX = newCX - win->SizeFull.x * 0.5f;
+                float newY = newCY - win->SizeFull.y * 0.5f;
+
+                // Clamp with margin
+                newX = std::max(mvp->WorkPos.x + margin,
+                       std::min(newX, mvp->WorkPos.x + newSize.x - win->SizeFull.x - margin));
+                newY = std::max(mvp->WorkPos.y + margin,
+                       std::min(newY, mvp->WorkPos.y + newSize.y - win->SizeFull.y - margin));
+
+                win->Pos = ImVec2(newX, newY);
+            }
+        }
+        m_prevViewportSize = newSize;
+    }
 
     // Keep UI visible while hovering any panel or menu (except the Viewport)
     bool hoveringUI = false;
@@ -413,10 +468,26 @@ void App::Render() {
         m_uiAlpha = 1.0f;
     }
 
+    // Auto-hide mouse cursor
+    if (m_autoHideCursor && m_lastUIActivityNS > 0) {
+        uint64_t elapsed = SDL_GetTicksNS() - m_lastUIActivityNS;
+        if (elapsed > 5000000000ULL && !hoveringUI)
+            SDL_HideCursor();
+        else
+            SDL_ShowCursor();
+    } else {
+        SDL_ShowCursor();
+    }
+
     ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
 
-    // Menu bar
-    if (ImGui::BeginMainMenuBar()) {
+    // Menu bar — in fullscreen: overlay with fade, subject to auto-hide
+    bool showMenuBar = !m_fullscreen || !m_uiHidden;
+    if (m_fullscreen && showMenuBar) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
+        ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.2f, 0.2f, 0.2f, 0.85f * m_uiAlpha));
+    }
+    if (showMenuBar && ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open...", (std::string(kKeys.cmdName) + "+O").c_str())) {
                 // TODO: file dialog
@@ -438,12 +509,22 @@ void App::Render() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Fullscreen", "F", m_fullscreen)) {
+                m_fullscreen = !m_fullscreen;
+                SDL_SetWindowFullscreen(m_window, m_fullscreen);
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.cmdName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
             if (ImGui::MenuItem("Segments", (std::string(kKeys.cmdName) + "+S").c_str(), m_showSegments)) {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
             }
+            if (ImGui::MenuItem("Help", "?", m_showHelpPanel))
+                m_showHelpPanel = !m_showHelpPanel;
+            ImGui::Separator();
+            if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
+                m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
                 m_autoHideUI = !m_autoHideUI;
             if (ImGui::MenuItem("Show/Hide UI", "H", false, !m_autoHideUI)) {
@@ -470,6 +551,10 @@ void App::Render() {
             ImGui::EndMenu();
         }
         ImGui::EndMainMenuBar();
+    }
+    if (m_fullscreen && showMenuBar) {
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
     }
 
     ImGuiViewport* vp = ImGui::GetMainViewport();

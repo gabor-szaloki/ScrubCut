@@ -6,6 +6,7 @@
 #include "export/Exporter.h"
 #include "util/Settings.h"
 
+#include <imgui.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
 #include <string>
@@ -41,10 +42,14 @@ private:
     bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    bool m_autoHideCursor = true;
     bool m_autoHideUI = true;
     bool m_uiHidden = false;
+    bool m_fullscreen = false;
+    int m_windowedX = 0, m_windowedY = 0, m_windowedW = 1280, m_windowedH = 720;
     float m_uiAlpha = 1.0f;
     uint64_t m_lastUIActivityNS = 0;
+    ImVec2 m_prevViewportSize = {0, 0};
     ExportSettings m_pendingExport;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";
