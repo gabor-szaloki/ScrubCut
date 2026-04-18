@@ -101,6 +101,7 @@ void Player::Close() {
 void Player::Play() {
     TRACE_EVENT("Player::Play");
     if (!m_hasMedia) return;
+    WaitForSeek();
     if (m_eof) {
         // Restart from beginning
         EnsureThreadsStopped();
@@ -169,8 +170,11 @@ void Player::SeekTo(double seconds, bool resumeAfter) {
     double duration = m_demuxer.GetDuration();
     seconds = std::clamp(seconds, 0.0, duration);
 
+    // Don't resume playback if seeking to the very end
+    bool atEnd = (seconds >= duration - 0.01);
+
     // Track intent: if we were playing (or already want to play), remember it.
-    if (m_playing.load(std::memory_order_relaxed) || resumeAfter)
+    if (!atEnd && (m_playing.load(std::memory_order_relaxed) || resumeAfter))
         m_wantsToPlay = true;
 
     // Signal that we want to stop playing (the seek thread handles
@@ -268,6 +272,12 @@ void Player::SeekThread() {
 }
 
 void Player::PollSeekComplete() {
+    // Pause at end of video
+    if (m_playing && m_eof && m_clock.GetTime() >= m_demuxer.GetDuration()) {
+        m_clock.SetTime(m_demuxer.GetDuration());
+        Pause();
+    }
+
     if (!m_seekDone.load(std::memory_order_acquire)) return;
     m_seekDone = false;
 

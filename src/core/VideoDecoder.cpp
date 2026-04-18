@@ -46,10 +46,12 @@ void VideoDecoder::Close() {
 }
 
 int VideoDecoder::SendPacket(AVPacket* pkt) {
+    if (!m_codecCtx) return AVERROR(EINVAL);
     return avcodec_send_packet(m_codecCtx, pkt);
 }
 
 int VideoDecoder::ReceiveFrame(AVFrame* frame) {
+    if (!m_codecCtx) return AVERROR(EINVAL);
     return avcodec_receive_frame(m_codecCtx, frame);
 }
 
