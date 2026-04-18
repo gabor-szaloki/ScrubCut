@@ -111,6 +111,9 @@ bool App::Init() {
         return false;
     }
 
+    // Menu bar height estimate for 16:9 work area (font not built yet, use default 13px + 2*3px padding)
+    int menuBarHeight = 19;
+
     if (CommandLine::Get().HasFlag("-trace")) {
         auto tracePath = (GetAppDataDir() / "logs" / "scrubcut_trace.csv").string();
         TraceFile::Get().Open(tracePath.c_str());
@@ -118,12 +121,13 @@ bool App::Init() {
     }
     m_settings.Load(GetAppDataDir() / "settings.ini");
     if (resetLayout) {
-        // files already deleted, nothing to restore
+        // Default size: 16:9 work area below menu bar
+        SDL_SetWindowSize(m_window, 1280, 720 + menuBarHeight);
+        SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
-        int ww = m_settings.GetInt("window_width", 0);
-        int wh = m_settings.GetInt("window_height", 0);
-        if (ww > 0 && wh > 0)
-            SDL_SetWindowSize(m_window, ww, wh);
+        int ww = m_settings.GetInt("window_width", 1280);
+        int wh = m_settings.GetInt("window_height", 720 + menuBarHeight);
+        SDL_SetWindowSize(m_window, ww, wh);
         int wx = m_settings.GetInt("window_x", SDL_WINDOWPOS_UNDEFINED);
         int wy = m_settings.GetInt("window_y", SDL_WINDOWPOS_UNDEFINED);
         if (wx != SDL_WINDOWPOS_UNDEFINED && wy != SDL_WINDOWPOS_UNDEFINED)
@@ -600,7 +604,9 @@ void App::Render() {
                 m_showSegments = false;
                 m_showHelpPanel = false;
                 m_segmentsClosedManually = false;
-                SDL_SetWindowSize(m_window, 1280, 720);
+                int mbH = static_cast<int>(ImGui::GetFontSize() + ImGui::GetStyle().FramePadding.y * 2);
+                if (!m_fullscreen)
+                    SDL_SetWindowSize(m_window, 1280, 720 + mbH);
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                 std::filesystem::remove(GetAppDataDir() / "settings.ini");
             }
@@ -622,6 +628,7 @@ void App::Render() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
 
     // Viewport panel
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("Viewport");
     if (m_videoTexture && m_player.HasMedia()) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -643,6 +650,7 @@ void App::Render() {
         ImGui::TextWrapped("Drag and drop a video file to open it.");
     }
     ImGui::End();
+    ImGui::PopStyleVar();
 
     // Timeline panel (unified controls + timeline bar)
     if (m_showTimeline && !m_uiHidden) {
