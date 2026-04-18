@@ -99,11 +99,11 @@ bool App::Init() {
     SDL_GL_MakeCurrent(m_window, m_glContext);
     SDL_GL_SetSwapInterval(1);
 
-    // Delete layout/settings files before ImGui loads them
+    // Delete layout files before ImGui loads them
     bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
     if (resetLayout) {
         std::filesystem::remove(GetAppDataDir() / "imgui.ini");
-        std::filesystem::remove(GetAppDataDir() / "settings.ini");
+        std::filesystem::remove(GetAppDataDir() / "layout.ini");
     }
 
     if (!m_ui.Init(m_window, m_glContext)) {
@@ -119,23 +119,27 @@ bool App::Init() {
         TraceFile::Get().Open(tracePath.c_str());
         LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
     }
-    m_settings.Load(GetAppDataDir() / "settings.ini");
+    m_layoutSettings.Load(GetAppDataDir() / "layout.ini");
+    m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
+
+    // Preferences always load
+    m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
+    m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
+
     if (resetLayout) {
         // Default size: 16:9 work area below menu bar
         SDL_SetWindowSize(m_window, 1280, 720 + menuBarHeight);
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
-        int ww = m_settings.GetInt("window_width", 1280);
-        int wh = m_settings.GetInt("window_height", 720 + menuBarHeight);
+        int ww = m_layoutSettings.GetInt("window_width", 1280);
+        int wh = m_layoutSettings.GetInt("window_height", 720 + menuBarHeight);
         SDL_SetWindowSize(m_window, ww, wh);
-        int wx = m_settings.GetInt("window_x", SDL_WINDOWPOS_UNDEFINED);
-        int wy = m_settings.GetInt("window_y", SDL_WINDOWPOS_UNDEFINED);
+        int wx = m_layoutSettings.GetInt("window_x", SDL_WINDOWPOS_UNDEFINED);
+        int wy = m_layoutSettings.GetInt("window_y", SDL_WINDOWPOS_UNDEFINED);
         if (wx != SDL_WINDOWPOS_UNDEFINED && wy != SDL_WINDOWPOS_UNDEFINED)
             SDL_SetWindowPosition(m_window, wx, wy);
-        m_showTimeline = m_settings.GetBool("show_timeline", true);
-        m_showSegments = m_settings.GetBool("show_segments", false);
-        m_autoHideCursor = m_settings.GetBool("auto_hide_cursor", true);
-        m_autoHideUI = m_settings.GetBool("auto_hide_ui", true);
+        m_showTimeline = m_layoutSettings.GetBool("show_timeline", true);
+        m_showSegments = m_layoutSettings.GetBool("show_segments", false);
     }
 
     SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
@@ -190,15 +194,17 @@ void App::Shutdown() {
 
     // Save windowed mode geometry (tracked while not fullscreen)
     if (m_window) {
-        m_settings.SetInt("window_x", m_windowedX);
-        m_settings.SetInt("window_y", m_windowedY);
-        m_settings.SetInt("window_width", m_windowedW);
-        m_settings.SetInt("window_height", m_windowedH);
-        m_settings.SetBool("show_timeline", m_showTimeline);
-        m_settings.SetBool("show_segments", m_showSegments);
-        m_settings.SetBool("auto_hide_cursor", m_autoHideCursor);
-        m_settings.SetBool("auto_hide_ui", m_autoHideUI);
-        m_settings.Save();
+        m_layoutSettings.SetInt("window_x", m_windowedX);
+        m_layoutSettings.SetInt("window_y", m_windowedY);
+        m_layoutSettings.SetInt("window_width", m_windowedW);
+        m_layoutSettings.SetInt("window_height", m_windowedH);
+        m_layoutSettings.SetBool("show_timeline", m_showTimeline);
+        m_layoutSettings.SetBool("show_segments", m_showSegments);
+        m_layoutSettings.Save();
+
+        m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
+        m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
+        m_prefSettings.Save();
     }
     SDL_ShowCursor();
 
@@ -290,15 +296,17 @@ void App::ProcessEvents() {
             RequestOpenFile(event.drop.data);
         }
         if (event.type == SDL_EVENT_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
-            SDL_Keymod mod = SDL_GetModState();
+            SDL_Keymod mod = event.key.mod;
             bool shift     = (mod & SDL_KMOD_SHIFT)      != 0;
             bool cmd       = (mod & kKeys.cmdMod)        != 0;
             bool seekFine  = (mod & kKeys.seekFineMod)   != 0 && !cmd;
             bool frameStep = (mod & kKeys.frameStepMod)  != 0 && (!kKeys.frameStepNeedsCmd || cmd);
             bool jump      = kKeys.jumpMod && (mod & kKeys.jumpMod) != 0 && !frameStep;
+            bool noMod     = !shift && !cmd && !(mod & SDL_KMOD_ALT) && !(mod & SDL_KMOD_GUI) && !(mod & SDL_KMOD_CTRL);
 
             switch (event.key.key) {
             case SDLK_SPACE:
+                if (!noMod) break;
                 m_player.TogglePlayPause();
                 break;
             case SDLK_LEFT:
@@ -316,19 +324,24 @@ void App::ProcessEvents() {
                 else                m_player.SeekRelative(5.0);
                 break;
             case SDLK_COMMA:
+                if (!noMod) break;
                 m_player.StepFrame(-1);
                 break;
             case SDLK_PERIOD:
+                if (!noMod) break;
                 m_player.StepFrame(+1);
                 break;
             case SDLK_HOME:
+                if (!noMod) break;
                 m_player.SeekTo(0.0);
                 break;
             case SDLK_END:
+                if (!noMod) break;
                 m_player.SeekTo(m_player.GetDuration());
                 break;
             case SDLK_EQUALS: // + key (= without shift, + with shift)
             case SDLK_KP_PLUS: {
+                if (cmd) break;
                 double spd = m_player.GetSpeed();
                 if (spd < 0.25) spd = 0.25;
                 else if (spd < 0.5) spd = 0.5;
@@ -341,6 +354,7 @@ void App::ProcessEvents() {
             }
             case SDLK_MINUS:
             case SDLK_KP_MINUS: {
+                if (cmd) break;
                 double spd = m_player.GetSpeed();
                 if (spd > 4.0) spd = 4.0;
                 else if (spd > 2.0) spd = 2.0;
@@ -353,6 +367,7 @@ void App::ProcessEvents() {
             }
             case SDLK_I:
             case SDLK_LEFTBRACKET:
+                if (!noMod) break;
                 if (m_player.HasMedia()) {
                     int before = m_segments.GetCount();
                     m_segments.SetMarkIn(m_player.GetPlaybackTime());
@@ -374,8 +389,10 @@ void App::ProcessEvents() {
                     }, this, m_window, videoFilters, 2, nullptr, false);
                     break;
                 }
+                if (!noMod) break;
                 [[fallthrough]];
             case SDLK_RIGHTBRACKET:
+                if (!noMod) break;
                 if (m_player.HasMedia()) {
                     double now_t = m_player.GetPlaybackTime();
                     if (m_segments.HasPendingMarkIn()) {
@@ -393,6 +410,7 @@ void App::ProcessEvents() {
                 break;
             case SDLK_DELETE:
             case SDLK_BACKSPACE:
+                if (!noMod) break;
                 if (m_segments.GetCount() > 0) {
                     m_segments.RemoveSegment(m_segments.GetCount() - 1);
                     m_lastUIActivityNS = SDL_GetTicksNS();
@@ -419,16 +437,19 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_F:
+                if (!noMod) break;
                 m_fullscreen = !m_fullscreen;
                 SDL_SetWindowFullscreen(m_window, m_fullscreen);
                 break;
             case SDLK_ESCAPE:
+                if (!noMod) break;
                 if (m_fullscreen) {
                     m_fullscreen = false;
                     SDL_SetWindowFullscreen(m_window, false);
                 }
                 break;
             case SDLK_H:
+                if (!noMod) break;
                 if (!m_autoHideUI) {
                     m_uiHidden = !m_uiHidden;
                     m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
@@ -569,6 +590,16 @@ void App::Render() {
                 m_pendingExport = ExportSettings{};
             }
             ImGui::Separator();
+            if (ImGui::MenuItem("Open App Data Folder")) {
+                std::string appDataDir = GetAppDataDir().string();
+#ifdef __APPLE__
+                std::string cmd = "open \"" + appDataDir + "\"";
+#else
+                std::string cmd = "explorer \"" + appDataDir + "\"";
+#endif
+                system(cmd.c_str());
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {
                 m_running = false;
             }
@@ -608,7 +639,7 @@ void App::Render() {
                 if (!m_fullscreen)
                     SDL_SetWindowSize(m_window, 1280, 720 + mbH);
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-                std::filesystem::remove(GetAppDataDir() / "settings.ini");
+                std::filesystem::remove(GetAppDataDir() / "layout.ini");
             }
             ImGui::EndMenu();
         }

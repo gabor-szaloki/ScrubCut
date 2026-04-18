@@ -31,7 +31,8 @@ private:
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
     UIManager m_ui;
-    Settings m_settings;
+    Settings m_layoutSettings;
+    Settings m_prefSettings;
     bool m_running = false;
 
     Player m_player;
