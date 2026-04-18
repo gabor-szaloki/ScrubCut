@@ -27,6 +27,10 @@ bool VideoDecoder::Open(AVCodecParameters* codecParams) {
         return false;
     }
 
+    // Enable multi-threaded decoding
+    m_codecCtx->thread_count = 0;  // auto-detect (typically number of CPU cores)
+    m_codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
     ret = avcodec_open2(m_codecCtx, codec, nullptr);
     if (ret < 0) {
         LOG_ERROR("avcodec_open2 failed: %s", ff::ErrorString(ret).c_str());
@@ -70,4 +74,19 @@ int VideoDecoder::GetHeight() const {
 
 AVPixelFormat VideoDecoder::GetPixelFormat() const {
     return m_codecCtx ? m_codecCtx->pix_fmt : AV_PIX_FMT_NONE;
+}
+
+void VideoDecoder::SetFastDecode(bool fast) {
+    if (!m_codecCtx) return;
+    if (fast) {
+        m_codecCtx->skip_frame = AVDISCARD_NONREF;
+        m_codecCtx->skip_loop_filter = AVDISCARD_ALL;
+        m_codecCtx->skip_idct = AVDISCARD_NONREF;
+        m_codecCtx->flags2 |= AV_CODEC_FLAG2_FAST;
+    } else {
+        m_codecCtx->skip_frame = AVDISCARD_DEFAULT;
+        m_codecCtx->skip_loop_filter = AVDISCARD_DEFAULT;
+        m_codecCtx->skip_idct = AVDISCARD_DEFAULT;
+        m_codecCtx->flags2 &= ~AV_CODEC_FLAG2_FAST;
+    }
 }

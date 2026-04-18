@@ -139,6 +139,7 @@ void Player::Play() {
     m_waitingForResumeFrame = true;
     m_resumeTime = resumeTime;
     m_playing = true;
+    m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
     // Clock stays paused; TryGetVideoFrame will unpause it when ready.
 }
 
@@ -186,6 +187,7 @@ void Player::SeekTo(double seconds, bool resumeAfter) {
 
     // Clear stale completion — a new seek supersedes any previous result.
     m_seekDone = false;
+    m_pendingSeekTarget.store(seconds, std::memory_order_relaxed);
 
     // Post seek request to background thread (non-blocking)
     {
@@ -235,15 +237,42 @@ void Player::SeekThread() {
             m_decoderDirty = true;
         }
 
-        // Try fast forward decode if decoder state is intact
-        double currentSec = m_clock.GetTime();
-        double delta = target - currentSec;
-        bool decoded = false;
-        if (!m_decoderDirty && delta > 0.0 && delta < 2.0) {
-            decoded = SyncDecodeForwardTo(target);
-        }
-        if (!decoded) {
-            SyncSeekAndDecode(target);
+        bool scrubbing = m_scrubbing.load(std::memory_order_relaxed);
+
+        if (scrubbing) {
+            double currentSec = m_clock.GetTime();
+            double delta = target - currentSec;
+            double frameDur = GetFrameDuration();
+            bool decoded = false;
+
+            if (!m_decoderDirty && delta > -frameDur && delta <= 0.0) {
+                // Already at/past the target by less than one frame — reuse current frame
+                decoded = true;
+            } else if (!m_decoderDirty && delta > 0.0 && delta < 10.0) {
+                decoded = SyncDecodeForwardTo(target);
+            }
+            if (!decoded) {
+                // Check if a newer request arrived — skip this expensive decode
+                {
+                    std::lock_guard<std::mutex> lock(m_seekMutex);
+                    if (m_seekRequest >= 0.0) {
+                        m_seekBusy = false;
+                        continue;
+                    }
+                }
+                SyncSeekAndDecode(target);
+            }
+        } else {
+            // Full precision seek (non-scrubbing)
+            double currentSec = m_clock.GetTime();
+            double delta = target - currentSec;
+            bool decoded = false;
+            if (!m_decoderDirty && delta > 0.0 && delta < 2.0) {
+                decoded = SyncDecodeForwardTo(target);
+            }
+            if (!decoded) {
+                SyncSeekAndDecode(target);
+            }
         }
 
         // Check if a newer seek request arrived while we were decoding
@@ -251,15 +280,14 @@ void Player::SeekThread() {
             std::lock_guard<std::mutex> lock(m_seekMutex);
             if (m_seekRequest >= 0.0) {
                 m_seekBusy = false;
-                continue; // process the newer request instead of resuming
+                continue;
             }
         }
 
         bool shouldResume = m_wantsToPlay.load(std::memory_order_relaxed);
 
-        // Populate cache for backward stepping (safe here — no other thread
-        // touches the decoder while seek thread is busy and threads are stopped)
-        if (!shouldResume) {
+        // Populate cache for backward stepping (skip during scrubbing)
+        if (!shouldResume && !scrubbing) {
             PopulateCacheAroundCurrent();
         }
 
@@ -280,6 +308,7 @@ void Player::PollSeekComplete() {
 
     if (!m_seekDone.load(std::memory_order_acquire)) return;
     m_seekDone = false;
+    m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
     if (m_seekShouldResume.load(std::memory_order_relaxed)) {
         m_seekShouldResume = false;
@@ -298,6 +327,7 @@ void Player::StepFrame(int direction) {
     if (!m_hasMedia) return;
 
     WaitForSeek();
+    m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
     bool wasPlaying = m_playing.load(std::memory_order_relaxed);
     if (wasPlaying) Pause();
@@ -417,12 +447,13 @@ void Player::StepFrame(int direction) {
         }
 
         if (!cacheHit) {
-            // Cache miss — need to seek and decode
+            // Cache miss — need to seek and decode, then repopulate cache
             TRACE_LOG("StepBack_CacheMiss");
             double frameDur = GetFrameDuration();
             double targetSec = m_clock.GetTime() - frameDur;
             if (targetSec < 0.0) targetSec = 0.0;
             SyncSeekAndDecode(targetSec);
+            PopulateCacheAroundCurrent();
         }
     }
 }
@@ -526,10 +557,11 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     m_videoDecoder.Flush();
     if (m_hasAudio) m_audioDecoder.Flush();
 
-    // Flush queues
+    // Flush queues and frame cache (stale frames from previous position)
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
     m_videoFrameQueue.Flush();
+    m_frameCache.Clear();
 
     if (m_hasAudio) {
         m_audioOutput.Flush();

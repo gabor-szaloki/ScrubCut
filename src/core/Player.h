@@ -52,6 +52,10 @@ public:
     bool HasAudio() const { return m_hasAudio; }
     bool IsEOF() const { return m_eof.load(std::memory_order_relaxed); }
     double GetPlaybackTime() const { return m_clock.GetTime(); }
+    double GetSeekTargetTime() const {
+        double t = m_pendingSeekTarget.load(std::memory_order_relaxed);
+        return t >= 0.0 ? t : m_clock.GetTime();
+    }
     double GetDuration() const { return m_demuxer.GetDuration(); }
     double GetFrameRate() const { return m_demuxer.GetVideoFrameRate(); }
     double GetFrameDuration() const;
@@ -63,6 +67,11 @@ public:
 
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
+
+    void SetScrubbing(bool scrubbing) {
+        m_scrubbing.store(scrubbing, std::memory_order_relaxed);
+        m_videoDecoder.SetFastDecode(scrubbing);
+    }
 
     void SetVolume(float volume);
     float GetVolume() const { return m_volume; }
@@ -102,9 +111,11 @@ private:
     std::condition_variable m_seekCv;
     double m_seekRequest = -1.0;          // pending seek target, -1 = none
     std::atomic<bool> m_seekBusy{false};   // seek thread is working
+    std::atomic<double> m_pendingSeekTarget{-1.0}; // for UI: immediate seek target display
     std::atomic<bool> m_seekDone{false};   // seek completed, main thread should check
     std::atomic<bool> m_seekShouldResume{false}; // main thread should call Play()
     std::atomic<bool> m_stopSeekThread{false};
+    std::atomic<bool> m_scrubbing{false};    // true during timeline drag (keyframe-only mode)
     bool m_seekThreadRunning = false;
 
     // Sticky flag: true when the user intends playback to continue after seeking.

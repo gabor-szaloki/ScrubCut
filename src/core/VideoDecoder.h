@@ -26,6 +26,7 @@ public:
     int GetWidth() const;
     int GetHeight() const;
     AVPixelFormat GetPixelFormat() const;
+    void SetFastDecode(bool fast);
 
 private:
     AVCodecContext* m_codecCtx = nullptr;

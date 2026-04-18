@@ -475,11 +475,11 @@ void App::Render() {
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Keep seek target in sync with player when not actively seeking
-    // and no async seek is in progress. This prevents the playhead from
-    // snapping back to an old position while the seek thread is still working.
-    if (!m_isTimelineSeeking && !m_player.IsSeekBusy() && m_player.HasMedia()) {
-        m_seekTarget = m_player.GetPlaybackTime();
+    // Keep seek target in sync with player when not actively seeking.
+    // Use GetSeekTargetTime() which returns the pending seek position immediately
+    // (before decode completes), falling back to the clock time when no seek is pending.
+    if (!m_isTimelineSeeking && m_player.HasMedia()) {
+        m_seekTarget = m_player.GetSeekTargetTime();
     }
 
     m_ui.BeginFrame(m_fullscreen);
@@ -908,9 +908,10 @@ void App::Render() {
                     m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
                     if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
                     m_isTimelineSeeking = true;
+                    m_player.SetScrubbing(true);
                 }
                 uint64_t now = SDL_GetTicksNS();
-                if (now - m_lastSeekTime > 150000000ULL) {
+                if (now - m_lastSeekTime > 33000000ULL) {
                     m_player.SeekTo(newStart);
                     m_lastSeekTime = now;
                 }
@@ -918,6 +919,7 @@ void App::Render() {
             if (ImGui::IsItemHovered() || ImGui::IsItemActive())
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
+                m_player.SetScrubbing(false);
                 m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }
@@ -938,9 +940,10 @@ void App::Render() {
                     m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
                     if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
                     m_isTimelineSeeking = true;
+                    m_player.SetScrubbing(true);
                 }
                 uint64_t now = SDL_GetTicksNS();
-                if (now - m_lastSeekTime > 150000000ULL) {
+                if (now - m_lastSeekTime > 33000000ULL) {
                     m_player.SeekTo(newEnd);
                     m_lastSeekTime = now;
                 }
@@ -948,6 +951,7 @@ void App::Render() {
             if (ImGui::IsItemHovered() || ImGui::IsItemActive())
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
+                m_player.SetScrubbing(false);
                 m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }
@@ -966,15 +970,17 @@ void App::Render() {
                 m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
                 if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
                 m_isTimelineSeeking = true;
+                m_player.SetScrubbing(true);
             }
 
             uint64_t now = SDL_GetTicksNS();
-            if (now - m_lastSeekTime > 150000000ULL) {
+            if (now - m_lastSeekTime > 33000000ULL) {
                 m_player.SeekTo(m_seekTarget);
                 m_lastSeekTime = now;
             }
         }
         if (m_isTimelineSeeking && !ImGui::IsItemActive()) {
+            m_player.SetScrubbing(false);
             m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
             m_isTimelineSeeking = false;
         }
