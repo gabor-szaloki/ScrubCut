@@ -35,11 +35,11 @@
         {
             "label": "Install Release",
             "type": "shell",
-            "command": "cmake --build --preset release && cmake --install build/release --prefix /Applications",
+            "command": "cmake --build --preset release && powershell -Command \"Start-Process cmake -ArgumentList '--install','build/release' -Verb RunAs -Wait\"",
             "group": "build",
             "problemMatcher": "$msCompile",
-            "windows": {
-                "command": "cmake --build --preset release && cmake --install build/release"
+            "osx": {
+                "command": "cmake --build --preset release && cmake --install build/release --prefix /Applications"
             }
         }
     ]

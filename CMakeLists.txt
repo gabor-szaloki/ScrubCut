@@ -27,7 +27,7 @@ if(WIN32)
     set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.rc")
 endif()
 
-add_executable(ScrubCut ${SOURCES} ${APP_ICON_RC})
+add_executable(ScrubCut WIN32 ${SOURCES} ${APP_ICON_RC})
 
 
 target_include_directories(ScrubCut PRIVATE
@@ -57,4 +57,58 @@ if(APPLE)
     install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
 elseif(WIN32)
     install(TARGETS ScrubCut RUNTIME DESTINATION ".")
+
+    # Bundle vcpkg DLLs (FFmpeg, SDL3)
+    set(_VCPKG_BIN "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin")
+    file(GLOB _VCPKG_DLLS "${_VCPKG_BIN}/*.dll")
+    install(FILES ${_VCPKG_DLLS} DESTINATION ".")
+
+    # License and icon
+    install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
+    install(FILES "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico" DESTINATION ".")
+
+    # --- CPack / NSIS installer ---
+    set(CPACK_GENERATOR "NSIS")
+    set(CPACK_PACKAGE_NAME "ScrubCut")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_VENDOR "Gabor Szaloki")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast video scrubbing, trimming, and exporting")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    set(CPACK_PACKAGE_INSTALL_DIRECTORY "ScrubCut")
+    set(CPACK_PACKAGE_EXECUTABLES "ScrubCut" "ScrubCut")
+
+    # Icons
+    set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
+    set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
+    set(CPACK_NSIS_INSTALLED_ICON_NAME "ScrubCut.exe")
+    set(CPACK_NSIS_DISPLAY_NAME "ScrubCut")
+    set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+    set(CPACK_NSIS_MODIFY_PATH OFF)
+
+    # Desktop shortcut
+    set(CPACK_NSIS_CREATE_ICONS_EXTRA
+        "CreateShortCut '$DESKTOP\\\\ScrubCut.lnk' '$INSTDIR\\\\ScrubCut.exe' '' '$INSTDIR\\\\ScrubCut.ico'")
+    set(CPACK_NSIS_DELETE_ICONS_EXTRA
+        "Delete '$DESKTOP\\\\ScrubCut.lnk'")
+
+    # File associations: register ScrubCut as an Open With option for video files
+    set(_ASSOC_EXTS .mp4 .mkv .avi .mov .wmv .flv .webm .mpg .mpeg .3gp .ts .m4v)
+    set(_NSIS_REG_INSTALL
+        "WriteRegStr HKCU 'Software\\\\Classes\\\\ScrubCut.Video' '' 'Video File - ScrubCut'")
+    set(_NSIS_REG_INSTALL "${_NSIS_REG_INSTALL}\n    WriteRegStr HKCU 'Software\\\\Classes\\\\ScrubCut.Video\\\\shell\\\\open\\\\command' '' '\\\"$INSTDIR\\\\ScrubCut.exe\\\" \\\"%1\\\"'")
+    set(_NSIS_REG_INSTALL "${_NSIS_REG_INSTALL}\n    WriteRegStr HKCU 'Software\\\\Classes\\\\ScrubCut.Video\\\\DefaultIcon' '' '$INSTDIR\\\\ScrubCut.ico'")
+    set(_NSIS_REG_UNINSTALL
+        "DeleteRegKey HKCU 'Software\\\\Classes\\\\ScrubCut.Video'")
+    foreach(_ext ${_ASSOC_EXTS})
+        set(_NSIS_REG_INSTALL "${_NSIS_REG_INSTALL}\n    WriteRegStr HKCU 'Software\\\\Classes\\\\${_ext}\\\\OpenWithProgids' 'ScrubCut.Video' ''")
+        set(_NSIS_REG_UNINSTALL "${_NSIS_REG_UNINSTALL}\n    DeleteRegValue HKCU 'Software\\\\Classes\\\\${_ext}\\\\OpenWithProgids' 'ScrubCut.Video'")
+    endforeach()
+    # Notify shell of association changes
+    set(_NSIS_REG_INSTALL "${_NSIS_REG_INSTALL}\n    System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'")
+    set(_NSIS_REG_UNINSTALL "${_NSIS_REG_UNINSTALL}\n    System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'")
+
+    set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "${_NSIS_REG_INSTALL}")
+    set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${_NSIS_REG_UNINSTALL}")
+
+    include(CPack)
 endif()

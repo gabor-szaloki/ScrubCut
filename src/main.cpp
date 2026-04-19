@@ -14,6 +14,16 @@ int main(int argc, char* argv[]) {
 #endif
     CommandLine::Get().Init(argc, argv);
 
+#ifdef _WIN32
+    // The executable uses the Windows subsystem (no console by default).
+    // Allocate a console for stdout/stderr output when -log is passed.
+    if (CommandLine::Get().HasFlag("-log")) {
+        AllocConsole();
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
     App app;
 
     if (!app.Init())
