@@ -27,6 +27,7 @@ private:
 
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
+    void SetFullscreen(bool fullscreen);
 
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
@@ -57,6 +58,7 @@ private:
     std::vector<bool> m_exportChecked;
     bool m_showOverwriteConfirm = false;
     bool m_showOpenFileConfirm = false;
+    bool m_pendingOpenImmediate = false;
     std::string m_pendingOpenFilePath;
     std::vector<std::string> m_conflictingFiles;
     char m_exportDir[512] = "";

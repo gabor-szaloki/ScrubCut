@@ -10,6 +10,19 @@
 #include <cmath>
 #include <filesystem>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#define NOSERVICE
+#define NOMCX
+#define NOIME
+#include <windows.h>
+#endif
+
 struct PlatformKeys {
     SDL_Keymod cmdMod;          // Cmd on Mac, Ctrl on Windows — for app commands (quit, export, open)
     SDL_Keymod seekFineMod;     // Option on Mac, Ctrl on Windows — for 1s seeking
@@ -166,6 +179,13 @@ void App::Run() {
         ProcessEvents();
         m_player.PollSeekComplete();
 
+        // Handle deferred file open (from dialog callback, possibly off-thread)
+        if (m_pendingOpenImmediate) {
+            m_pendingOpenImmediate = false;
+            OpenFile(m_pendingOpenFilePath);
+            m_pendingOpenFilePath.clear();
+        }
+
         // Fetch frame before render (for async playback)
         // and after render (for sync seeks triggered by UI during Render)
         auto fetchFrame = [&]() {
@@ -233,12 +253,14 @@ void App::Shutdown() {
 }
 
 void App::RequestOpenFile(const std::string& path) {
-    if (m_segments.GetCount() > 0) {
-        m_pendingOpenFilePath = path;
+    // Always defer to main thread — SDL_ShowOpenFileDialog callback may fire
+    // on a non-main thread, and OpenFile uses OpenGL calls that require
+    // the GL context thread.
+    m_pendingOpenFilePath = path;
+    if (m_segments.GetCount() > 0)
         m_showOpenFileConfirm = true;
-    } else {
-        OpenFile(path);
-    }
+    else
+        m_pendingOpenImmediate = true;
 }
 
 void App::OpenFile(const std::string& path) {
@@ -442,14 +464,12 @@ void App::ProcessEvents() {
                 break;
             case SDLK_F:
                 if (!noMod) break;
-                m_fullscreen = !m_fullscreen;
-                SDL_SetWindowFullscreen(m_window, m_fullscreen);
+                SetFullscreen(!m_fullscreen);
                 break;
             case SDLK_ESCAPE:
                 if (!noMod) break;
                 if (m_fullscreen) {
-                    m_fullscreen = false;
-                    SDL_SetWindowFullscreen(m_window, false);
+                    SetFullscreen(false);
                 }
                 break;
             case SDLK_H:
@@ -611,8 +631,7 @@ void App::Render() {
         }
         if (ImGui::BeginMenu("View")) {
             if (ImGui::MenuItem("Fullscreen", "F", m_fullscreen)) {
-                m_fullscreen = !m_fullscreen;
-                SDL_SetWindowFullscreen(m_window, m_fullscreen);
+                SetFullscreen(!m_fullscreen);
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.cmdName) + "+T").c_str(), m_showTimeline))
@@ -1567,4 +1586,53 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
     glBindTexture(GL_TEXTURE_2D, m_videoTexture);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void App::SetFullscreen(bool fullscreen) {
+    if (fullscreen == m_fullscreen) return;
+    m_fullscreen = fullscreen;
+
+#ifdef _WIN32
+    // SDL_SetWindowFullscreen uses exclusive fullscreen, which causes screen
+    // flashing, slow Alt-Tab, and broken overlays. We want borderless fullscreen
+    // instead. However, simply creating a borderless window at the display
+    // resolution with an OpenGL context also triggers exclusive fullscreen due
+    // to a known SDL3/driver issue. The workaround is to set Win32 window styles
+    // directly, which avoids the driver's exclusive fullscreen detection.
+    // See: https://github.com/libsdl-org/SDL/issues/12791
+    SDL_PropertiesID props = SDL_GetWindowProperties(m_window);
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+
+    if (fullscreen) {
+        SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
+        SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
+
+        SDL_DisplayID display = SDL_GetDisplayForWindow(m_window);
+        SDL_Rect bounds;
+        SDL_GetDisplayBounds(display, &bounds);
+
+        SetWindowLongPtr(hwnd, GWL_STYLE, WS_OVERLAPPED | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
+        SetWindowPos(hwnd, HWND_TOP, bounds.x, bounds.y, bounds.w, bounds.h,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    } else {
+        LONG style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+        LONG exStyle = WS_EX_APPWINDOW;
+        SetWindowLongPtr(hwnd, GWL_STYLE, style);
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
+
+        // SDL returns client area position and size, but SetWindowPos expects
+        // outer window bounds (including title bar and borders). Adjust both.
+        RECT rc = { m_windowedX, m_windowedY,
+                    m_windowedX + m_windowedW, m_windowedY + m_windowedH };
+        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+
+        SetWindowPos(hwnd, HWND_NOTOPMOST, rc.left, rc.top,
+                     rc.right - rc.left, rc.bottom - rc.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    }
+#else
+    // On macOS, SDL_SetWindowFullscreen works as expected.
+    SDL_SetWindowFullscreen(m_window, fullscreen);
+#endif
 }
