@@ -1342,7 +1342,7 @@ void App::Render() {
                 tableSize.y = 10 * rowH + 30;
             }
             if (ImGui::BeginTable("##export_segs", 5, tableFlags, tableSize)) {
-                ImGui::TableSetupColumn("##chk", ImGuiTableColumnFlags_WidthFixed, 24);
+                ImGui::TableSetupColumn("##chk_col", ImGuiTableColumnFlags_WidthFixed, 24);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Range", ImGuiTableColumnFlags_WidthFixed, 160);
                 ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 60);
@@ -1404,14 +1404,44 @@ void App::Render() {
                 if (s.mode == ExportMode::GIF) { hasGif = true; break; }
             if (hasGif) {
                 ImGui::Spacing();
-                ImGui::Text("GIF Settings:");
-                ImGui::Indent();
-                ImGui::SliderInt("Width", &m_pendingExport.gifWidth, 120, 1920);
-                float fps = static_cast<float>(m_pendingExport.gifFps);
-                if (ImGui::SliderFloat("FPS", &fps, 5.0f, 30.0f, "%.0f")) {
-                    m_pendingExport.gifFps = static_cast<double>(fps);
+                if (ImGui::CollapsingHeader("GIF Settings")) {
+                    ImGui::SliderInt("Width", &m_pendingExport.gifWidth, 120, 1920);
+                    float fps = static_cast<float>(m_pendingExport.gifFps);
+                    if (ImGui::SliderFloat("FPS", &fps, 5.0f, 30.0f, "%.0f")) {
+                        m_pendingExport.gifFps = static_cast<double>(fps);
+                    }
                 }
-                ImGui::Unindent();
+            }
+
+            // Output file preview
+            ImGui::Spacing();
+            if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
+                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
+                std::string stem = std::filesystem::path(m_exportName).stem().string();
+                if (stem.empty()) stem = m_exportName;
+                ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetDpiScale()),
+                                  ImGuiChildFlags_Borders);
+                bool anyForPreview = false;
+                for (int i = 0; i < segCount; i++) {
+                    if (i >= static_cast<int>(m_exportChecked.size()) || !m_exportChecked[i]) continue;
+                    anyForPreview = true;
+                    const auto& seg = segs[i];
+                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                    std::string filename = seg.name.empty()
+                        ? std::string("<unnamed>")
+                        : (stem + "_" + seg.name + ext);
+                    bool exists = !seg.name.empty() &&
+                                  std::filesystem::exists(std::filesystem::path(m_exportDir) / filename);
+                    if (exists) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                                           "%s  (already exists)", filename.c_str());
+                    } else {
+                        ImGui::TextUnformatted(filename.c_str());
+                    }
+                }
+                if (!anyForPreview)
+                    ImGui::TextDisabled("(no segments selected)");
+                ImGui::EndChild();
             }
 
             ImGui::Spacing();
