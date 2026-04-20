@@ -124,8 +124,7 @@ bool App::Init() {
         return false;
     }
 
-    // Menu bar height estimate for 16:9 work area (font not built yet, use default 13px + 2*3px padding)
-    int menuBarHeight = 19;
+    // Menu bar overlays the viewport, so window size = video size directly
 
     if (CommandLine::Get().HasFlag("-trace")) {
         auto tracePath = (GetAppDataDir() / "logs" / "scrubcut_trace.csv").string();
@@ -145,11 +144,11 @@ bool App::Init() {
 
     if (resetLayout) {
         // Default size: 16:9 work area below menu bar
-        SDL_SetWindowSize(m_window, 1280, 720 + menuBarHeight);
+        SDL_SetWindowSize(m_window, 1280, 720);
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
         int ww = m_layoutSettings.GetInt("window_width", 1280);
-        int wh = m_layoutSettings.GetInt("window_height", 720 + menuBarHeight);
+        int wh = m_layoutSettings.GetInt("window_height", 720);
         SDL_SetWindowSize(m_window, ww, wh);
         int wx = m_layoutSettings.GetInt("window_x", SDL_WINDOWPOS_UNDEFINED);
         int wy = m_layoutSettings.GetInt("window_y", SDL_WINDOWPOS_UNDEFINED);
@@ -506,7 +505,7 @@ void App::Render() {
         m_seekTarget = m_player.GetSeekTargetTime();
     }
 
-    m_ui.BeginFrame(m_fullscreen);
+    m_ui.BeginFrame();
 
     ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
 
@@ -585,11 +584,14 @@ void App::Render() {
         SDL_ShowCursor();
     }
 
-    // Menu bar — in fullscreen: overlay with fade, subject to auto-hide
-    bool showMenuBar = !m_fullscreen || !m_uiHidden;
-    if (m_fullscreen && showMenuBar) {
+    // Menu bar — overlay on top of video with fade, subject to auto-hide
+    bool showMenuBar = !m_uiHidden;
+    if (showMenuBar) {
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-        ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.2f, 0.2f, 0.2f, 0.85f * m_uiAlpha));
+        ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        // Match the transparency of floating panels (Timeline, Segments, Help)
+        ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(bg.x, bg.y, bg.z, 0.85f * m_uiAlpha));
     }
     if (showMenuBar && ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
@@ -658,9 +660,8 @@ void App::Render() {
                 m_showSegments = false;
                 m_showHelpPanel = false;
                 m_segmentsClosedManually = false;
-                int mbH = static_cast<int>(ImGui::GetFontSize() + ImGui::GetStyle().FramePadding.y * 2);
                 if (!m_fullscreen)
-                    SDL_SetWindowSize(m_window, 1280, 720 + mbH);
+                    SDL_SetWindowSize(m_window, 1280, 720);
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                 std::filesystem::remove(GetAppDataDir() / "layout.ini");
             }
@@ -674,8 +675,8 @@ void App::Render() {
         }
         ImGui::EndMainMenuBar();
     }
-    if (m_fullscreen && showMenuBar) {
-        ImGui::PopStyleColor();
+    if (showMenuBar) {
+        ImGui::PopStyleColor(2);
         ImGui::PopStyleVar();
     }
 

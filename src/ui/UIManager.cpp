@@ -20,6 +20,13 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
 
     ImGui::StyleColorsDark();
 
+    // Apply translucency to title bars so windows blend with the video behind them
+    ImGuiStyle& style = ImGui::GetStyle();
+    auto fade = [](ImVec4 c, float a) { return ImVec4(c.x, c.y, c.z, a); };
+    style.Colors[ImGuiCol_TitleBg]          = fade(style.Colors[ImGuiCol_TitleBg],          0.85f);
+    style.Colors[ImGuiCol_TitleBgActive]    = fade(style.Colors[ImGuiCol_TitleBgActive],    0.85f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = fade(style.Colors[ImGuiCol_TitleBgCollapsed], 0.85f);
+
     if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
         return false;
     if (!ImGui_ImplOpenGL3_Init("#version 150"))
@@ -34,12 +41,11 @@ void UIManager::Shutdown() {
     ImGui::DestroyContext();
 }
 
-void UIManager::BeginFrame(bool fullscreen) {
+void UIManager::BeginFrame() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
-    m_fullscreen = fullscreen;
     SetupDockspace();
 }
 
@@ -50,9 +56,9 @@ void UIManager::EndFrame() {
 
 void UIManager::SetupDockspace() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // In fullscreen, cover the full viewport so video renders behind the menu bar
-    ImVec2 dockPos  = m_fullscreen ? viewport->Pos  : viewport->WorkPos;
-    ImVec2 dockSize = m_fullscreen ? viewport->Size : viewport->WorkSize;
+    // Always cover the full viewport so video renders behind the menu bar
+    ImVec2 dockPos  = viewport->Pos;
+    ImVec2 dockSize = viewport->Size;
     ImGui::SetNextWindowPos(dockPos);
     ImGui::SetNextWindowSize(dockSize);
     ImGui::SetNextWindowViewport(viewport->ID);
