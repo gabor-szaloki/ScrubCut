@@ -46,11 +46,22 @@ private:
     bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    bool m_useDpiScaling = false;
     bool m_autoHideCursor = true;
     bool m_autoHideUI = true;
+
+    // Returns the current DPI scale to apply to the UI. Wraps
+    // SDL_GetWindowDisplayScale and returns 1.0 if DPI scaling is disabled
+    // or on platforms where we don't support it.
+    float GetEffectiveDpiScale() const;
     bool m_uiHidden = false;
     bool m_fullscreen = false;
     int m_windowedX = 0, m_windowedY = 0, m_windowedW = 1280, m_windowedH = 720;
+
+    // Floating window geometry snapshot (position + size) taken when entering
+    // fullscreen, so it can be restored exactly on exit.
+    struct FloatingWindowSnap { ImVec2 pos; ImVec2 size; bool valid = false; };
+    FloatingWindowSnap m_snapTimeline, m_snapSegments, m_snapHelp;
     float m_uiAlpha = 1.0f;
     uint64_t m_lastUIActivityNS = 0;
     ImVec2 m_prevViewportSize = {0, 0};

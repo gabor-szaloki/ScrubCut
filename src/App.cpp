@@ -124,8 +124,6 @@ bool App::Init() {
         return false;
     }
 
-    // Menu bar overlays the viewport, so window size = video size directly
-
     if (CommandLine::Get().HasFlag("-trace")) {
         auto tracePath = (GetAppDataDir() / "logs" / "scrubcut_trace.csv").string();
         TraceFile::Get().Open(tracePath.c_str());
@@ -139,12 +137,20 @@ bool App::Init() {
     m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
 
     // Preferences always load
+    m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
 
+    // Apply initial DPI scale to the UI (1.0 unless DPI scaling is enabled on Windows).
+    m_ui.SetDpiScale(GetEffectiveDpiScale());
+
     if (resetLayout) {
-        // Default size: 16:9 work area below menu bar
-        SDL_SetWindowSize(m_window, 1280, 720);
+        // Default window size is scaled by the effective DPI so UI elements
+        // are readable on high-DPI displays.
+        float dpiScale = m_ui.GetDpiScale();
+        SDL_SetWindowSize(m_window,
+                          static_cast<int>(1280 * dpiScale),
+                          static_cast<int>(720 * dpiScale));
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
         int ww = m_layoutSettings.GetInt("window_width", 1280);
@@ -225,6 +231,7 @@ void App::Shutdown() {
         m_layoutSettings.SetBool("show_segments", m_showSegments);
         m_layoutSettings.Save();
 
+        m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
         m_prefSettings.Save();
@@ -309,6 +316,12 @@ void App::ProcessEvents() {
         if (!m_fullscreen && (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)) {
             SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
             SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
+        }
+
+        // Rescale ImGui when the window moves to a display with different DPI.
+        if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
+            event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) {
+            m_ui.SetDpiScale(GetEffectiveDpiScale());
         }
 
         if (event.type == SDL_EVENT_QUIT) {
@@ -469,6 +482,9 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_fullscreen) {
                     SetFullscreen(false);
+                } else if (m_uiHidden) {
+                    m_uiHidden = false;
+                    m_uiAlpha = 1.0f;
                 }
                 break;
             case SDLK_H:
@@ -509,11 +525,13 @@ void App::Render() {
 
     ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
 
-    // Reposition floating windows proportionally when viewport size changes
-    // (skip during layout reset — let the default positions apply)
+    // Reposition floating windows proportionally when the viewport size changes.
+    // Use the full viewport Size (not WorkSize) so that the menu bar appearing
+    // or disappearing — e.g. on app start before it renders, or on auto-hide
+    // toggle — doesn't cause floating panels to creep over time.
     {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
-        ImVec2 newSize = mvp->WorkSize;
+        ImVec2 newSize = mvp->Size;
         if (layoutCond != ImGuiCond_Always &&
             m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
             (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
@@ -525,22 +543,22 @@ void App::Render() {
                 if (!win || win->DockId != 0) continue;
 
                 // Compute center as ratio of old viewport
-                float cx = (win->Pos.x + win->SizeFull.x * 0.5f - mvp->WorkPos.x) / m_prevViewportSize.x;
-                float cy = (win->Pos.y + win->SizeFull.y * 0.5f - mvp->WorkPos.y) / m_prevViewportSize.y;
+                float cx = (win->Pos.x + win->SizeFull.x * 0.5f - mvp->Pos.x) / m_prevViewportSize.x;
+                float cy = (win->Pos.y + win->SizeFull.y * 0.5f - mvp->Pos.y) / m_prevViewportSize.y;
 
                 // Apply ratio to new viewport to get new center
-                float newCX = mvp->WorkPos.x + cx * newSize.x;
-                float newCY = mvp->WorkPos.y + cy * newSize.y;
+                float newCX = mvp->Pos.x + cx * newSize.x;
+                float newCY = mvp->Pos.y + cy * newSize.y;
 
                 // Derive top-left from center
                 float newX = newCX - win->SizeFull.x * 0.5f;
                 float newY = newCY - win->SizeFull.y * 0.5f;
 
                 // Clamp with margin
-                newX = std::max(mvp->WorkPos.x + margin,
-                       std::min(newX, mvp->WorkPos.x + newSize.x - win->SizeFull.x - margin));
-                newY = std::max(mvp->WorkPos.y + margin,
-                       std::min(newY, mvp->WorkPos.y + newSize.y - win->SizeFull.y - margin));
+                newX = std::max(mvp->Pos.x + margin,
+                       std::min(newX, mvp->Pos.x + newSize.x - win->SizeFull.x - margin));
+                newY = std::max(mvp->Pos.y + margin,
+                       std::min(newY, mvp->Pos.y + newSize.y - win->SizeFull.y - margin));
 
                 win->Pos = ImVec2(newX, newY);
             }
@@ -645,6 +663,12 @@ void App::Render() {
             if (ImGui::MenuItem("Help", "?", m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
             ImGui::Separator();
+#ifdef _WIN32
+            if (ImGui::MenuItem("Use DPI scaling", nullptr, m_useDpiScaling)) {
+                m_useDpiScaling = !m_useDpiScaling;
+                m_ui.SetDpiScale(GetEffectiveDpiScale());
+            }
+#endif
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
@@ -655,13 +679,14 @@ void App::Render() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Reset Layout")) {
+                SetFullscreen(false);
                 m_ui.ResetLayout();
                 m_showTimeline = true;
                 m_showSegments = false;
                 m_showHelpPanel = false;
                 m_segmentsClosedManually = false;
-                if (!m_fullscreen)
-                    SDL_SetWindowSize(m_window, 1280, 720);
+                float scale = m_ui.GetDpiScale();
+                SDL_SetWindowSize(m_window, static_cast<int>(1280 * scale), static_cast<int>(720 * scale));
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                 std::filesystem::remove(GetAppDataDir() / "layout.ini");
             }
@@ -684,6 +709,7 @@ void App::Render() {
 
     // Viewport panel
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::Begin("Viewport");
     if (m_videoTexture && m_player.HasMedia()) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -702,18 +728,26 @@ void App::Render() {
         ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_videoTexture)),
                       ImVec2(displayW, displayH));
     } else {
-        ImGui::TextWrapped("Drag and drop a video file to open it.");
+        const char* text = "Drag and drop a video file to open it.";
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        ImVec2 textSize = ImGui::CalcTextSize(text);
+        ImGui::SetCursorPos(ImVec2(
+            (avail.x - textSize.x) * 0.5f,
+            (avail.y - textSize.y) * 0.5f
+        ));
+        ImGui::TextUnformatted(text);
     }
     ImGui::End();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
 
     // Timeline panel (unified controls + timeline bar)
     if (m_showTimeline && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    float tlPad = 40.0f;
-    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1000.0f);
-    float tlHeight = 110.0f;
+    float dpi = m_ui.GetDpiScale();
+    float tlPad = 40.0f * dpi;
+    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1000.0f * dpi);
+    float tlHeight = 110.0f * dpi;
     ImGui::SetNextWindowPos(
         ImVec2(vp->WorkPos.x + (vp->WorkSize.x - tlWidth) * 0.5f, vp->WorkPos.y + vp->WorkSize.y - tlHeight - tlPad),
         layoutCond);
@@ -1065,8 +1099,9 @@ void App::Render() {
     if (m_showSegments && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350 - 40, vp->WorkPos.y + 40), layoutCond);
-    ImGui::SetNextWindowSize(ImVec2(350, 250), layoutCond);
+    float dpi = m_ui.GetDpiScale();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - (350 + 40) * dpi, vp->WorkPos.y + 40 * dpi), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(350 * dpi, 250 * dpi), layoutCond);
     bool segmentsWasOpen = m_showSegments;
     ImGui::Begin("Segments", &m_showSegments);
 
@@ -1589,9 +1624,50 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+float App::GetEffectiveDpiScale() const {
+#ifdef _WIN32
+    if (!m_useDpiScaling) return 1.0f;
+    return SDL_GetWindowDisplayScale(m_window);
+#else
+    // On macOS the OS already handles scaling via the window's point/pixel
+    // separation, so we leave UI at 1.0.
+    return 1.0f;
+#endif
+}
+
 void App::SetFullscreen(bool fullscreen) {
     if (fullscreen == m_fullscreen) return;
     m_fullscreen = fullscreen;
+
+    // Snapshot / restore floating windows so repeated fullscreen toggles don't
+    // accumulate rounding drift from proportional repositioning.
+    auto snap = [](App::FloatingWindowSnap& s, const char* name) {
+        ImGuiWindow* w = ImGui::FindWindowByName(name);
+        if (!w || w->DockId != 0) { s.valid = false; return; }
+        s.pos = w->Pos;
+        s.size = w->SizeFull;
+        s.valid = true;
+    };
+    auto restore = [this](const App::FloatingWindowSnap& s, const char* name) {
+        if (!s.valid) return;
+        ImGuiWindow* w = ImGui::FindWindowByName(name);
+        if (!w || w->DockId != 0) return;
+        w->Pos = s.pos;
+        w->SizeFull = s.size;
+        w->Size = s.size;
+        // Bypass the next frame's proportional reposition — we already set
+        // the exact pre-fullscreen position/size.
+        m_prevViewportSize = ImVec2(0, 0);
+    };
+    if (fullscreen) {
+        snap(m_snapTimeline, "Timeline");
+        snap(m_snapSegments, "Segments");
+        snap(m_snapHelp,     "Help");
+    } else {
+        restore(m_snapTimeline, "Timeline");
+        restore(m_snapSegments, "Segments");
+        restore(m_snapHelp,     "Help");
+    }
 
 #ifdef _WIN32
     // SDL_SetWindowFullscreen uses exclusive fullscreen, which causes screen
@@ -1623,10 +1699,14 @@ void App::SetFullscreen(bool fullscreen) {
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
 
         // SDL returns client area position and size, but SetWindowPos expects
-        // outer window bounds (including title bar and borders). Adjust both.
+        // outer window bounds (including title bar and borders). Use the
+        // per-monitor-DPI-aware version so the border math matches the actual
+        // monitor the window will appear on — AdjustWindowRectEx (non-DPI)
+        // uses the process DPI and drifts across mixed-DPI multi-monitor setups.
         RECT rc = { m_windowedX, m_windowedY,
                     m_windowedX + m_windowedW, m_windowedY + m_windowedH };
-        AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+        UINT dpi = GetDpiForWindow(hwnd);
+        AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpi);
 
         SetWindowPos(hwnd, HWND_NOTOPMOST, rc.left, rc.top,
                      rc.right - rc.left, rc.bottom - rc.top,

@@ -27,12 +27,53 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     style.Colors[ImGuiCol_TitleBgActive]    = fade(style.Colors[ImGuiCol_TitleBgActive],    0.85f);
     style.Colors[ImGuiCol_TitleBgCollapsed] = fade(style.Colors[ImGuiCol_TitleBgCollapsed], 0.85f);
 
+    // Snapshot the unscaled style so SetDpiScale can re-apply it cleanly.
+    m_baseStyle = style;
+
     if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
         return false;
     if (!ImGui_ImplOpenGL3_Init("#version 150"))
         return false;
 
     return true;
+}
+
+void UIManager::SetDpiScale(float scale) {
+    if (scale <= 0.0f) scale = 1.0f;
+    if (scale == m_dpiScale) return;
+
+    float prevScale = m_dpiScale;
+    m_dpiScale = scale;
+
+    // ImGui 1.92+ uses dynamic font rasterization. Final font size is
+    //   FontSizeBase * FontScaleMain * FontScaleDpi * ...
+    // Fonts are re-rasterized on demand at the exact rendered size, so text
+    // stays crisp when FontScaleDpi changes. ScaleAllSizes() handles
+    // padding/spacing/thickness but explicitly does NOT scale fonts — we use
+    // FontScaleDpi for that.
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = m_baseStyle;
+    style.ScaleAllSizes(scale);
+    style.FontScaleDpi = scale;
+
+    // Rescale open floating windows' sizes by the DPI ratio so they keep the
+    // same visual footprint. Keep each window centered on its previous center
+    // so it grows/shrinks in place rather than off to one corner.
+    float ratio = scale / prevScale;
+    if (ratio != 1.0f) {
+        const char* floatingWindows[] = { "Timeline", "Segments", "Help" };
+        for (const char* name : floatingWindows) {
+            ImGuiWindow* w = ImGui::FindWindowByName(name);
+            if (!w || w->DockId != 0) continue;
+            ImVec2 center(w->Pos.x + w->SizeFull.x * 0.5f,
+                          w->Pos.y + w->SizeFull.y * 0.5f);
+            w->SizeFull.x *= ratio;
+            w->SizeFull.y *= ratio;
+            w->Size = w->SizeFull;
+            w->Pos = ImVec2(center.x - w->SizeFull.x * 0.5f,
+                            center.y - w->SizeFull.y * 0.5f);
+        }
+    }
 }
 
 void UIManager::Shutdown() {
