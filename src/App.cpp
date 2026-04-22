@@ -346,7 +346,7 @@ void App::ProcessEvents() {
             SDL_Keymod mod = event.key.mod;
             bool shift     = (mod & SDL_KMOD_SHIFT)      != 0;
             bool cmd       = (mod & kKeys.cmdMod)        != 0;
-            bool seekFine  = (mod & kKeys.seekFineMod)   != 0 && !cmd;
+            bool seekFine  = (mod & kKeys.seekFineMod)   != 0;
             bool frameStep = (mod & kKeys.frameStepMod)  != 0 && (!kKeys.frameStepNeedsCmd || cmd);
             bool jump      = kKeys.jumpMod && (mod & kKeys.jumpMod) != 0 && !frameStep;
             bool noMod     = !shift && !cmd && !(mod & SDL_KMOD_ALT) && !(mod & SDL_KMOD_GUI) && !(mod & SDL_KMOD_CTRL);
