@@ -75,8 +75,6 @@ elseif(WIN32)
     set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast video scrubbing, trimming, and exporting")
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "ScrubCut")
-    set(CPACK_PACKAGE_EXECUTABLES "ScrubCut" "ScrubCut")
-
     # Icons
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
     set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
@@ -85,11 +83,12 @@ elseif(WIN32)
     set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
     set(CPACK_NSIS_MODIFY_PATH OFF)
 
-    # Desktop shortcut
+    # Start menu shortcut. CPACK_PACKAGE_EXECUTABLES isn't used because its
+    # template hardcodes $INSTDIR\bin\<exe> (we install to $INSTDIR directly).
     set(CPACK_NSIS_CREATE_ICONS_EXTRA
-        "CreateShortCut '$DESKTOP\\\\ScrubCut.lnk' '$INSTDIR\\\\ScrubCut.exe' '' '$INSTDIR\\\\ScrubCut.ico'")
+        "CreateShortCut '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\ScrubCut.lnk' '$INSTDIR\\\\ScrubCut.exe' '' '$INSTDIR\\\\ScrubCut.ico'")
     set(CPACK_NSIS_DELETE_ICONS_EXTRA
-        "Delete '$DESKTOP\\\\ScrubCut.lnk'")
+        "Delete '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\ScrubCut.lnk'")
 
     # File associations: register ScrubCut as an Open With option for video files
     set(_ASSOC_EXTS .mp4 .mkv .avi .mov .wmv .flv .webm .mpg .mpeg .3gp .ts .m4v)
