@@ -219,6 +219,15 @@ void App::Run() {
 }
 
 void App::Shutdown() {
+    // If closing while in fullscreen, revert floating-panel ImGui positions
+    // to their pre-fullscreen snapshots. Otherwise ImGui would save the
+    // fullscreen-repositioned coordinates to imgui.ini, and on the next
+    // launch (into a windowed viewport) the panels would load off-screen.
+    if (m_fullscreen) {
+        RestoreFloatingWindowSnapshots();
+        ImGui::MarkIniSettingsDirty();
+    }
+
     m_player.Close();
 
     // Save windowed mode geometry (tracked while not fullscreen)
@@ -542,25 +551,33 @@ void App::Render() {
                 ImGuiWindow* win = ImGui::FindWindowByName(name);
                 if (!win || win->DockId != 0) continue;
 
+                // Timeline scales its width with the viewport — the wider it
+                // is the more scrubbing resolution you get. Height stays.
+                bool scaleWidth = (strcmp(name, "Timeline") == 0);
+                float newW = scaleWidth
+                    ? win->SizeFull.x * (newSize.x / m_prevViewportSize.x)
+                    : win->SizeFull.x;
+                float newH = win->SizeFull.y;
+
                 // Compute center as ratio of old viewport
                 float cx = (win->Pos.x + win->SizeFull.x * 0.5f - mvp->Pos.x) / m_prevViewportSize.x;
                 float cy = (win->Pos.y + win->SizeFull.y * 0.5f - mvp->Pos.y) / m_prevViewportSize.y;
 
-                // Apply ratio to new viewport to get new center
-                float newCX = mvp->Pos.x + cx * newSize.x;
-                float newCY = mvp->Pos.y + cy * newSize.y;
-
-                // Derive top-left from center
-                float newX = newCX - win->SizeFull.x * 0.5f;
-                float newY = newCY - win->SizeFull.y * 0.5f;
+                // Apply ratio to new viewport to get new center, then top-left
+                float newX = mvp->Pos.x + cx * newSize.x - newW * 0.5f;
+                float newY = mvp->Pos.y + cy * newSize.y - newH * 0.5f;
 
                 // Clamp with margin
                 newX = std::max(mvp->Pos.x + margin,
-                       std::min(newX, mvp->Pos.x + newSize.x - win->SizeFull.x - margin));
+                       std::min(newX, mvp->Pos.x + newSize.x - newW - margin));
                 newY = std::max(mvp->Pos.y + margin,
-                       std::min(newY, mvp->Pos.y + newSize.y - win->SizeFull.y - margin));
+                       std::min(newY, mvp->Pos.y + newSize.y - newH - margin));
 
                 win->Pos = ImVec2(newX, newY);
+                if (scaleWidth) {
+                    win->SizeFull.x = newW;
+                    win->Size.x = newW;
+                }
             }
         }
         m_prevViewportSize = newSize;
@@ -1665,38 +1682,42 @@ float App::GetEffectiveDpiScale() const {
 #endif
 }
 
-void App::SetFullscreen(bool fullscreen) {
-    if (fullscreen == m_fullscreen) return;
-    m_fullscreen = fullscreen;
-
-    // Snapshot / restore floating windows so repeated fullscreen toggles don't
-    // accumulate rounding drift from proportional repositioning.
-    auto snap = [](App::FloatingWindowSnap& s, const char* name) {
-        ImGuiWindow* w = ImGui::FindWindowByName(name);
-        if (!w || w->DockId != 0) { s.valid = false; return; }
-        s.pos = w->Pos;
-        s.size = w->SizeFull;
-        s.valid = true;
-    };
-    auto restore = [this](const App::FloatingWindowSnap& s, const char* name) {
+void App::RestoreFloatingWindowSnapshots() {
+    auto restore = [](const FloatingWindowSnap& s, const char* name) {
         if (!s.valid) return;
         ImGuiWindow* w = ImGui::FindWindowByName(name);
         if (!w || w->DockId != 0) return;
         w->Pos = s.pos;
         w->SizeFull = s.size;
         w->Size = s.size;
-        // Bypass the next frame's proportional reposition — we already set
-        // the exact pre-fullscreen position/size.
-        m_prevViewportSize = ImVec2(0, 0);
     };
+    restore(m_snapTimeline, "Timeline");
+    restore(m_snapSegments, "Segments");
+    restore(m_snapHelp,     "Help");
+}
+
+void App::SetFullscreen(bool fullscreen) {
+    if (fullscreen == m_fullscreen) return;
+    m_fullscreen = fullscreen;
+
+    // Snapshot / restore floating windows so repeated fullscreen toggles don't
+    // accumulate rounding drift from proportional repositioning.
     if (fullscreen) {
+        auto snap = [](App::FloatingWindowSnap& s, const char* name) {
+            ImGuiWindow* w = ImGui::FindWindowByName(name);
+            if (!w || w->DockId != 0) { s.valid = false; return; }
+            s.pos = w->Pos;
+            s.size = w->SizeFull;
+            s.valid = true;
+        };
         snap(m_snapTimeline, "Timeline");
         snap(m_snapSegments, "Segments");
         snap(m_snapHelp,     "Help");
     } else {
-        restore(m_snapTimeline, "Timeline");
-        restore(m_snapSegments, "Segments");
-        restore(m_snapHelp,     "Help");
+        RestoreFloatingWindowSnapshots();
+        // Bypass the next frame's proportional reposition — we just set the
+        // exact pre-fullscreen position/size.
+        m_prevViewportSize = ImVec2(0, 0);
     }
 
 #ifdef _WIN32

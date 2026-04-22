@@ -28,6 +28,7 @@ private:
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
+    void RestoreFloatingWindowSnapshots();
 
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
