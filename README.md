@@ -60,34 +60,69 @@ cmake --build --preset release
 cmake --build --preset debug
 ```
 
-The executable is at `build/Release/ScrubCut.exe` or `build/Debug/ScrubCut.exe`.
+The executable is at `build/release/bin/ScrubCut[.exe]` (or `build/debug/bin/` for the debug build). On macOS this is a bare binary — see [Packaging](#packaging) to produce a `.app` bundle.
+
+## Packaging
+
+### Windows installer (NSIS)
+
+Install [NSIS](https://nsis.sourceforge.io/) (`winget install NSIS.NSIS`), then from the configured build dir:
+
+```bash
+cpack -G NSIS --config build/release/CPackConfig.cmake -B build/release
+```
+
+This produces `build/release/ScrubCut-<version>-win64.exe`, which installs ScrubCut, bundled DLLs, a desktop shortcut, and registers the app as an "Open with" handler for common video extensions.
+
+### macOS .app bundle
+
+The `.app` is produced by the **install** step, not a plain build:
+
+```bash
+cmake --install build/release --prefix <output-dir>
+```
+
+`<output-dir>/ScrubCut.app` can be dragged to `/Applications`. The bundle is ad-hoc codesigned (runs locally without a developer certificate), so Gatekeeper will show a first-launch warning. No DMG is produced.
 
 ## Usage
 
-Launch the app and drag-and-drop a video file onto the window.
+Launch the app and drag-and-drop a video file onto the window, or press **Ctrl/Cmd + O** to open one via a file dialog.
 
 ### Keyboard shortcuts
 
-| Action               | Hotkey                        |
-|----------------------|-------------------------------|
-| Play / Pause         | Space                         |
-| Seek +/- 5s          | Left / Right                  |
-| Seek +/- 1s          | Ctrl + Left / Right           |
-| Seek +/- 30s         | Shift + Left / Right          |
-| Frame step           | Alt + Left / Right  or  , / . |
-| Speed up / down      | + / -                         |
-| Jump to start / end  | Home / End                    |
-| Mark In              | I                             |
-| Mark Out             | O                             |
-| Remove last segment  | Delete                        |
-| Export segments      | Ctrl + E                      |
-| Toggle help          | ?                             |
+Where two modifiers are shown separated by `/`, the first is Windows and the second is macOS.
+
+| Action                      | Hotkey                                      |
+|-----------------------------|---------------------------------------------|
+| Play / Pause                | Space                                       |
+| Seek +/- 5s                 | Left / Right                                |
+| Seek +/- 1s                 | Ctrl/Option + Left / Right                  |
+| Seek +/- 30s                | Shift + Left / Right                        |
+| Frame step                  | Alt/Cmd+Option + Left / Right  or  , / .    |
+| Speed up / down             | + / -                                       |
+| Jump to start / end         | Home / End  (also Cmd + Left / Right on macOS) |
+| Mark In                     | I  or  [                                    |
+| Mark Out                    | O  or  ]                                    |
+| Remove last segment         | Delete / Backspace                          |
+| Open file                   | Ctrl/Cmd + O                                |
+| Export segments             | Ctrl/Cmd + E                                |
+| Toggle timeline panel       | Ctrl/Cmd + T                                |
+| Toggle segments panel       | Ctrl/Cmd + S                                |
+| Toggle fullscreen           | F                                           |
+| Toggle UI visibility        | H                                           |
+| Exit fullscreen / show UI   | Esc                                         |
+| Quit                        | Alt+F4 / Cmd + Q                            |
+| Toggle help                 | ?                                           |
 
 ### Command-line flags
 
-| Flag     | Description                              |
-|----------|------------------------------------------|
-| `-trace` | Enable performance tracing to `logs/`    |
+| Argument         | Description                                                     |
+|------------------|-----------------------------------------------------------------|
+| `<path>`         | Open the given video file at launch                             |
+| `-trace`         | Write performance traces to `scrubcut_trace.csv` in the app data dir |
+| `-log`           | Allocate a console for stdout/stderr (Windows only)             |
+| `-resetlayout`   | Reset the docked panel layout to defaults                       |
+| `-profileseek`   | Enable seek-performance profiling                               |
 
 ## Tech stack
 
