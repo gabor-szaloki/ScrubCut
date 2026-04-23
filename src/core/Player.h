@@ -101,6 +101,12 @@ private:
     // Flushes decoder. Threads must be stopped.
     bool SyncSeekAndDecode(double targetSec);
 
+    // Like SyncSeekAndDecode, but lands on the frame with the largest pts that
+    // is STRICTLY LESS than maxPts. Used for backward frame stepping — avoids
+    // snapping back to the current frame when B-frame reordering or keyframe
+    // alignment causes the first decoded pts to already be >= the target.
+    bool SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts);
+
 
 
     // Background seek thread

@@ -435,12 +435,16 @@ void Player::StepFrame(int direction) {
         }
 
         if (!cacheHit) {
-            // Cache miss — need to seek and decode, then repopulate cache
+            // Cache miss — seek back and decode the frame immediately before
+            // the current one. SyncSeekAndDecode's `pts >= target` rule can
+            // snap forward onto the current frame after B-frame reordering;
+            // SyncSeekAndDecodeBefore guarantees a strictly-earlier frame.
             TRACE_LOG("StepBack_CacheMiss");
             double frameDur = GetFrameDuration();
             double targetSec = m_clock.GetTime() - frameDur;
             if (targetSec < 0.0) targetSec = 0.0;
-            SyncSeekAndDecode(targetSec);
+            int64_t maxPts = m_lastDisplayedPts;
+            SyncSeekAndDecodeBefore(targetSec, maxPts);
             PopulateCacheAroundCurrent();
         }
     }
@@ -645,6 +649,111 @@ done:
     }
 
     m_clock.SetTime(targetSec);
+    return false;
+}
+
+bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
+    TRACE_EVENT("SyncSeekAndDecodeBefore");
+
+    // Flush state (same as SyncSeekAndDecode — we're repositioning).
+    m_videoDecoder.Flush();
+    if (m_hasAudio) m_audioDecoder.Flush();
+    m_videoPacketQueue.Flush();
+    m_audioPacketQueue.Flush();
+    m_videoFrameQueue.Flush();
+    m_frameCache.Clear();
+    if (m_hasAudio) {
+        m_audioOutput.Flush();
+        m_audioOutput.ResetPosition(seekSec);
+    }
+
+    int attempt = 0;
+    double trySec = seekSec;
+    AVFrame* bestFrame = nullptr;
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    // Keep decoding a few frames past the first frame with pts >= maxPts so
+    // that any B-frames with pts < maxPts that emit after (decode order !=
+    // display order) are still captured.
+    const int kReorderDepth = 8;
+
+    while (attempt < 4) {
+        m_videoDecoder.Flush();
+        m_demuxer.Seek(trySec);
+        m_eof = false;
+
+        int maxPackets = 500;
+        int framesAtOrAfterMax = 0;
+
+        while (maxPackets-- > 0 && framesAtOrAfterMax < kReorderDepth) {
+            int ret = m_demuxer.ReadPacket(pkt);
+            if (ret == AVERROR_EOF) { m_eof = true; break; }
+            if (ret < 0) break;
+
+            if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            ret = m_videoDecoder.SendPacket(pkt);
+            av_packet_unref(pkt);
+            if (ret < 0) continue;
+
+            while (true) {
+                ret = m_videoDecoder.ReceiveFrame(frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                if (ret < 0) break;
+
+                if (frame->pts < maxPts) {
+                    if (!bestFrame) {
+                        bestFrame = av_frame_alloc();
+                        av_frame_move_ref(bestFrame, frame);
+                    } else if (frame->pts > bestFrame->pts) {
+                        av_frame_unref(bestFrame);
+                        av_frame_move_ref(bestFrame, frame);
+                    } else {
+                        av_frame_unref(frame);
+                    }
+                } else {
+                    framesAtOrAfterMax++;
+                    av_frame_unref(frame);
+                }
+            }
+        }
+
+        if (bestFrame) break;
+
+        // No frame with pts < maxPts found at this seek point — seek further
+        // back and retry. Happens near the head of a GOP when the keyframe
+        // itself has pts >= maxPts.
+        attempt++;
+        trySec -= 1.0;
+        if (trySec < 0.0) { trySec = 0.0; attempt = 99; } // last try, then give up
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+
+    if (bestFrame) {
+        AVRational tb = m_demuxer.GetVideoTimeBase();
+        double frameSec = static_cast<double>(bestFrame->pts) * av_q2d(tb);
+        m_clock.SetTime(frameSec);
+        m_lastDisplayedPts = bestFrame->pts;
+
+        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
+        if (rgba) {
+            m_frameCache.Put(bestFrame->pts, rgba,
+                             m_frameConverter.GetWidth(),
+                             m_frameConverter.GetHeight());
+            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
+            m_cachedWidth = m_frameConverter.GetWidth();
+            m_cachedHeight = m_frameConverter.GetHeight();
+            m_hasCachedFrame = true;
+        }
+        m_decoderDirty = false;
+        av_frame_free(&bestFrame);
+        return m_hasCachedFrame;
+    }
+
     return false;
 }
 
