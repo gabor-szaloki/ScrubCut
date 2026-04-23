@@ -101,4 +101,13 @@ private:
     uint64_t m_lastSeekTime = 0;
     bool m_isTimelineSeeking = false;
     bool m_wasPlayingBeforeTimelineSeek = false;
+
+    // Precision-scrub anchor (active while any timeline drag is in progress).
+    // Holding Alt mid-drag switches to 0.1× sensitivity, rebased around the
+    // current mouse/target so there's no visual jump.
+    float  m_scrubAnchorX = 0.0f;
+    double m_scrubAnchorTime = 0.0;
+    bool   m_scrubAltWasHeld = false;
+    double ComputeScrubTarget(float mouseX, float barWidth, double duration,
+                              double initialTime, bool justActivated);
 };

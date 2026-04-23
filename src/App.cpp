@@ -1063,7 +1063,8 @@ void App::Render() {
             ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
             if (ImGui::IsItemActive()) {
                 float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
-                double newStart = static_cast<double>(mouseX / barWidth) * duration;
+                double newStart = ComputeScrubTarget(mouseX, barWidth, duration,
+                                                     segs[i].startSec, ImGui::IsItemActivated());
                 newStart = std::max(0.0, std::min(newStart, segs[i].endSec - 0.01));
                 m_segments.UpdateSegment(i, newStart, segs[i].endSec);
                 m_seekTarget = newStart;
@@ -1099,7 +1100,8 @@ void App::Render() {
             ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
             if (ImGui::IsItemActive()) {
                 float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
-                double newEnd = static_cast<double>(mouseX / barWidth) * duration;
+                double newEnd = ComputeScrubTarget(mouseX, barWidth, duration,
+                                                   segs[i].endSec, ImGui::IsItemActivated());
                 newEnd = std::max(segs[i].startSec + 0.01, std::min(newEnd, duration));
                 m_segments.UpdateSegment(i, segs[i].startSec, newEnd);
                 m_seekTarget = newEnd;
@@ -1139,7 +1141,8 @@ void App::Render() {
             ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
             if (ImGui::IsItemActive()) {
                 float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
-                double newTime = static_cast<double>(mouseX / barWidth) * duration;
+                double newTime = ComputeScrubTarget(mouseX, barWidth, duration,
+                                                    frames[i].timeSec, ImGui::IsItemActivated());
                 newTime = std::max(0.0, std::min(newTime, duration));
                 m_segments.UpdateFrame(i, newTime);
                 m_seekTarget = newTime;
@@ -1173,7 +1176,9 @@ void App::Render() {
         ImGui::InvisibleButton("##timeline_bar", ImVec2(barWidth, barHeight));
         if (ImGui::IsItemActive() && !handleActive) {
             float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
-            double clickTime = static_cast<double>(mouseX / barWidth) * duration;
+            double initial = static_cast<double>(mouseX / barWidth) * duration;
+            double clickTime = ComputeScrubTarget(mouseX, barWidth, duration,
+                                                  initial, ImGui::IsItemActivated());
             clickTime = std::max(0.0, std::min(clickTime, duration));
             m_seekTarget = clickTime;
 
@@ -1504,6 +1509,7 @@ void App::Render() {
             row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());
             row("Toggle marks",        (std::string(kKeys.cmdName) + " + M").c_str());
             row("Quit",                 kKeys.quitShortcut);
+            row("Precision scrub",      "Alt + drag timeline");
             row("Toggle help",          "?");
 
             ImGui::EndTable();
@@ -1965,6 +1971,27 @@ float App::GetEffectiveDpiScale() const {
     // separation, so we leave UI at 1.0.
     return 1.0f;
 #endif
+}
+
+double App::ComputeScrubTarget(float mouseX, float barWidth, double duration,
+                                double initialTime, bool justActivated) {
+    bool altNow = ImGui::GetIO().KeyAlt;
+    if (justActivated) {
+        m_scrubAnchorX = mouseX;
+        m_scrubAnchorTime = initialTime;
+        m_scrubAltWasHeld = altNow;
+    } else if (altNow != m_scrubAltWasHeld) {
+        // Rebase so toggling Alt mid-drag doesn't snap the target.
+        double prevScale = m_scrubAltWasHeld ? 0.1 : 1.0;
+        double curTarget = m_scrubAnchorTime +
+            static_cast<double>(mouseX - m_scrubAnchorX) / barWidth * duration * prevScale;
+        m_scrubAnchorX = mouseX;
+        m_scrubAnchorTime = curTarget;
+        m_scrubAltWasHeld = altNow;
+    }
+    double scale = altNow ? 0.1 : 1.0;
+    return m_scrubAnchorTime +
+        static_cast<double>(mouseX - m_scrubAnchorX) / barWidth * duration * scale;
 }
 
 void App::TakeScreenshot() {

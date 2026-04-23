@@ -115,6 +115,7 @@ Where two modifiers are shown separated by `/`, the first is Windows and the sec
 | Exit fullscreen / show UI   | Esc                                         |
 | Quit                        | Alt+F4 / Cmd + Q                            |
 | Toggle help                 | ?                                           |
+| Precision scrub             | Alt + drag timeline (0.1× sensitivity)      |
 
 ### Command-line flags
 
