@@ -12,8 +12,8 @@ class Exporter {
 public:
     struct Progress {
         std::atomic<float> fraction{0.0f};
-        std::atomic<int> currentSegment{0};
-        std::atomic<int> totalSegments{0};
+        std::atomic<int> currentItem{0};
+        std::atomic<int> totalItems{0};
         std::atomic<bool> running{false};
         std::atomic<bool> finished{false};
         std::atomic<bool> error{false};
@@ -36,8 +36,8 @@ public:
 
         void Reset() {
             fraction = 0.0f;
-            currentSegment = 0;
-            totalSegments = 0;
+            currentItem = 0;
+            totalItems = 0;
             running = false;
             finished = false;
             error = false;
@@ -70,8 +70,12 @@ private:
                           const std::string& outputPath,
                           int gifWidth, double gifFps);
 
-    std::string BuildOutputPath(const std::string& basePath, int segmentIndex, int totalSegments,
-                                const std::string& extension) const;
+    bool ExportFramePNG(const std::string& inputPath,
+                        const FrameMark& frame,
+                        const std::string& outputPath);
+
+    std::string BuildOutputPath(const std::string& basePath, const std::string& markName,
+                                int fallbackIndex, const std::string& extension) const;
 
     std::thread m_thread;
     Progress m_progress;

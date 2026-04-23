@@ -6,6 +6,9 @@
 #include "util/Log.h"
 #include "util/FFmpegUtils.h"
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb/stb_image_write.h"
+
 #include <filesystem>
 
 #ifdef _WIN32
@@ -29,7 +32,7 @@ void Exporter::Start(const std::string& inputPath, const ExportSettings& setting
     m_cancel = false;
     m_inputPath = inputPath;
     m_settings = settings;
-    m_progress.totalSegments = static_cast<int>(settings.segments.size());
+    m_progress.totalItems = static_cast<int>(settings.segments.size() + settings.frames.size());
     m_progress.running = true;
 
     m_thread = std::thread(&Exporter::ExportThread, this);
@@ -44,37 +47,53 @@ void Exporter::Cancel() {
 void Exporter::ExportThread() {
     SetCurrentThreadName(L"ScrubCut Export");
 
+    int totalItems = static_cast<int>(m_settings.segments.size() + m_settings.frames.size());
+    int itemsDone = 0;
+    std::string srcExt = std::filesystem::path(m_inputPath).extension().string();
+
     for (int i = 0; i < static_cast<int>(m_settings.segments.size()); i++) {
         if (m_cancel) break;
 
-        m_progress.currentSegment = i + 1;
+        m_progress.currentItem = itemsDone + 1;
         const auto& seg = m_settings.segments[i];
 
         bool ok = false;
         if (seg.mode == ExportMode::SourceFormat) {
-            std::string ext = std::filesystem::path(m_inputPath).extension().string();
-            std::string outPath = BuildOutputPath(m_settings.outputPath, i,
-                                                   static_cast<int>(m_settings.segments.size()), ext);
+            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, srcExt);
             LOG_INFO("Exporting segment %d/%d (stream copy) -> %s",
-                     i + 1, static_cast<int>(m_settings.segments.size()), outPath.c_str());
+                     itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentStreamCopy(m_inputPath, seg, outPath);
         } else {
-            std::string outPath = BuildOutputPath(m_settings.outputPath, i,
-                                                   static_cast<int>(m_settings.segments.size()), ".gif");
+            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
             LOG_INFO("Exporting segment %d/%d (GIF) -> %s",
-                     i + 1, static_cast<int>(m_settings.segments.size()), outPath.c_str());
+                     itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentGIF(m_inputPath, seg, outPath,
                                   m_settings.gifWidth, m_settings.gifFps);
         }
 
         if (!ok && !m_cancel) {
-            // Error already set inside the export function
             m_progress.running = false;
             return;
         }
+        itemsDone++;
+        m_progress.fraction = static_cast<float>(itemsDone) / static_cast<float>(totalItems);
+    }
 
-        // Update overall progress
-        m_progress.fraction = static_cast<float>(i + 1) / static_cast<float>(m_settings.segments.size());
+    for (int i = 0; i < static_cast<int>(m_settings.frames.size()); i++) {
+        if (m_cancel) break;
+
+        m_progress.currentItem = itemsDone + 1;
+        const auto& f = m_settings.frames[i];
+        std::string outPath = BuildOutputPath(m_settings.outputPath, f.name, i, ".png");
+        LOG_INFO("Exporting frame %d/%d (PNG) -> %s",
+                 itemsDone + 1, totalItems, outPath.c_str());
+        bool ok = ExportFramePNG(m_inputPath, f, outPath);
+        if (!ok && !m_cancel) {
+            m_progress.running = false;
+            return;
+        }
+        itemsDone++;
+        m_progress.fraction = static_cast<float>(itemsDone) / static_cast<float>(totalItems);
     }
 
     if (!m_cancel) {
@@ -85,20 +104,18 @@ void Exporter::ExportThread() {
     m_progress.running = false;
 }
 
-std::string Exporter::BuildOutputPath(const std::string& basePath, int segmentIndex,
-                                       int totalSegments, const std::string& extension) const {
+std::string Exporter::BuildOutputPath(const std::string& basePath, const std::string& markName,
+                                       int fallbackIndex, const std::string& extension) const {
     std::filesystem::path base(basePath);
     std::string stem = base.stem().string();
     std::string dir = base.parent_path().string();
 
-    // Use segment name if available, otherwise fall back to index
     std::string suffix;
-    if (segmentIndex < static_cast<int>(m_settings.segments.size()) &&
-        !m_settings.segments[segmentIndex].name.empty()) {
-        suffix = "_" + m_settings.segments[segmentIndex].name;
+    if (!markName.empty()) {
+        suffix = "_" + markName;
     } else {
         char buf[32];
-        snprintf(buf, sizeof(buf), "_%03d", segmentIndex + 1);
+        snprintf(buf, sizeof(buf), "_%03d", fallbackIndex + 1);
         suffix = buf;
     }
 
@@ -254,9 +271,9 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
             float segProgress = static_cast<float>(pktTime / segDuration);
             segProgress = std::max(0.0f, std::min(segProgress, 1.0f));
 
-            int totalSegs = static_cast<int>(m_settings.segments.size());
-            float base = static_cast<float>(m_progress.currentSegment - 1) / totalSegs;
-            m_progress.fraction = base + segProgress / totalSegs;
+            int totalItems = std::max(1, m_progress.totalItems.load());
+            float base = static_cast<float>(m_progress.currentItem - 1) / totalItems;
+            m_progress.fraction = base + segProgress / totalItems;
         }
 
         ret = av_interleaved_write_frame(outFmt, pkt);
@@ -558,9 +575,9 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
             // Update progress
             if (segDuration > 0.0) {
                 float segProgress = static_cast<float>((frameTime - range.startSec) / segDuration);
-                int totalSegs = static_cast<int>(m_settings.segments.size());
-                float base = static_cast<float>(m_progress.currentSegment - 1) / totalSegs;
-                m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalSegs;
+                int totalItems = std::max(1, m_progress.totalItems.load());
+                float base = static_cast<float>(m_progress.currentItem - 1) / totalItems;
+                m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalItems;
             }
 
             ret = av_buffersrc_add_frame(bufSrcCtx, decFrame);
@@ -615,4 +632,113 @@ gif_cleanup:
     avformat_free_context(outFmt);
     avfilter_graph_free(&filterGraph);
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// PNG still-frame export
+// ---------------------------------------------------------------------------
+bool Exporter::ExportFramePNG(const std::string& inputPath,
+                               const FrameMark& frame,
+                               const std::string& outputPath) {
+    Demuxer demuxer;
+    if (!demuxer.Open(inputPath)) {
+        m_progress.SetError("Failed to open input: " + inputPath);
+        return false;
+    }
+
+    AVCodecParameters* vparams = demuxer.GetVideoCodecParams();
+    if (!vparams) {
+        m_progress.SetError("Input has no video stream");
+        return false;
+    }
+
+    VideoDecoder decoder;
+    if (!decoder.Open(vparams)) {
+        m_progress.SetError("Failed to open video decoder");
+        return false;
+    }
+
+    if (!demuxer.Seek(frame.timeSec)) {
+        m_progress.SetError("Seek failed for frame at " + std::to_string(frame.timeSec) + "s");
+        return false;
+    }
+
+    AVRational tb = demuxer.GetVideoTimeBase();
+    int64_t targetPts = static_cast<int64_t>(frame.timeSec / av_q2d(tb));
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* decFrame = av_frame_alloc();
+    AVFrame* captured = nullptr;  // the latest frame whose PTS <= target
+    bool pastTarget = false;
+
+    while (!pastTarget && !m_cancel) {
+        int rr = demuxer.ReadPacket(pkt);
+        if (rr < 0) {
+            // EOF or error — flush decoder
+            decoder.SendPacket(nullptr);
+        } else if (pkt->stream_index != demuxer.GetVideoStreamIndex()) {
+            av_packet_unref(pkt);
+            continue;
+        } else {
+            decoder.SendPacket(pkt);
+            av_packet_unref(pkt);
+        }
+
+        while (true) {
+            int rf = decoder.ReceiveFrame(decFrame);
+            if (rf == AVERROR(EAGAIN) || rf == AVERROR_EOF) break;
+            if (rf < 0) {
+                m_progress.SetError("Decode error: " + ff::ErrorString(rf));
+                av_packet_free(&pkt);
+                av_frame_free(&decFrame);
+                if (captured) av_frame_free(&captured);
+                return false;
+            }
+            int64_t pts = decFrame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE) pts = decFrame->pts;
+            if (pts <= targetPts) {
+                // Keep the most recent frame at-or-before the target.
+                if (captured) av_frame_free(&captured);
+                captured = av_frame_clone(decFrame);
+            } else {
+                pastTarget = true;
+                av_frame_unref(decFrame);
+                break;
+            }
+            av_frame_unref(decFrame);
+        }
+        if (rr < 0) break;  // EOF after flush
+    }
+
+    av_packet_free(&pkt);
+    av_frame_free(&decFrame);
+
+    if (m_cancel) {
+        if (captured) av_frame_free(&captured);
+        return false;
+    }
+    if (!captured) {
+        m_progress.SetError("No frame decoded at " + std::to_string(frame.timeSec) + "s");
+        return false;
+    }
+
+    FrameConverter conv;
+    const uint8_t* rgba = conv.Convert(captured);
+    int W = conv.GetWidth();
+    int H = conv.GetHeight();
+
+    if (!rgba || W <= 0 || H <= 0) {
+        av_frame_free(&captured);
+        m_progress.SetError("Frame conversion failed");
+        return false;
+    }
+
+    int ok = stbi_write_png(outputPath.c_str(), W, H, 4, rgba, W * 4);
+    av_frame_free(&captured);
+
+    if (!ok) {
+        m_progress.SetError("Failed to write PNG: " + outputPath);
+        return false;
+    }
+    return true;
 }

@@ -29,6 +29,7 @@ private:
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
     void RestoreFloatingWindowSnapshots();
+    void TakeScreenshot();
 
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
@@ -68,6 +69,7 @@ private:
     ImVec2 m_prevViewportSize = {0, 0};
     ExportSettings m_pendingExport;
     std::vector<bool> m_exportChecked;
+    std::vector<bool> m_frameExportChecked;
     bool m_showOverwriteConfirm = false;
     bool m_showOpenFileConfirm = false;
     bool m_pendingOpenImmediate = false;
@@ -85,6 +87,14 @@ private:
     // Segment hover state (shared between timeline bar and segments panel)
     int m_hoveredSegment = -1;       // last frame's value, used for rendering
     int m_hoveredSegmentThisFrame = -1;  // being built this frame
+
+    // Frame-mark hover state (same two-phase pattern)
+    int m_hoveredFrame = -1;
+    int m_hoveredFrameThisFrame = -1;
+
+    // Screenshot request flag — consumed right before the frame's SwapWindow.
+    bool m_screenshotPending = false;
+    int m_screenshotCounter = 0;
 
     // Seek/scrub state
     double m_seekTarget = 0.0;

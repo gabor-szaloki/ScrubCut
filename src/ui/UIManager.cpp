@@ -61,7 +61,7 @@ void UIManager::SetDpiScale(float scale) {
     // so it grows/shrinks in place rather than off to one corner.
     float ratio = scale / prevScale;
     if (ratio != 1.0f) {
-        const char* floatingWindows[] = { "Timeline", "Segments", "Help" };
+        const char* floatingWindows[] = { "Timeline", "Marks", "Help" };
         for (const char* name : floatingWindows) {
             ImGuiWindow* w = ImGui::FindWindowByName(name);
             if (!w || w->DockId != 0) continue;
@@ -150,7 +150,7 @@ void UIManager::ResetLayout() {
     ImGui::DockBuilderRemoveNode(dockspaceId);
 
     // Destroy floating windows so ImGui recreates them fresh
-    const char* windows[] = { "Timeline", "Segments", "Help" };
+    const char* windows[] = { "Timeline", "Marks", "Help" };
     ImGuiContext* ctx = ImGui::GetCurrentContext();
     for (const char* name : windows) {
         if (ImGuiWindow* w = ImGui::FindWindowByName(name)) {

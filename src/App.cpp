@@ -4,10 +4,13 @@
 #include "util/CommandLine.h"
 #include "util/AppPaths.h"
 
+#include "stb/stb_image_write.h"
+
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -342,6 +345,11 @@ void App::ProcessEvents() {
         if (event.type == SDL_EVENT_DROP_FILE) {
             RequestOpenFile(event.drop.data);
         }
+        // F12 screenshots work even when ImGui has keyboard capture (e.g. a
+        // modal popup is open), so the shortcut stays useful for debugging.
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12) {
+            m_screenshotPending = true;
+        }
         if (event.type == SDL_EVENT_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
             SDL_Keymod mod = event.key.mod;
             bool shift     = (mod & SDL_KMOD_SHIFT)      != 0;
@@ -458,14 +466,25 @@ void App::ProcessEvents() {
             case SDLK_DELETE:
             case SDLK_BACKSPACE:
                 if (!noMod) break;
-                if (m_segments.GetCount() > 0) {
-                    m_segments.RemoveSegment(m_segments.GetCount() - 1);
+                if (m_segments.GetTotalCount() > 0) {
+                    m_segments.RemoveLastMark();
+                    m_lastUIActivityNS = SDL_GetTicksNS();
+                    if (m_autoHideUI) m_uiHidden = false;
+                }
+                break;
+            case SDLK_P:
+                if (!noMod) break;
+                if (m_player.HasMedia()) {
+                    int before = m_segments.GetTotalCount();
+                    m_segments.AddFrame(m_player.GetPlaybackTime());
+                    if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                        m_showSegments = true;
                     m_lastUIActivityNS = SDL_GetTicksNS();
                     if (m_autoHideUI) m_uiHidden = false;
                 }
                 break;
             case SDLK_E:
-                if (cmd && m_segments.GetCount() > 0 && !m_exporter.IsRunning()) {
+                if (cmd && m_segments.GetTotalCount() > 0 && !m_exporter.IsRunning()) {
                     m_showExportDialog = true;
                     auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
                     auto stem = std::filesystem::path(m_currentFilePath).stem().string();
@@ -477,7 +496,7 @@ void App::ProcessEvents() {
             case SDLK_T:
                 if (cmd) m_showTimeline = !m_showTimeline;
                 break;
-            case SDLK_S:
+            case SDLK_M:
                 if (cmd) {
                     m_showSegments = !m_showSegments;
                     if (!m_showSegments) m_segmentsClosedManually = true;
@@ -517,6 +536,7 @@ void App::ProcessEvents() {
 
 void App::Render() {
     m_hoveredSegmentThisFrame = -1;
+    m_hoveredFrameThisFrame = -1;
     int w, h;
     SDL_GetWindowSizeInPixels(m_window, &w, &h);
     glViewport(0, 0, w, h);
@@ -545,7 +565,7 @@ void App::Render() {
             m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
             (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
 
-            const char* floatingWindows[] = { "Timeline", "Segments", "Help" };
+            const char* floatingWindows[] = { "Timeline", "Marks", "Help" };
             float margin = 20.0f;
             for (const char* name : floatingWindows) {
                 ImGuiWindow* win = ImGui::FindWindowByName(name);
@@ -673,7 +693,7 @@ void App::Render() {
             ImGui::Separator();
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.cmdName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
-            if (ImGui::MenuItem("Segments", (std::string(kKeys.cmdName) + "+S").c_str(), m_showSegments)) {
+            if (ImGui::MenuItem("Marks", (std::string(kKeys.cmdName) + "+M").c_str(), m_showSegments)) {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
             }
@@ -823,14 +843,16 @@ void App::Render() {
         ImGui::SameLine();
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
 
-        // Segment mark buttons — centered between transport and audio controls
+        // Mark buttons — centered between transport and audio controls
+        float markGroupGap = 12.0f * dpi;  // extra gap between segment buttons and the frame button
         {
             float afterTransport = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x;
             bool muted_ = m_player.IsMuted();
             float muteW_ = ImGui::CalcTextSize(muted_ ? "Unmute" : "Mute").x + ImGui::GetStyle().FramePadding.x * 2;
             float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f;
             float bracketW = ImGui::CalcTextSize(" [ ").x + ImGui::GetStyle().FramePadding.x * 2;
-            float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x;
+            float frameBtnW = ImGui::CalcTextSize(" [] ").x + ImGui::GetStyle().FramePadding.x * 2;
+            float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x + markGroupGap + frameBtnW;
             float segStart = afterTransport + (audioStart - afterTransport - segBtnsW) * 0.5f;
             ImGui::SameLine(segStart);
         }
@@ -860,6 +882,17 @@ void App::Render() {
             if (m_autoHideUI) m_uiHidden = false;
         }
         if (!canMarkOut) ImGui::EndDisabled();
+        ImGui::SameLine(0.0f, markGroupGap);
+        if (ImGui::Button(" [] ")) {
+            if (m_player.HasMedia()) {
+                int before = m_segments.GetTotalCount();
+                m_segments.AddFrame(m_player.GetPlaybackTime());
+                if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                    m_showSegments = true;
+                m_lastUIActivityNS = SDL_GetTicksNS();
+                if (m_autoHideUI) m_uiHidden = false;
+            }
+        }
 
         // Right: Mute + volume slider
         {
@@ -938,6 +971,58 @@ void App::Render() {
                 }
                 drawList->PopClipRect();
             }
+        }
+
+        // Frame marks — vertical line + triangle caps at top and bottom of the
+        // bar (pointing inward). Draw the two caps as stacked integer-height
+        // rectangles (a discrete pixel pyramid) instead of AA triangles — this
+        // gives pixel-perfect symmetric rasterization. ImGui's AA triangle
+        // fill was rendering the bottom cap visibly taller than the top even
+        // with matching vertex coords, due to the direction the rasterizer
+        // distributes sub-pixel coverage across flat-top vs flat-bottom edges.
+        const auto& frames = m_segments.GetFrames();
+        if (duration > 0.0) {
+            // Use odd pixel widths so the pyramid apex (1 pixel) aligns
+            // exactly with the vertical line (1 pixel), and same for hover
+            // (apex and line both 3 pixels wide). ImGui's AddLine was being
+            // centered between pixels for thickness=2 which left a 1-pixel
+            // misalignment vs. integer-positioned triangle apexes.
+            int triHalf = static_cast<int>(std::round(4.0f * dpi));
+            int topY = static_cast<int>(std::round(barPos.y));
+            int botY = static_cast<int>(std::round(barPos.y + barHeight));
+            drawList->PushClipRect(ImVec2(barPos.x, static_cast<float>(topY)),
+                                   ImVec2(barPos.x + barWidth, static_cast<float>(botY)), true);
+            for (int i = 0; i < static_cast<int>(frames.size()); i++) {
+                int fxi = static_cast<int>(std::round(barPos.x + static_cast<float>(frames[i].timeSec / duration) * barWidth));
+                float fx = static_cast<float>(fxi);
+                bool barHovered = mousePos.y >= topY && mousePos.y <= botY &&
+                                  std::abs(mousePos.x - fx) <= triHalf + 1.0f;
+                if (barHovered) m_hoveredFrameThisFrame = i;
+                bool highlighted = (m_hoveredFrame == i);
+                float alpha = highlighted ? 1.0f : 0.9f;
+                int lineHalf = highlighted ? 1 : 0;            // 3 px line on hover, else 1 px
+                int pyramidHalf = triHalf + (highlighted ? 2 : 0);  // grow base on hover
+                ImU32 col = GetSegmentColor(frames[i].colorIndex, alpha * m_uiAlpha);
+                // Vertical line as a pixel-aligned rect (not AddLine) so it
+                // cannot drift half a pixel relative to the pyramid caps.
+                drawList->AddRectFilled(
+                    ImVec2(fx - static_cast<float>(lineHalf), static_cast<float>(topY)),
+                    ImVec2(fx + static_cast<float>(lineHalf + 1), static_cast<float>(botY)),
+                    col);
+                // Pyramid caps: row k has half-width (pyramidHalf - k) and
+                // spans 2*halfW+1 pixels centered on fx. Stops at halfW ==
+                // lineHalf so the apex matches the line width exactly.
+                for (int halfW = pyramidHalf; halfW >= lineHalf; halfW--) {
+                    int k = pyramidHalf - halfW;
+                    float x0 = fx - static_cast<float>(halfW);
+                    float x1 = fx + static_cast<float>(halfW + 1);
+                    float yt = static_cast<float>(topY + k);
+                    float yb = static_cast<float>(botY - k - 1);
+                    drawList->AddRectFilled(ImVec2(x0, yt), ImVec2(x1, yt + 1.0f), col);
+                    drawList->AddRectFilled(ImVec2(x0, yb), ImVec2(x1, yb + 1.0f), col);
+                }
+            }
+            drawList->PopClipRect();
         }
 
         // Pending mark-in indicator
@@ -1037,6 +1122,47 @@ void App::Render() {
             }
         }
 
+        // Frame marker drag handles (rendered after segment handles so they
+        // take priority when overlapping, and before the click-to-seek fallback)
+        for (int i = 0; i < static_cast<int>(frames.size()); i++) {
+            float fx = barPos.x + static_cast<float>(frames[i].timeSec / duration) * barWidth;
+            float handleW = 10.0f;
+
+            ImGui::SetCursorScreenPos(ImVec2(fx - handleW * 0.5f, barPos.y));
+            char idBuf[32];
+            snprintf(idBuf, sizeof(idBuf), "##frm_%d", i);
+            ImGui::InvisibleButton(idBuf, ImVec2(handleW, barHeight));
+            if (ImGui::IsItemActive()) {
+                float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
+                double newTime = static_cast<double>(mouseX / barWidth) * duration;
+                newTime = std::max(0.0, std::min(newTime, duration));
+                m_segments.UpdateFrame(i, newTime);
+                m_seekTarget = newTime;
+                handleActive = true;
+                m_hoveredFrameThisFrame = i;
+
+                if (!m_isTimelineSeeking) {
+                    m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
+                    if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
+                    m_isTimelineSeeking = true;
+                    m_player.SetScrubbing(true);
+                }
+                uint64_t now = SDL_GetTicksNS();
+                if (now - m_lastSeekTime > 33000000ULL) {
+                    m_player.SeekTo(newTime);
+                    m_lastSeekTime = now;
+                }
+            }
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+            if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
+                m_player.SetScrubbing(false);
+                if (m_wasPlayingBeforeTimelineSeek)
+                    m_player.SeekTo(m_seekTarget, true);
+                m_isTimelineSeeking = false;
+            }
+        }
+
         // Click-to-seek on timeline bar (only if no handle is active)
         ImGui::SetCursorScreenPos(barPos);
         ImGui::InvisibleButton("##timeline_bar", ImVec2(barWidth, barHeight));
@@ -1117,10 +1243,12 @@ void App::Render() {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float dpi = m_ui.GetDpiScale();
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - (350 + 40) * dpi, vp->WorkPos.y + 40 * dpi), layoutCond);
-    ImGui::SetNextWindowSize(ImVec2(350 * dpi, 250 * dpi), layoutCond);
+    float marksW = 350.0f * dpi;
+    float marksH = 250.0f * dpi;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * dpi, vp->WorkPos.y + 40 * dpi), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(marksW, marksH), layoutCond);
     bool segmentsWasOpen = m_showSegments;
-    ImGui::Begin("Segments", &m_showSegments);
+    ImGui::Begin("Marks", &m_showSegments);
 
     // Pending mark-in indicator
     if (m_segments.HasPendingMarkIn()) {
@@ -1131,131 +1259,195 @@ void App::Render() {
         ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
     }
 
-    // Scrollable segment list
+    // Scrollable mark list — segments and frames interleaved by timestamp
     float bottomHeight = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y + 4;
     if (ImGui::BeginChild("##seglist", ImVec2(0, -bottomHeight), ImGuiChildFlags_None)) {
-        if (m_segments.GetCount() > 0) {
-            const auto& segs = m_segments.GetSegments();
-            int removeIdx = -1;
-            for (int i = 0; i < static_cast<int>(segs.size()); i++) {
-                ImGui::PushID(i);
-                const ImVec4& segColor = kSegmentColors[segs[i].colorIndex % kSegmentColorCount];
+        const auto& segs = m_segments.GetSegments();
+        const auto& frames = m_segments.GetFrames();
+        if (!segs.empty() || !frames.empty()) {
+            struct Row { bool isFrame; int index; double t; uint64_t seq; };
+            std::vector<Row> rows;
+            rows.reserve(segs.size() + frames.size());
+            for (int i = 0; i < static_cast<int>(segs.size()); i++)
+                rows.push_back({false, i, segs[i].startSec, segs[i].addSeq});
+            for (int i = 0; i < static_cast<int>(frames.size()); i++)
+                rows.push_back({true, i, frames[i].timeSec, frames[i].addSeq});
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+                if (a.t != b.t) return a.t < b.t;
+                return a.seq < b.seq;
+            });
 
-                float cardPad = 4.0f;
+            int removeSegIdx = -1;
+            int removeFrameIdx = -1;
+            float cardPad = 4.0f;
+
+            for (size_t r = 0; r < rows.size(); r++) {
+                const Row& row = rows[r];
+                // Stable ID: addSeq is monotonic and unique per mark, so text-cursor /
+                // focus state survives re-sorting when a new mark is added.
+                uint64_t stableId = row.isFrame ? frames[row.index].addSeq : segs[row.index].addSeq;
+                ImGui::PushID(static_cast<int>(stableId));
+
                 ImVec2 cardStart = ImGui::GetCursorScreenPos();
                 ImGui::SetCursorScreenPos(ImVec2(cardStart.x + cardPad, cardStart.y + cardPad));
                 ImGui::BeginGroup();
 
-                // Row 1: color square, name field, delete button
+                // Row 1: color square, type label, name field, delete button
+                int colorIdx = row.isFrame ? frames[row.index].colorIndex : segs[row.index].colorIndex;
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 ImVec2 sq = ImGui::GetCursorScreenPos();
                 float sqSize = ImGui::GetTextLineHeight();
-                dl->AddRectFilled(sq, ImVec2(sq.x + sqSize, sq.y + sqSize),
-                    GetSegmentColor(segs[i].colorIndex));
+                dl->AddRectFilled(sq, ImVec2(sq.x + sqSize, sq.y + sqSize), GetSegmentColor(colorIdx));
                 ImGui::Dummy(ImVec2(sqSize, sqSize));
                 ImGui::SameLine();
+                ImGui::TextDisabled("%s", row.isFrame ? "Frame" : "Segment");
+                ImGui::SameLine();
+
+                // Measure widths so the format indicator and delete button can
+                // be right-aligned to the same column regardless of whether
+                // this row is a Frame (shows "PNG" text) or a Segment (shows
+                // a "MP4"/"GIF" SmallButton).
+                float framePadX = ImGui::GetStyle().FramePadding.x * 2;
+                float spacing = ImGui::GetStyle().ItemSpacing.x;
+                float xBtnW = ImGui::CalcTextSize("X").x + framePadX;
+                float mp4W = ImGui::CalcTextSize("MP4").x + framePadX;
+                float gifW = ImGui::CalcTextSize("GIF").x + framePadX;
+                float pngW = ImGui::CalcTextSize("PNG").x;
+                float maxFmtW = std::max(std::max(mp4W, gifW), pngW);
+
+                float nameStartX = ImGui::GetCursorPosX();
+                float rightEdge = nameStartX + ImGui::GetContentRegionAvail().x;
+                // Stop one cardPad short of the window content edge so the
+                // card's hover-highlight rect (which adds cardPad past the
+                // rightmost item) lands on the edge, not past it.
+                float xBtnX = rightEdge - cardPad - xBtnW;
+                float fmtRightX = xBtnX - spacing;
 
                 char nameBuf[64];
-                snprintf(nameBuf, sizeof(nameBuf), "%s", segs[i].name.c_str());
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 30);
+                const std::string& curName = row.isFrame ? frames[row.index].name : segs[row.index].name;
+                snprintf(nameBuf, sizeof(nameBuf), "%s", curName.c_str());
+                ImGui::SetNextItemWidth(fmtRightX - maxFmtW - spacing - nameStartX);
                 if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf))) {
-                    m_segments.SetSegmentName(i, nameBuf);
+                    if (row.isFrame) m_segments.SetFrameName(row.index, nameBuf);
+                    else             m_segments.SetSegmentName(row.index, nameBuf);
                 }
+
+                // Format indicator: right-aligned so its right edge sits just
+                // before the delete button, regardless of its intrinsic width.
+                float fmtActualW = row.isFrame ? pngW
+                    : ((segs[row.index].mode == ExportMode::GIF) ? gifW : mp4W);
                 ImGui::SameLine();
+                ImGui::SetCursorPosX(fmtRightX - fmtActualW);
+                if (row.isFrame) {
+                    ImGui::TextDisabled("PNG");
+                } else {
+                    const TimeRange& s = segs[row.index];
+                    const char* fmtLabel = (s.mode == ExportMode::GIF) ? "GIF##fmt" : "MP4##fmt";
+                    if (ImGui::SmallButton(fmtLabel)) {
+                        ExportMode newMode = (s.mode == ExportMode::GIF)
+                            ? ExportMode::SourceFormat : ExportMode::GIF;
+                        m_segments.SetSegmentMode(row.index, newMode);
+                    }
+                }
+
+                // Delete button: pinned to the right edge.
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(xBtnX);
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.2f, 0.2f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.25f, 0.25f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
                 if (ImGui::SmallButton("X")) {
-                    removeIdx = i;
+                    if (row.isFrame) removeFrameIdx = row.index;
+                    else             removeSegIdx   = row.index;
                 }
                 ImGui::PopStyleColor(3);
 
-                // Row 2: start and end times as individual seek buttons
-                int sMin = static_cast<int>(segs[i].startSec) / 60;
-                int sSec = static_cast<int>(segs[i].startSec) % 60;
-                int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
-                int eMin = static_cast<int>(segs[i].endSec) / 60;
-                int eSec = static_cast<int>(segs[i].endSec) % 60;
-                int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
-                char startBuf[32], endBuf[32];
-                snprintf(startBuf, sizeof(startBuf), "%02d:%02d.%03d##start", sMin, sSec, sMs);
-                snprintf(endBuf, sizeof(endBuf), "%02d:%02d.%03d##end", eMin, eSec, eMs);
-                double playhead = m_seekTarget;
-                bool canSetStart = playhead < segs[i].endSec;
-                bool canSetEnd = playhead > segs[i].startSec;
-                if (!canSetStart) ImGui::BeginDisabled();
-                if (ImGui::SmallButton("[##setstart")) {
-                    m_segments.UpdateSegment(i, playhead, segs[i].endSec);
-                }
-                if (!canSetStart) ImGui::EndDisabled();
-                ImGui::SameLine();
-                if (ImGui::SmallButton(startBuf))
-                    m_player.SeekTo(segs[i].startSec);
-                ImGui::SameLine();
-                ImGui::Text("->");
-                ImGui::SameLine();
-                if (ImGui::SmallButton(endBuf))
-                    m_player.SeekTo(segs[i].endSec);
-                ImGui::SameLine();
-                if (!canSetEnd) ImGui::BeginDisabled();
-                if (ImGui::SmallButton("]##setend")) {
-                    m_segments.UpdateSegment(i, segs[i].startSec, playhead);
-                }
-                if (!canSetEnd) ImGui::EndDisabled();
-                double dur = segs[i].endSec - segs[i].startSec;
-                ImGui::SameLine();
-                ImGui::TextDisabled("(%.1fs)", dur);
-                ImGui::SameLine();
-                const char* fmtLabel = (segs[i].mode == ExportMode::GIF) ? "GIF##fmt" : "MP4##fmt";
-                if (ImGui::SmallButton(fmtLabel)) {
-                    ExportMode newMode = (segs[i].mode == ExportMode::GIF)
-                        ? ExportMode::SourceFormat : ExportMode::GIF;
-                    m_segments.SetSegmentMode(i, newMode);
+                if (!row.isFrame) {
+                    // Row 2 (segments only): start/end seek buttons + set-to-current + duration
+                    const TimeRange& s = segs[row.index];
+                    int sMin = static_cast<int>(s.startSec) / 60;
+                    int sSec = static_cast<int>(s.startSec) % 60;
+                    int sMs  = static_cast<int>(s.startSec * 1000) % 1000;
+                    int eMin = static_cast<int>(s.endSec) / 60;
+                    int eSec = static_cast<int>(s.endSec) % 60;
+                    int eMs  = static_cast<int>(s.endSec * 1000) % 1000;
+                    char startBuf[32], endBuf[32];
+                    snprintf(startBuf, sizeof(startBuf), "%02d:%02d.%03d##start", sMin, sSec, sMs);
+                    snprintf(endBuf,   sizeof(endBuf),   "%02d:%02d.%03d##end",   eMin, eSec, eMs);
+                    double playhead = m_seekTarget;
+                    bool canSetStart = playhead < s.endSec;
+                    bool canSetEnd   = playhead > s.startSec;
+                    if (!canSetStart) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton(">[##setstart"))
+                        m_segments.UpdateSegment(row.index, playhead, s.endSec);
+                    if (!canSetStart) ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(startBuf)) m_player.SeekTo(s.startSec);
+                    ImGui::SameLine();
+                    ImGui::Text("->");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(endBuf)) m_player.SeekTo(s.endSec);
+                    ImGui::SameLine();
+                    if (!canSetEnd) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton("]<##setend"))
+                        m_segments.UpdateSegment(row.index, s.startSec, playhead);
+                    if (!canSetEnd) ImGui::EndDisabled();
+                    double dur = s.endSec - s.startSec;
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%.1fs)", dur);
+                } else {
+                    // Row 2 (frames): seek button + set-to-current
+                    const FrameMark& f = frames[row.index];
+                    int fMin = static_cast<int>(f.timeSec) / 60;
+                    int fSec = static_cast<int>(f.timeSec) % 60;
+                    int fMs  = static_cast<int>(f.timeSec * 1000) % 1000;
+                    char timeBuf[32];
+                    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d.%03d##ftime", fMin, fSec, fMs);
+                    if (ImGui::SmallButton(timeBuf)) m_player.SeekTo(f.timeSec);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(">[]<##fset"))
+                        m_segments.UpdateFrame(row.index, m_seekTarget);
                 }
 
                 ImGui::EndGroup();
 
-                // Card bounds with padding
-                ImVec2 cardEnd = ImVec2(
-                    ImGui::GetItemRectMax().x + cardPad,
-                    ImGui::GetItemRectMax().y + cardPad);
-                // Advance cursor past the bottom padding
+                ImVec2 cardEnd = ImVec2(ImGui::GetItemRectMax().x + cardPad,
+                                        ImGui::GetItemRectMax().y + cardPad);
                 ImGui::SetCursorScreenPos(ImVec2(cardStart.x, cardEnd.y));
                 ImGui::Dummy(ImVec2(0, 0));
 
-                // Detect hover on this card
                 bool cardHovered = ImGui::IsMouseHoveringRect(cardStart, cardEnd);
-                if (cardHovered)
-                    m_hoveredSegmentThisFrame = i;
-
-                // Draw highlight if this segment is hovered (from panel or timeline)
-                if (m_hoveredSegment == i) {
-                    ImDrawList* dl2 = ImGui::GetWindowDrawList();
-                    dl2->AddRectFilled(cardStart, cardEnd,
-                        GetSegmentColor(segs[i].colorIndex, 0.15f), 3.0f);
-                    dl2->AddRect(cardStart, cardEnd,
-                        GetSegmentColor(segs[i].colorIndex, 0.5f), 3.0f);
+                if (cardHovered) {
+                    if (row.isFrame) m_hoveredFrameThisFrame = row.index;
+                    else             m_hoveredSegmentThisFrame = row.index;
                 }
 
-                if (i < static_cast<int>(segs.size()) - 1)
-                    ImGui::Separator();
+                bool highlighted = row.isFrame
+                    ? (m_hoveredFrame == row.index)
+                    : (m_hoveredSegment == row.index);
+                if (highlighted) {
+                    ImDrawList* dl2 = ImGui::GetWindowDrawList();
+                    dl2->AddRectFilled(cardStart, cardEnd, GetSegmentColor(colorIdx, 0.15f), 3.0f);
+                    dl2->AddRect(cardStart, cardEnd, GetSegmentColor(colorIdx, 0.5f), 3.0f);
+                }
+
+                if (r + 1 < rows.size()) ImGui::Separator();
 
                 ImGui::PopID();
             }
-            if (removeIdx >= 0) {
-                m_segments.RemoveSegment(removeIdx);
-            }
+            if (removeSegIdx >= 0)   m_segments.RemoveSegment(removeSegIdx);
+            if (removeFrameIdx >= 0) m_segments.RemoveFrame(removeFrameIdx);
         }
     }
     ImGui::EndChild();
 
     // Bottom bar: Export + Clear All (always visible)
     ImGui::Separator();
-    bool hasSegments = m_segments.GetCount() > 0;
-    bool canExport = hasSegments && !m_exporter.IsRunning();
+    bool hasMarks = m_segments.GetTotalCount() > 0;
+    bool canExport = hasMarks && !m_exporter.IsRunning();
     if (!canExport) ImGui::BeginDisabled();
     float btnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
-    if (ImGui::Button("Export Segments", ImVec2(btnWidth, 0))) {
+    if (ImGui::Button("Export", ImVec2(btnWidth, 0))) {
         m_showExportDialog = true;
         auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
         auto stem = std::filesystem::path(m_currentFilePath).stem().string();
@@ -1265,11 +1457,11 @@ void App::Render() {
     }
     if (!canExport) ImGui::EndDisabled();
     ImGui::SameLine();
-    if (!hasSegments) ImGui::BeginDisabled();
+    if (!hasMarks) ImGui::BeginDisabled();
     if (ImGui::Button("Clear All", ImVec2(-1, 0))) {
         m_segments.Clear();
     }
-    if (!hasSegments) ImGui::EndDisabled();
+    if (!hasMarks) ImGui::EndDisabled();
 
     ImGui::End();
     if (segmentsWasOpen && !m_showSegments) m_segmentsClosedManually = true;
@@ -1301,10 +1493,11 @@ void App::Render() {
             row("Jump to start / end",  kKeys.jumpName);
             row("Mark In",              "I  or  [");
             row("Mark Out",             "O  or  ]");
-            row("Remove last segment",  kKeys.deleteName);
-            row("Export segments",      (std::string(kKeys.cmdName) + " + E").c_str());
+            row("Mark Frame",           "P");
+            row("Remove last mark",     kKeys.deleteName);
+            row("Export",               (std::string(kKeys.cmdName) + " + E").c_str());
             row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());
-            row("Toggle segments",     (std::string(kKeys.cmdName) + " + S").c_str());
+            row("Toggle marks",        (std::string(kKeys.cmdName) + " + M").c_str());
             row("Quit",                 kKeys.quitShortcut);
             row("Toggle help",          "?");
 
@@ -1318,17 +1511,48 @@ void App::Render() {
     if (m_showExportDialog) {
         m_exporter.ResetProgress();
         m_exportChecked.assign(m_segments.GetCount(), true);
-        ImGui::OpenPopup("Export Segments");
+        m_frameExportChecked.assign(m_segments.GetFrameCount(), true);
+        ImGui::OpenPopup("Export");
         m_showExportDialog = false;
     }
 
-    if (ImGui::BeginPopupModal("Export Segments", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::BeginPopupModal("Export", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         const auto& progress = m_exporter.GetProgress();
+        const auto& segs = m_segments.GetSegments();
+        const auto& frames = m_segments.GetFrames();
+        std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
 
-        if (!progress.running && !progress.finished) {
+        // Interleaved-by-time row list (same pattern as the Segments panel)
+        struct Row { bool isFrame; int index; double t; uint64_t seq; };
+        std::vector<Row> rows;
+        rows.reserve(segs.size() + frames.size());
+        for (int i = 0; i < static_cast<int>(segs.size()); i++)
+            rows.push_back({false, i, segs[i].startSec, segs[i].addSeq});
+        for (int i = 0; i < static_cast<int>(frames.size()); i++)
+            rows.push_back({true, i, frames[i].timeSec, frames[i].addSeq});
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            if (a.t != b.t) return a.t < b.t;
+            return a.seq < b.seq;
+        });
+
+        auto isChecked = [&](const Row& row) -> bool {
+            return row.isFrame
+                ? (row.index < static_cast<int>(m_frameExportChecked.size()) && m_frameExportChecked[row.index])
+                : (row.index < static_cast<int>(m_exportChecked.size()) && m_exportChecked[row.index]);
+        };
+        auto extForRow = [&](const Row& row) -> std::string {
+            if (row.isFrame) return ".png";
+            return (segs[row.index].mode == ExportMode::GIF) ? std::string(".gif") : inputExt;
+        };
+        auto nameForRow = [&](const Row& row) -> const std::string& {
+            return row.isFrame ? frames[row.index].name : segs[row.index].name;
+        };
+
+        if (!progress.running && !progress.finished && !progress.error) {
             // --- Settings form ---
+            const float dialogWidth = 600.0f;
             ImGui::Text("Output Directory:");
-            ImGui::SetNextItemWidth(500 - ImGui::CalcTextSize("Browse").x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ItemSpacing.x);
+            ImGui::SetNextItemWidth(dialogWidth - ImGui::CalcTextSize("Browse").x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ItemSpacing.x);
             ImGui::InputText("##dir", m_exportDir, sizeof(m_exportDir));
             ImGui::SameLine();
             if (ImGui::Button("Browse")) {
@@ -1341,74 +1565,98 @@ void App::Render() {
             }
 
             ImGui::Text("Filename Base:");
-            ImGui::SetNextItemWidth(500);
+            ImGui::SetNextItemWidth(dialogWidth);
             ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
 
-            // GIF settings (apply to all GIF segments)
-            const auto& segs = m_segments.GetSegments();
-
-            // Segment list with checkboxes in scrollable table
+            // Mark list with checkboxes in scrollable table
             ImGui::Spacing();
-            ImGui::Text("Segments to export:");
-            int segCount = static_cast<int>(segs.size());
+            ImGui::Text("Marks to export:");
             float rowH = ImGui::GetTextLineHeightWithSpacing() + 4;
             ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
             ImVec2 tableSize(0, 0);
-            if (segCount > 10) {
+            if (static_cast<int>(rows.size()) > 10) {
                 tableFlags |= ImGuiTableFlags_ScrollY;
                 tableSize.y = 10 * rowH + 30;
             }
-            if (ImGui::BeginTable("##export_segs", 5, tableFlags, tableSize)) {
+            if (ImGui::BeginTable("##export_marks", 6, tableFlags, tableSize)) {
                 ImGui::TableSetupColumn("##chk_col", ImGuiTableColumnFlags_WidthFixed, 24);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Range", ImGuiTableColumnFlags_WidthFixed, 160);
+                ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 160);
                 ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 60);
                 ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed, 50);
                 ImGui::TableHeadersRow();
 
-                for (int i = 0; i < segCount; i++) {
-                    ImGui::PushID(i);
+                for (size_t r = 0; r < rows.size(); r++) {
+                    const Row& row = rows[r];
+                    uint64_t stableId = row.isFrame ? frames[row.index].addSeq : segs[row.index].addSeq;
+                    ImGui::PushID(static_cast<int>(stableId));
                     ImGui::TableNextRow();
 
                     // Checkbox
                     ImGui::TableNextColumn();
-                    bool checked = (i < static_cast<int>(m_exportChecked.size())) && m_exportChecked[i];
-                    if (ImGui::Checkbox("##chk", &checked))
-                        m_exportChecked[i] = checked;
+                    bool checked = isChecked(row);
+                    if (ImGui::Checkbox("##chk", &checked)) {
+                        if (row.isFrame) m_frameExportChecked[row.index] = checked;
+                        else             m_exportChecked[row.index] = checked;
+                    }
+
+                    // Type
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(row.isFrame ? "Frame" : "Segment");
 
                     // Editable name
                     ImGui::TableNextColumn();
                     char nameBuf[64];
-                    snprintf(nameBuf, sizeof(nameBuf), "%s", segs[i].name.c_str());
+                    snprintf(nameBuf, sizeof(nameBuf), "%s", nameForRow(row).c_str());
                     ImGui::SetNextItemWidth(-1);
-                    if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
-                        m_segments.SetSegmentName(i, nameBuf);
+                    if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf))) {
+                        if (row.isFrame) m_segments.SetFrameName(row.index, nameBuf);
+                        else             m_segments.SetSegmentName(row.index, nameBuf);
+                    }
 
-                    // Time range
+                    // Time (or range)
                     ImGui::TableNextColumn();
-                    int sMin = static_cast<int>(segs[i].startSec) / 60;
-                    int sSec = static_cast<int>(segs[i].startSec) % 60;
-                    int sMs  = static_cast<int>(segs[i].startSec * 1000) % 1000;
-                    int eMin = static_cast<int>(segs[i].endSec) / 60;
-                    int eSec = static_cast<int>(segs[i].endSec) % 60;
-                    int eMs  = static_cast<int>(segs[i].endSec * 1000) % 1000;
-                    ImGui::Text("%02d:%02d.%03d-%02d:%02d.%03d", sMin, sSec, sMs, eMin, eSec, eMs);
+                    if (row.isFrame) {
+                        const FrameMark& f = frames[row.index];
+                        int fMin = static_cast<int>(f.timeSec) / 60;
+                        int fSec = static_cast<int>(f.timeSec) % 60;
+                        int fMs  = static_cast<int>(f.timeSec * 1000) % 1000;
+                        ImGui::Text("%02d:%02d.%03d", fMin, fSec, fMs);
+                    } else {
+                        const TimeRange& s = segs[row.index];
+                        int sMin = static_cast<int>(s.startSec) / 60;
+                        int sSec = static_cast<int>(s.startSec) % 60;
+                        int sMs  = static_cast<int>(s.startSec * 1000) % 1000;
+                        int eMin = static_cast<int>(s.endSec) / 60;
+                        int eSec = static_cast<int>(s.endSec) % 60;
+                        int eMs  = static_cast<int>(s.endSec * 1000) % 1000;
+                        ImGui::Text("%02d:%02d.%03d-%02d:%02d.%03d", sMin, sSec, sMs, eMin, eSec, eMs);
+                    }
 
                     // Duration
                     ImGui::TableNextColumn();
-                    double dur = segs[i].endSec - segs[i].startSec;
-                    ImGui::Text("%.1fs", dur);
-
-                    // Format (editable toggle)
-                    ImGui::TableNextColumn();
-                    const char* fmtLabel = (segs[i].mode == ExportMode::GIF) ? "GIF" : "MP4";
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 0.6f));
-                    if (ImGui::SmallButton(fmtLabel)) {
-                        ExportMode newMode = (segs[i].mode == ExportMode::GIF)
-                            ? ExportMode::SourceFormat : ExportMode::GIF;
-                        m_segments.SetSegmentMode(i, newMode);
+                    if (row.isFrame) {
+                        ImGui::TextDisabled("-");
+                    } else {
+                        double dur = segs[row.index].endSec - segs[row.index].startSec;
+                        ImGui::Text("%.1fs", dur);
                     }
-                    ImGui::PopStyleColor();
+
+                    // Format (toggle for segments, static PNG label for frames)
+                    ImGui::TableNextColumn();
+                    if (row.isFrame) {
+                        ImGui::TextDisabled("PNG");
+                    } else {
+                        const char* fmtLabel = (segs[row.index].mode == ExportMode::GIF) ? "GIF" : "MP4";
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 0.6f));
+                        if (ImGui::SmallButton(fmtLabel)) {
+                            ExportMode newMode = (segs[row.index].mode == ExportMode::GIF)
+                                ? ExportMode::SourceFormat : ExportMode::GIF;
+                            m_segments.SetSegmentMode(row.index, newMode);
+                        }
+                        ImGui::PopStyleColor();
+                    }
 
                     ImGui::PopID();
                 }
@@ -1433,31 +1681,27 @@ void App::Render() {
             // Output file preview
             ImGui::Spacing();
             if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
-                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
                 std::string stem = std::filesystem::path(m_exportName).stem().string();
                 if (stem.empty()) stem = m_exportName;
                 ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetDpiScale()),
                                   ImGuiChildFlags_Borders);
                 bool anyForPreview = false;
-                for (int i = 0; i < segCount; i++) {
-                    if (i >= static_cast<int>(m_exportChecked.size()) || !m_exportChecked[i]) continue;
+                for (const Row& row : rows) {
+                    if (!isChecked(row)) continue;
                     anyForPreview = true;
-                    const auto& seg = segs[i];
-                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                    std::string filename = seg.name.empty()
-                        ? std::string("<unnamed>")
-                        : (stem + "_" + seg.name + ext);
-                    bool exists = !seg.name.empty() &&
+                    std::string ext = extForRow(row);
+                    const std::string& nm = nameForRow(row);
+                    std::string filename = nm.empty() ? std::string("<unnamed>") : (stem + "_" + nm + ext);
+                    bool exists = !nm.empty() &&
                                   std::filesystem::exists(std::filesystem::path(m_exportDir) / filename);
-                    if (exists) {
+                    if (exists)
                         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
                                            "%s  (already exists)", filename.c_str());
-                    } else {
+                    else
                         ImGui::TextUnformatted(filename.c_str());
-                    }
                 }
                 if (!anyForPreview)
-                    ImGui::TextDisabled("(no segments selected)");
+                    ImGui::TextDisabled("(nothing selected)");
                 ImGui::EndChild();
             }
 
@@ -1468,55 +1712,67 @@ void App::Render() {
             // Validate: check for empty names and any checked
             bool anyChecked = false;
             bool hasEmptyName = false;
-            for (int i = 0; i < segCount; i++) {
-                if (i < static_cast<int>(m_exportChecked.size()) && m_exportChecked[i]) {
-                    anyChecked = true;
-                    if (segs[i].name.empty()) hasEmptyName = true;
-                }
+            for (const Row& row : rows) {
+                if (!isChecked(row)) continue;
+                anyChecked = true;
+                if (nameForRow(row).empty()) hasEmptyName = true;
             }
             if (hasEmptyName)
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "All segments must have a name.");
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "All marks must have a name.");
 
-            if (!anyChecked || hasEmptyName) ImGui::BeginDisabled();
-            float expBtnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
-            if (ImGui::Button("Export", ImVec2(expBtnWidth, 0))) {
+            auto triggerExport = [&]() {
                 m_pendingExport.segments.clear();
-                for (int i = 0; i < segCount; i++)
-                    if (i < static_cast<int>(m_exportChecked.size()) && m_exportChecked[i])
-                        m_pendingExport.segments.push_back(segs[i]);
+                m_pendingExport.frames.clear();
+                for (const Row& row : rows) {
+                    if (!isChecked(row)) continue;
+                    if (row.isFrame) m_pendingExport.frames.push_back(frames[row.index]);
+                    else             m_pendingExport.segments.push_back(segs[row.index]);
+                }
                 m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
 
                 // Check for existing files
-                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
                 std::filesystem::path base(m_pendingExport.outputPath);
                 std::string stem = base.stem().string();
                 std::string dir = base.parent_path().string();
                 m_conflictingFiles.clear();
-                for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
-                    const auto& seg = m_pendingExport.segments[i];
+                for (const auto& seg : m_pendingExport.segments) {
                     std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                    std::string suffix = "_" + seg.name;
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + suffix + ext);
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + seg.name + ext);
                     if (std::filesystem::exists(outPath))
                         m_conflictingFiles.push_back(outPath.filename().string());
                 }
-
-                if (m_conflictingFiles.empty()) {
-                    m_exporter.Start(m_currentFilePath, m_pendingExport);
-                } else {
-                    m_showOverwriteConfirm = true;
+                for (const auto& fm : m_pendingExport.frames) {
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + fm.name + ".png");
+                    if (std::filesystem::exists(outPath))
+                        m_conflictingFiles.push_back(outPath.filename().string());
                 }
-            }
-            if (!anyChecked || hasEmptyName) ImGui::EndDisabled();
+                if (m_conflictingFiles.empty())
+                    m_exporter.Start(m_currentFilePath, m_pendingExport);
+                else
+                    m_showOverwriteConfirm = true;
+            };
+
+            bool canExport = anyChecked && !hasEmptyName;
+            if (!canExport) ImGui::BeginDisabled();
+            float expBtnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
+            if (ImGui::Button("Export", ImVec2(expBtnWidth, 0))) triggerExport();
+            if (!canExport) ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(-1, 0))) {
                 ImGui::CloseCurrentPopup();
             }
+
+            // Enter → Export when the popup is focused (and no sub-modal is open)
+            if (canExport && !m_showOverwriteConfirm &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
+                triggerExport();
+            }
         } else if (progress.running) {
             // --- Progress display ---
-            int cur = progress.currentSegment;
-            int total = progress.totalSegments;
-            ImGui::Text("Exporting segment %d of %d...", cur, total);
+            int cur = progress.currentItem;
+            int total = progress.totalItems;
+            ImGui::Text("Exporting %d of %d...", cur, total);
             ImGui::ProgressBar(progress.fraction, ImVec2(400, 0));
 
             if (ImGui::Button("Cancel Export", ImVec2(120, 0))) {
@@ -1525,7 +1781,7 @@ void App::Render() {
             }
         } else if (progress.finished) {
             // --- Done ---
-            ImGui::Dummy(ImVec2(500, 0)); // maintain minimum width
+            ImGui::Dummy(ImVec2(500, 0));
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Export complete!");
             ImGui::Spacing();
 
@@ -1545,26 +1801,34 @@ void App::Render() {
             }
             ImGui::Spacing();
             ImGui::Text("Exported files:");
-            for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
-                const auto& seg = m_pendingExport.segments[i];
+            for (const auto& seg : m_pendingExport.segments) {
                 std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : basePath.extension().string();
                 if (ext.empty()) ext = ".mp4";
-                std::string suffix = seg.name.empty() ? "_" + std::to_string(i + 1) : "_" + seg.name;
-                std::string filename = stem + suffix + ext;
-                ImGui::BulletText("%s", filename.c_str());
+                ImGui::BulletText("%s_%s%s", stem.c_str(), seg.name.c_str(), ext.c_str());
+            }
+            for (const auto& fm : m_pendingExport.frames) {
+                ImGui::BulletText("%s_%s.png", stem.c_str(), fm.name.c_str());
             }
             ImGui::Spacing();
 
-            if (ImGui::Button("Close", ImVec2(-1, 0))) {
-                ImGui::CloseCurrentPopup();
+            bool closeRequested = false;
+            if (ImGui::Button("Close", ImVec2(-1, 0))) closeRequested = true;
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
+                closeRequested = true;
             }
+            if (closeRequested) ImGui::CloseCurrentPopup();
         } else if (progress.error) {
             // --- Error ---
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Export failed:");
             ImGui::TextWrapped("%s", progress.GetError().c_str());
-            if (ImGui::Button("Close", ImVec2(120, 0))) {
-                ImGui::CloseCurrentPopup();
+            bool closeRequested = false;
+            if (ImGui::Button("Close", ImVec2(120, 0))) closeRequested = true;
+            if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
+                closeRequested = true;
             }
+            if (closeRequested) ImGui::CloseCurrentPopup();
         }
 
         // Overwrite confirmation sub-popup
@@ -1588,21 +1852,23 @@ void App::Render() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Skip Existing", ImVec2(btnW, 0))) {
-                // Remove conflicting segments from pending export
-                std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
                 std::filesystem::path base(m_pendingExport.outputPath);
                 std::string stem = base.stem().string();
                 std::string dir = base.parent_path().string();
-                std::vector<TimeRange> filtered;
-                for (int i = 0; i < static_cast<int>(m_pendingExport.segments.size()); i++) {
-                    const auto& seg = m_pendingExport.segments[i];
+                std::vector<TimeRange> filteredSegs;
+                for (const auto& seg : m_pendingExport.segments) {
                     std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
                     std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + seg.name + ext);
-                    if (!std::filesystem::exists(outPath))
-                        filtered.push_back(seg);
+                    if (!std::filesystem::exists(outPath)) filteredSegs.push_back(seg);
                 }
-                m_pendingExport.segments = filtered;
-                if (!filtered.empty())
+                std::vector<FrameMark> filteredFrames;
+                for (const auto& fm : m_pendingExport.frames) {
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + fm.name + ".png");
+                    if (!std::filesystem::exists(outPath)) filteredFrames.push_back(fm);
+                }
+                m_pendingExport.segments = filteredSegs;
+                m_pendingExport.frames = filteredFrames;
+                if (!filteredSegs.empty() || !filteredFrames.empty())
                     m_exporter.Start(m_currentFilePath, m_pendingExport);
                 ImGui::CloseCurrentPopup();
             }
@@ -1644,6 +1910,12 @@ void App::Render() {
     m_ui.EndFrame();
 
     m_hoveredSegment = m_hoveredSegmentThisFrame;
+    m_hoveredFrame = m_hoveredFrameThisFrame;
+
+    if (m_screenshotPending) {
+        TakeScreenshot();
+        m_screenshotPending = false;
+    }
 
     SDL_GL_SwapWindow(m_window);
 }
@@ -1682,6 +1954,35 @@ float App::GetEffectiveDpiScale() const {
 #endif
 }
 
+void App::TakeScreenshot() {
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(m_window, &w, &h);
+    if (w <= 0 || h <= 0) { LOG_WARN("Screenshot: invalid window size"); return; }
+
+    std::vector<uint8_t> raw(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+
+    // OpenGL origin is bottom-left; image formats expect top-left. Flip rows.
+    int stride = w * 4;
+    std::vector<uint8_t> flipped(raw.size());
+    for (int y = 0; y < h; y++)
+        std::memcpy(flipped.data() + y * stride, raw.data() + (h - 1 - y) * stride, stride);
+
+    auto dir = GetAppDataDir() / "screenshots";
+    std::filesystem::create_directories(dir);
+    m_screenshotCounter++;
+    char name[64];
+    snprintf(name, sizeof(name), "screenshot_%03d.png", m_screenshotCounter);
+    auto path = (dir / name).string();
+
+    if (stbi_write_png(path.c_str(), w, h, 4, flipped.data(), stride))
+        LOG_INFO("Screenshot saved: %s", path.c_str());
+    else
+        LOG_ERROR("Screenshot failed to write: %s", path.c_str());
+}
+
 void App::RestoreFloatingWindowSnapshots() {
     auto restore = [](const FloatingWindowSnap& s, const char* name) {
         if (!s.valid) return;
@@ -1692,7 +1993,7 @@ void App::RestoreFloatingWindowSnapshots() {
         w->Size = s.size;
     };
     restore(m_snapTimeline, "Timeline");
-    restore(m_snapSegments, "Segments");
+    restore(m_snapSegments, "Marks");
     restore(m_snapHelp,     "Help");
 }
 
@@ -1711,7 +2012,7 @@ void App::SetFullscreen(bool fullscreen) {
             s.valid = true;
         };
         snap(m_snapTimeline, "Timeline");
-        snap(m_snapSegments, "Segments");
+        snap(m_snapSegments, "Marks");
         snap(m_snapHelp,     "Help");
     } else {
         RestoreFloatingWindowSnapshots();

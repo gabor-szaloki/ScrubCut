@@ -7,7 +7,8 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 - **Fast scrubbing** -- drag the timeline bar or use keyboard shortcuts to seek instantly
 - **Frame stepping** -- step forward/backward one frame at a time
 - **Trimming** -- mark multiple in/out segments, export them as separate files
-- **Export formats** -- original format (stream copy, no re-encoding) or GIF
+- **Frame grabbing** -- mark individual frames, export them as PNG stills
+- **Export formats** -- original format (stream copy, no re-encoding), GIF, or PNG
 - **Variable speed** -- 0.25x to 4x playback
 - **Volume control** -- mute button and volume slider
 
@@ -103,11 +104,12 @@ Where two modifiers are shown separated by `/`, the first is Windows and the sec
 | Jump to start / end         | Home / End  (also Cmd + Left / Right on macOS) |
 | Mark In                     | I  or  [                                    |
 | Mark Out                    | O  or  ]                                    |
-| Remove last segment         | Delete / Backspace                          |
+| Mark Frame                  | P                                           |
+| Remove last mark            | Delete / Backspace                          |
 | Open file                   | Ctrl/Cmd + O                                |
-| Export segments             | Ctrl/Cmd + E                                |
+| Export                      | Ctrl/Cmd + E                                |
 | Toggle timeline panel       | Ctrl/Cmd + T                                |
-| Toggle segments panel       | Ctrl/Cmd + S                                |
+| Toggle marks panel          | Ctrl/Cmd + M                                |
 | Toggle fullscreen           | F                                           |
 | Toggle UI visibility        | H                                           |
 | Exit fullscreen / show UI   | Esc                                         |
