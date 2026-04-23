@@ -57,6 +57,17 @@ static constexpr PlatformKeys kKeys = {
 };
 #endif
 
+// Open a folder in the system file browser without spawning a shell.
+// system("explorer ...") launches cmd.exe first and blocks the caller until
+// it exits, which is hundreds of ms to seconds on Windows. SDL_OpenURL calls
+// ShellExecuteW directly and returns immediately.
+static void OpenFolderInShell(const std::filesystem::path& dir) {
+    std::string path = dir.generic_string();
+    if (!path.empty() && path.front() == '/') path.erase(0, 1);  // unix leading slash is part of the URI
+    std::string uri = "file:///" + path;
+    SDL_OpenURL(uri.c_str());
+}
+
 // Fixed cycling color palette for segments
 static const ImVec4 kSegmentColors[] = {
     {0.30f, 0.55f, 0.85f, 1.0f},  // blue
@@ -672,13 +683,7 @@ void App::Render() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Open App Data Folder")) {
-                std::string appDataDir = GetAppDataDir().string();
-#ifdef __APPLE__
-                std::string cmd = "open \"" + appDataDir + "\"";
-#else
-                std::string cmd = "explorer \"" + appDataDir + "\"";
-#endif
-                system(cmd.c_str());
+                OpenFolderInShell(GetAppDataDir());
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {
@@ -1552,7 +1557,11 @@ void App::Render() {
             // --- Settings form ---
             const float dialogWidth = 600.0f;
             ImGui::Text("Output Directory:");
-            ImGui::SetNextItemWidth(dialogWidth - ImGui::CalcTextSize("Browse").x - ImGui::GetStyle().FramePadding.x * 2 - ImGui::GetStyle().ItemSpacing.x);
+            float padX = ImGui::GetStyle().FramePadding.x * 2;
+            float dirSpacing = ImGui::GetStyle().ItemSpacing.x;
+            float browseW = ImGui::CalcTextSize("Browse").x + padX;
+            float openW = ImGui::CalcTextSize("Open").x + padX;
+            ImGui::SetNextItemWidth(dialogWidth - browseW - openW - dirSpacing * 2);
             ImGui::InputText("##dir", m_exportDir, sizeof(m_exportDir));
             ImGui::SameLine();
             if (ImGui::Button("Browse")) {
@@ -1563,6 +1572,14 @@ void App::Render() {
                     }
                 }, m_exportDir, m_window, m_exportDir, false);
             }
+            ImGui::SameLine();
+            std::error_code dirCheckEc;
+            bool dirExists = std::filesystem::is_directory(m_exportDir, dirCheckEc);
+            if (!dirExists) ImGui::BeginDisabled();
+            if (ImGui::Button("Open")) {
+                OpenFolderInShell(m_exportDir);
+            }
+            if (!dirExists) ImGui::EndDisabled();
 
             ImGui::Text("Filename Base:");
             ImGui::SetNextItemWidth(dialogWidth);
@@ -1786,18 +1803,14 @@ void App::Render() {
             ImGui::Spacing();
 
             std::filesystem::path basePath(m_pendingExport.outputPath);
-            std::string dir = basePath.parent_path().string();
+            std::filesystem::path dirPath = basePath.parent_path();
+            std::string dir = dirPath.string();
             std::string stem = basePath.stem().string();
             ImGui::Text("Output folder:");
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  %s", dir.c_str());
             ImGui::SameLine();
             if (ImGui::SmallButton("Open")) {
-#ifdef __APPLE__
-                std::string cmd = "open \"" + dir + "\"";
-#else
-                std::string cmd = "explorer \"" + dir + "\"";
-#endif
-                system(cmd.c_str());
+                OpenFolderInShell(dirPath);
             }
             ImGui::Spacing();
             ImGui::Text("Exported files:");
