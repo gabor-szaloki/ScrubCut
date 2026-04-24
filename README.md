@@ -2,7 +2,7 @@
 
 A lightweight video player for fast frame-accurate scrubbing, trimming, and exporting.
 
-<video src="https://github.com/gabor-szaloki/ScrubCut/raw/main/docs/demo.mp4" controls width="720"></video>
+<video src="https://github.com/user-attachments/assets/5b82612a-8015-4c31-8e7b-94dfa60347d7" controls width="720"></video>
 
 ## Features
 
