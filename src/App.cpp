@@ -154,6 +154,8 @@ bool App::Init() {
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
+    m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
+    m_player.SetMuted(m_prefSettings.GetBool("muted", false));
 
     // Apply initial DPI scale to the UI (1.0 unless DPI scaling is enabled on Windows).
     m_ui.SetDpiScale(GetEffectiveDpiScale());
@@ -257,6 +259,8 @@ void App::Shutdown() {
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
+        m_prefSettings.SetFloat("volume", m_player.GetVolume());
+        m_prefSettings.SetBool("muted", m_player.IsMuted());
         m_prefSettings.Save();
     }
     SDL_ShowCursor();
@@ -409,12 +413,14 @@ void App::ProcessEvents() {
             case SDLK_KP_PLUS: {
                 if (cmd) break;
                 double spd = m_player.GetSpeed();
-                if (spd < 0.25) spd = 0.25;
+                if (spd < 0.1) spd = 0.1;
+                else if (spd < 0.25) spd = 0.25;
                 else if (spd < 0.5) spd = 0.5;
                 else if (spd < 1.0) spd = 1.0;
                 else if (spd < 2.0) spd = 2.0;
                 else if (spd < 4.0) spd = 4.0;
-                else spd = 4.0;
+                else if (spd < 8.0) spd = 8.0;
+                else spd = 8.0;
                 m_player.SetSpeed(spd);
                 break;
             }
@@ -422,12 +428,14 @@ void App::ProcessEvents() {
             case SDLK_KP_MINUS: {
                 if (cmd) break;
                 double spd = m_player.GetSpeed();
-                if (spd > 4.0) spd = 4.0;
+                if (spd > 8.0) spd = 8.0;
+                else if (spd > 4.0) spd = 4.0;
                 else if (spd > 2.0) spd = 2.0;
                 else if (spd > 1.0) spd = 1.0;
                 else if (spd > 0.5) spd = 0.5;
                 else if (spd > 0.25) spd = 0.25;
-                else spd = 0.25;
+                else if (spd > 0.1) spd = 0.1;
+                else spd = 0.1;
                 m_player.SetSpeed(spd);
                 break;
             }
@@ -806,10 +814,11 @@ void App::Render() {
         float panelWidth = ImGui::GetContentRegionAvail().x;
 
         // Left: speed controls
-        static const double speeds[] = { 0.25, 0.5, 1.0, 2.0, 4.0 };
-        static const char* speedLabels[] = { "0.25x", "0.5x", "1x", "2x", "4x" };
+        static const double speeds[] = { 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 };
+        static const char* speedLabels[] = { ".1x", ".25x", ".5x", "1x", "2x", "4x", "8x" };
+        constexpr int kSpeedCount = sizeof(speeds) / sizeof(speeds[0]);
         double curSpeed = m_player.GetSpeed();
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < kSpeedCount; i++) {
             if (i > 0) ImGui::SameLine();
             bool selected = (std::abs(curSpeed - speeds[i]) < 0.01);
             if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.8f, 1.0f));
@@ -820,7 +829,16 @@ void App::Render() {
         }
 
         // Center: transport buttons
-        float transportWidth = 11 * (ImGui::CalcTextSize("<<30").x + ImGui::GetStyle().FramePadding.x * 2 + ImGui::GetStyle().ItemSpacing.x);
+        const float fp2 = ImGui::GetStyle().FramePadding.x * 2;
+        const float sp = ImGui::GetStyle().ItemSpacing.x;
+        auto btnW = [&](const char* s) { return ImGui::CalcTextSize(s).x + fp2; };
+        const char* playLabel = m_player.IsPlaying() ? "Pause" : "Play";
+        const float playBtnW = std::max(btnW("Play"), btnW("Pause"));
+        float transportWidth =
+            btnW("|<") + btnW("<<30") + btnW("<<5") + btnW("<<1") +
+            btnW("<") + playBtnW + btnW(">") +
+            btnW("1>>") + btnW("5>>") + btnW("30>>") + btnW(">|") +
+            10 * sp;
         float transportStart = (panelWidth - transportWidth) * 0.5f;
         ImGui::SameLine(transportStart > 0 ? transportStart : 0);
 
@@ -832,13 +850,13 @@ void App::Render() {
         ImGui::SameLine();
         if (ImGui::Button("<<1")) { m_player.SeekRelative(-1.0); }
         ImGui::SameLine();
-        if (ImGui::Button(" < ")) { m_player.StepFrame(-1); }
+        if (ImGui::Button("<")) { m_player.StepFrame(-1); }
         ImGui::SameLine();
-        if (ImGui::Button(m_player.IsPlaying() ? " Pause " : " Play  ")) {
+        if (ImGui::Button(playLabel, ImVec2(playBtnW, 0))) {
             m_player.TogglePlayPause();
         }
         ImGui::SameLine();
-        if (ImGui::Button(" > ")) { m_player.StepFrame(+1); }
+        if (ImGui::Button(">")) { m_player.StepFrame(+1); }
         ImGui::SameLine();
         if (ImGui::Button("1>>")) { m_player.SeekRelative(1.0); }
         ImGui::SameLine();
@@ -852,16 +870,15 @@ void App::Render() {
         float markGroupGap = 12.0f * dpi;  // extra gap between segment buttons and the frame button
         {
             float afterTransport = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x;
-            bool muted_ = m_player.IsMuted();
-            float muteW_ = ImGui::CalcTextSize(muted_ ? "Unmute" : "Mute").x + ImGui::GetStyle().FramePadding.x * 2;
+            float muteW_ = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
             float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f;
-            float bracketW = ImGui::CalcTextSize(" [ ").x + ImGui::GetStyle().FramePadding.x * 2;
-            float frameBtnW = ImGui::CalcTextSize(" [] ").x + ImGui::GetStyle().FramePadding.x * 2;
+            float bracketW = ImGui::CalcTextSize("[").x + ImGui::GetStyle().FramePadding.x * 2;
+            float frameBtnW = ImGui::CalcTextSize("[]").x + ImGui::GetStyle().FramePadding.x * 2;
             float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x + markGroupGap + frameBtnW;
             float segStart = afterTransport + (audioStart - afterTransport - segBtnsW) * 0.5f;
             ImGui::SameLine(segStart);
         }
-        if (ImGui::Button(" [ ")) {
+        if (ImGui::Button("[")) {
             int before = m_segments.GetCount();
             m_segments.SetMarkIn(m_player.GetPlaybackTime());
             if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
@@ -872,7 +889,7 @@ void App::Render() {
         ImGui::SameLine();
         bool canMarkOut = m_segments.HasPendingMarkIn() || m_segments.GetCount() > 0;
         if (!canMarkOut) ImGui::BeginDisabled();
-        if (ImGui::Button(" ] ")) {
+        if (ImGui::Button("]")) {
             double now_t = m_player.GetPlaybackTime();
             if (m_segments.HasPendingMarkIn()) {
                 int before = m_segments.GetCount();
@@ -888,7 +905,7 @@ void App::Render() {
         }
         if (!canMarkOut) ImGui::EndDisabled();
         ImGui::SameLine(0.0f, markGroupGap);
-        if (ImGui::Button(" [] ")) {
+        if (ImGui::Button("[]")) {
             if (m_player.HasMedia()) {
                 int before = m_segments.GetTotalCount();
                 m_segments.AddFrame(m_player.GetPlaybackTime());
@@ -903,13 +920,13 @@ void App::Render() {
         {
             bool muted = m_player.IsMuted();
             bool noAudio = hasMedia && !m_player.HasAudio();
-            float muteW = ImGui::CalcTextSize(muted ? "Unmute" : "Mute").x + ImGui::GetStyle().FramePadding.x * 2;
+            float muteW = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
             float sliderW = 80.0f;
             float spacing = ImGui::GetStyle().ItemSpacing.x;
             float volumeAreaWidth = muteW + spacing + sliderW;
             ImGui::SameLine(panelWidth - volumeAreaWidth);
             if (noAudio) ImGui::BeginDisabled();
-            if (ImGui::Button(muted ? "Unmute" : "Mute")) {
+            if (ImGui::Button(muted ? "Unmute" : "Mute", ImVec2(muteW, 0))) {
                 m_player.SetMuted(!muted);
             }
             ImGui::SameLine();

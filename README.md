@@ -9,7 +9,7 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 - **Trimming** -- mark multiple in/out segments, export them as separate files
 - **Frame grabbing** -- mark individual frames, export them as PNG stills
 - **Export formats** -- original format (stream copy, no re-encoding), GIF, or PNG
-- **Variable speed** -- 0.25x to 4x playback
+- **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider
 
 ## Prerequisites
