@@ -2,6 +2,8 @@
 
 A lightweight video player for fast frame-accurate scrubbing, trimming, and exporting.
 
+https://github.com/gabor-szaloki/ScrubCut/raw/main/docs/demo.mp4
+
 ## Features
 
 - **Fast scrubbing** -- drag the timeline bar or use keyboard shortcuts to seek instantly
