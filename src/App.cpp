@@ -1171,9 +1171,21 @@ void App::Render() {
             }
         }
 
-        // Click-to-seek on timeline bar (only if no handle is active)
+        // Click-to-seek on timeline bar (only if no handle is active). With
+        // Ctrl held at mouse-down, the interaction creates a mark instead:
+        // a click adds a Frame, a drag adds a Segment.
         ImGui::SetCursorScreenPos(barPos);
         ImGui::InvisibleButton("##timeline_bar", ImVec2(barWidth, barHeight));
+
+        if (ImGui::IsItemActivated() && !handleActive) {
+            float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
+            double t = std::max(0.0, std::min(static_cast<double>(mouseX / barWidth) * duration, duration));
+            m_barCtrlMode = ImGui::GetIO().KeyCtrl;
+            m_barCtrlStartX = mouseX;
+            m_barCtrlStartTime = t;
+            m_barCtrlSegIdx = -1;
+        }
+
         if (ImGui::IsItemActive() && !handleActive) {
             float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
             double initial = static_cast<double>(mouseX / barWidth) * duration;
@@ -1182,19 +1194,50 @@ void App::Render() {
             clickTime = std::max(0.0, std::min(clickTime, duration));
             m_seekTarget = clickTime;
 
+            // Create-mode: once the mouse drags past a small threshold,
+            // promote the interaction from a pending Frame into a live
+            // Segment that follows the scrub target.
+            if (m_barCtrlMode) {
+                const float dragThreshold = 5.0f;
+                if (std::abs(mouseX - m_barCtrlStartX) >= dragThreshold) {
+                    double a = std::min(m_barCtrlStartTime, clickTime);
+                    double b = std::max(m_barCtrlStartTime, clickTime);
+                    if (m_barCtrlSegIdx < 0) {
+                        int before = m_segments.GetTotalCount();
+                        m_barCtrlSegIdx = m_segments.AddSegment(a, b);
+                        if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                            m_showSegments = true;
+                    } else {
+                        m_segments.UpdateSegment(m_barCtrlSegIdx, a, b);
+                    }
+                }
+            }
+
             if (!m_isTimelineSeeking) {
                 m_wasPlayingBeforeTimelineSeek = m_player.IsPlaying();
                 if (m_wasPlayingBeforeTimelineSeek) m_player.Pause();
                 m_isTimelineSeeking = true;
                 m_player.SetScrubbing(true);
             }
-
             uint64_t now = SDL_GetTicksNS();
             if (now - m_lastSeekTime > 33000000ULL) {
                 m_player.SeekTo(m_seekTarget);
                 m_lastSeekTime = now;
             }
         }
+
+        if (ImGui::IsItemDeactivated()) {
+            if (m_barCtrlMode && m_barCtrlSegIdx < 0) {
+                // Ctrl+click without drag → add a single-frame mark.
+                int before = m_segments.GetTotalCount();
+                m_segments.AddFrame(m_barCtrlStartTime);
+                if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                    m_showSegments = true;
+            }
+            m_barCtrlMode = false;
+            m_barCtrlSegIdx = -1;
+        }
+
         if (m_isTimelineSeeking && !ImGui::IsItemActive()) {
             m_player.SetScrubbing(false);
             if (m_wasPlayingBeforeTimelineSeek)
@@ -1510,6 +1553,7 @@ void App::Render() {
             row("Toggle marks",        (std::string(kKeys.cmdName) + " + M").c_str());
             row("Quit",                 kKeys.quitShortcut);
             row("Precision scrub",      "Alt + drag timeline");
+            row("Add mark on timeline", "Ctrl + click (frame) / drag (segment)");
             row("Toggle help",          "?");
 
             ImGui::EndTable();

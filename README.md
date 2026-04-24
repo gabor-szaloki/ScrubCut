@@ -116,6 +116,7 @@ Where two modifiers are shown separated by `/`, the first is Windows and the sec
 | Quit                        | Alt+F4 / Cmd + Q                            |
 | Toggle help                 | ?                                           |
 | Precision scrub             | Alt + drag timeline (0.1× sensitivity)      |
+| Add mark on timeline        | Ctrl + click (frame) / drag (segment)       |
 
 ### Command-line flags
 

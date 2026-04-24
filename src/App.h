@@ -110,4 +110,11 @@ private:
     bool   m_scrubAltWasHeld = false;
     double ComputeScrubTarget(float mouseX, float barWidth, double duration,
                               double initialTime, bool justActivated);
+
+    // Ctrl+click/drag on the timeline bar creates marks: click = Frame,
+    // drag = Segment. State captured at drag start, finalised on release.
+    bool   m_barCtrlMode = false;
+    float  m_barCtrlStartX = 0.0f;
+    double m_barCtrlStartTime = 0.0;
+    int    m_barCtrlSegIdx = -1;
 };
