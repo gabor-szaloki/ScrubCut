@@ -81,6 +81,18 @@ static const ImVec4 kSegmentColors[] = {
 };
 static const int kSegmentColorCount = sizeof(kSegmentColors) / sizeof(kSegmentColors[0]);
 
+// Tooltip helper: description on line 1, grayed-out shortcut on line 2 (optional).
+// Globally gated by App::m_showTooltips, mirrored here so the helper stays free-standing.
+static bool g_tooltipsEnabled = true;
+static void TooltipFor(const char* desc, const char* shortcut = nullptr) {
+    if (!g_tooltipsEnabled) return;
+    if (!ImGui::BeginItemTooltip()) return;
+    ImGui::TextUnformatted(desc);
+    if (shortcut && shortcut[0])
+        ImGui::TextDisabled("%s", shortcut);
+    ImGui::EndTooltip();
+}
+
 static ImU32 GetSegmentColor(int colorIndex, float alpha = 1.0f) {
     const ImVec4& c = kSegmentColors[colorIndex % kSegmentColorCount];
     return IM_COL32(static_cast<int>(c.x * 255), static_cast<int>(c.y * 255),
@@ -151,6 +163,7 @@ bool App::Init() {
     m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
 
     // Preferences always load
+    m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
@@ -256,6 +269,7 @@ void App::Shutdown() {
         m_layoutSettings.SetBool("show_segments", m_showSegments);
         m_layoutSettings.Save();
 
+        m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
@@ -554,6 +568,7 @@ void App::ProcessEvents() {
 }
 
 void App::Render() {
+    g_tooltipsEnabled = m_showTooltips;
     m_hoveredSegmentThisFrame = -1;
     m_hoveredFrameThisFrame = -1;
     int w, h;
@@ -713,6 +728,8 @@ void App::Render() {
             if (ImGui::MenuItem("Help", "?", m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
             ImGui::Separator();
+            if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
+                m_showTooltips = !m_showTooltips;
 #ifdef _WIN32
             if (ImGui::MenuItem("Use DPI scaling", nullptr, m_useDpiScaling)) {
                 m_useDpiScaling = !m_useDpiScaling;
@@ -826,6 +843,9 @@ void App::Render() {
                 m_player.SetSpeed(speeds[i]);
             }
             if (selected) ImGui::PopStyleColor();
+            char desc[32];
+            snprintf(desc, sizeof(desc), "Playback speed %gx", speeds[i]);
+            TooltipFor(desc, "+ / - to cycle");
         }
 
         // Center: transport buttons
@@ -842,29 +862,44 @@ void App::Render() {
         float transportStart = (panelWidth - transportWidth) * 0.5f;
         ImGui::SameLine(transportStart > 0 ? transportStart : 0);
 
+        std::string prevFrameSc = std::string(kKeys.frameStepName) + " + Left  or  ,";
+        std::string nextFrameSc = std::string(kKeys.frameStepName) + " + Right  or  .";
+        std::string back1Sc     = std::string(kKeys.seekFineName)  + " + Left";
+        std::string fwd1Sc      = std::string(kKeys.seekFineName)  + " + Right";
         if (ImGui::Button("|<")) { m_player.SeekTo(0.0); }
+        TooltipFor("Jump to start", "Home");
         ImGui::SameLine();
         if (ImGui::Button("<<30")) { m_player.SeekRelative(-30.0); }
+        TooltipFor("Back 30s", "Shift + Left");
         ImGui::SameLine();
         if (ImGui::Button("<<5")) { m_player.SeekRelative(-5.0); }
+        TooltipFor("Back 5s", "Left");
         ImGui::SameLine();
         if (ImGui::Button("<<1")) { m_player.SeekRelative(-1.0); }
+        TooltipFor("Back 1s", back1Sc.c_str());
         ImGui::SameLine();
         if (ImGui::Button("<")) { m_player.StepFrame(-1); }
+        TooltipFor("Previous frame", prevFrameSc.c_str());
         ImGui::SameLine();
         if (ImGui::Button(playLabel, ImVec2(playBtnW, 0))) {
             m_player.TogglePlayPause();
         }
+        TooltipFor("Play / Pause", "Space");
         ImGui::SameLine();
         if (ImGui::Button(">")) { m_player.StepFrame(+1); }
+        TooltipFor("Next frame", nextFrameSc.c_str());
         ImGui::SameLine();
         if (ImGui::Button("1>>")) { m_player.SeekRelative(1.0); }
+        TooltipFor("Forward 1s", fwd1Sc.c_str());
         ImGui::SameLine();
         if (ImGui::Button("5>>")) { m_player.SeekRelative(5.0); }
+        TooltipFor("Forward 5s", "Right");
         ImGui::SameLine();
         if (ImGui::Button("30>>")) { m_player.SeekRelative(30.0); }
+        TooltipFor("Forward 30s", "Shift + Right");
         ImGui::SameLine();
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
+        TooltipFor("Jump to end", "End");
 
         // Mark buttons — centered between transport and audio controls
         float markGroupGap = 12.0f * dpi;  // extra gap between segment buttons and the frame button
@@ -886,6 +921,7 @@ void App::Render() {
             m_lastUIActivityNS = SDL_GetTicksNS();
             if (m_autoHideUI) m_uiHidden = false;
         }
+        TooltipFor("Mark segment start for export", "I  or  [");
         ImGui::SameLine();
         bool canMarkOut = m_segments.HasPendingMarkIn() || m_segments.GetCount() > 0;
         if (!canMarkOut) ImGui::BeginDisabled();
@@ -904,6 +940,7 @@ void App::Render() {
             if (m_autoHideUI) m_uiHidden = false;
         }
         if (!canMarkOut) ImGui::EndDisabled();
+        TooltipFor("Mark segment end for export", "O  or  ]");
         ImGui::SameLine(0.0f, markGroupGap);
         if (ImGui::Button("[]")) {
             if (m_player.HasMedia()) {
@@ -915,6 +952,7 @@ void App::Render() {
                 if (m_autoHideUI) m_uiHidden = false;
             }
         }
+        TooltipFor("Mark frame for PNG export", "P");
 
         // Right: Mute + volume slider
         {
@@ -1418,6 +1456,7 @@ void App::Render() {
                             ? ExportMode::SourceFormat : ExportMode::GIF;
                         m_segments.SetSegmentMode(row.index, newMode);
                     }
+                    TooltipFor("Toggle export format");
                 }
 
                 // Delete button: pinned to the right edge.
@@ -1431,6 +1470,7 @@ void App::Render() {
                     else             removeSegIdx   = row.index;
                 }
                 ImGui::PopStyleColor(3);
+                TooltipFor("Delete this mark");
 
                 if (!row.isFrame) {
                     // Row 2 (segments only): start/end seek buttons + set-to-current + duration
@@ -1451,17 +1491,21 @@ void App::Render() {
                     if (ImGui::SmallButton(">[##setstart"))
                         m_segments.UpdateSegment(row.index, playhead, s.endSec);
                     if (!canSetStart) ImGui::EndDisabled();
+                    TooltipFor("Set start to playhead");
                     ImGui::SameLine();
                     if (ImGui::SmallButton(startBuf)) m_player.SeekTo(s.startSec);
+                    TooltipFor("Seek to this time");
                     ImGui::SameLine();
                     ImGui::Text("->");
                     ImGui::SameLine();
                     if (ImGui::SmallButton(endBuf)) m_player.SeekTo(s.endSec);
+                    TooltipFor("Seek to this time");
                     ImGui::SameLine();
                     if (!canSetEnd) ImGui::BeginDisabled();
                     if (ImGui::SmallButton("]<##setend"))
                         m_segments.UpdateSegment(row.index, s.startSec, playhead);
                     if (!canSetEnd) ImGui::EndDisabled();
+                    TooltipFor("Set end to playhead");
                     double dur = s.endSec - s.startSec;
                     ImGui::SameLine();
                     ImGui::TextDisabled("(%.1fs)", dur);
@@ -1474,9 +1518,11 @@ void App::Render() {
                     char timeBuf[32];
                     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d.%03d##ftime", fMin, fSec, fMs);
                     if (ImGui::SmallButton(timeBuf)) m_player.SeekTo(f.timeSec);
+                    TooltipFor("Seek to this time");
                     ImGui::SameLine();
                     if (ImGui::SmallButton(">[]<##fset"))
                         m_segments.UpdateFrame(row.index, m_seekTarget);
+                    TooltipFor("Snap frame to playhead");
                 }
 
                 ImGui::EndGroup();

@@ -48,6 +48,7 @@ private:
     bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    bool m_showTooltips = true;
     bool m_useDpiScaling = false;
     bool m_autoHideCursor = true;
     bool m_autoHideUI = true;

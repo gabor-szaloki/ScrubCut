@@ -27,6 +27,8 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     style.Colors[ImGuiCol_TitleBgActive]    = fade(style.Colors[ImGuiCol_TitleBgActive],    0.85f);
     style.Colors[ImGuiCol_TitleBgCollapsed] = fade(style.Colors[ImGuiCol_TitleBgCollapsed], 0.85f);
 
+    style.HoverDelayShort = 1.0f;
+
     // Snapshot the unscaled style so SetDpiScale can re-apply it cleanly.
     m_baseStyle = style;
 
