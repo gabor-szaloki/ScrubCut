@@ -102,15 +102,27 @@ void Player::Play() {
     TRACE_EVENT("Player::Play");
     if (!m_hasMedia) return;
     WaitForSeek();
-    if (m_eof) {
+
+    // m_eof gets set whenever any read loop hits EOF — including when the
+    // user seeks/steps near (but not at) the end of the file, where the
+    // decoder pipeline drained packets through EOF to retrieve buffered
+    // frames. Don't treat that as "user at end". Only restart from the
+    // beginning if the playback clock has actually reached the duration
+    // (PollSeekComplete sets clock = duration exactly when playback
+    // hits EOF; any seeked/stepped position ends up at a frame's pts,
+    // strictly less than duration).
+    double curTime = m_clock.GetTime();
+    double duration = m_demuxer.GetDuration();
+    bool atActualEnd = duration > 0.0 && curTime >= duration - 0.001;
+    if (m_eof && atActualEnd) {
         // Restart from beginning
         EnsureThreadsStopped();
         m_videoDecoder.Flush();
         if (m_hasAudio) m_audioDecoder.Flush();
         m_demuxer.Seek(0.0);
         m_clock.SetTime(0.0);
-        m_eof = false;
     }
+    m_eof = false;
 
     double resumeTime = m_clock.GetTime();
 
@@ -393,6 +405,11 @@ void Player::StepFrame(int direction) {
             }
             av_frame_free(&tmpFrame);
             av_packet_free(&pkt);
+            // The decoder still has up to thread_count buffered frames from
+            // the speculative resync. If we leave them in place, the next
+            // step (taking the !dirty in-sync path) will pull a stale early
+            // frame out of the pipeline and jump backwards. Flush.
+            m_videoDecoder.Flush();
             m_decoderDirty = false;
         } else {
             // Decoder is in sync — just decode next frame
@@ -500,6 +517,7 @@ bool Player::SyncDecodeNextFrame() {
     AVFrame* frame = av_frame_alloc();
     bool found = false;
     int maxPackets = 200;
+    bool eofHit = false;
 
     while (!found && maxPackets-- > 0) {
         // First try to receive a frame (decoder may have buffered frames)
@@ -513,6 +531,7 @@ bool Player::SyncDecodeNextFrame() {
         ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
             m_eof = true;
+            eofHit = true;
             break;
         }
         if (ret < 0) break;
@@ -521,6 +540,17 @@ bool Player::SyncDecodeNextFrame() {
             m_videoDecoder.SendPacket(pkt);
         }
         av_packet_unref(pkt);
+    }
+
+    // Hit EOF without producing a frame — the next frame may still be
+    // sitting in the decoder pipeline. Drain it out so frame-step-forward
+    // can reach the last few frames of the file instead of stalling
+    // ~thread_count frames before the end.
+    if (eofHit && !found) {
+        m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* /*f*/) {
+            found = true;
+            return false;  // grab the first one and keep its data in `frame`
+        });
     }
 
     if (found) {
@@ -576,13 +606,15 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     AVFrame* bestFrame = nullptr;
-    int maxPackets = 500;
+    int maxPackets = 5000;
     int videoFrames = 0;
+    bool eofHit = false;
 
     while (maxPackets-- > 0) {
         int ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
             m_eof = true;
+            eofHit = true;
             break;
         }
         if (ret < 0) break;
@@ -615,13 +647,41 @@ bool Player::SyncSeekAndDecode(double targetSec) {
         }
     }
 
+    // Drain frames the decoder pipeline still holds after EOF — without
+    // this, scrubbing to a target inside the last GOP always returned the
+    // pre-tail frame instead of the actual one.
+    if (eofHit) {
+        m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
+            videoFrames++;
+            if (!bestFrame) bestFrame = av_frame_alloc();
+            else av_frame_unref(bestFrame);
+            av_frame_move_ref(bestFrame, f);
+            // Stop at the first frame at or past the target — otherwise
+            // we'd keep overwriting bestFrame with later flushed frames
+            // and end up at the very last frame regardless of target.
+            return bestFrame->pts < targetPts;
+        });
+    }
+
 done:
     uint64_t tDecode = m_profileSeek ? SDL_GetTicksNS() : 0;
+
     av_packet_free(&pkt);
     av_frame_free(&frame);
 
     if (bestFrame) {
         double frameSec = static_cast<double>(bestFrame->pts) * av_q2d(tb);
+        // If the user seeked to/past the file's end, set the clock to the
+        // declared duration so Play() correctly recognises this as "at end"
+        // and restarts from 0 — matching the playback-reaches-EOF behavior.
+        // Without this, clock lands on the last frame's pts which is one
+        // frame short of duration, so Play resumes from there and the first
+        // PollSeekComplete tick instantly pauses (looking like nothing
+        // happened).
+        double duration = m_demuxer.GetDuration();
+        if (duration > 0.0 && targetSec >= duration - 0.001) {
+            frameSec = duration;
+        }
         m_clock.SetTime(frameSec);
         m_lastDisplayedPts = bestFrame->pts;
 
@@ -773,10 +833,25 @@ void Player::PopulateCacheAroundCurrent() {
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     int maxPackets = 500;
+    bool eofHit = false;
+
+    auto cacheFrame = [&](AVFrame* f) -> bool {
+        if (f->pts > currentPts) return false;  // past current — stop
+        if (!m_frameCache.FindExact(f->pts)) {
+            const uint8_t* rgba = m_frameConverter.Convert(f);
+            if (rgba) {
+                m_frameCache.Put(f->pts, rgba,
+                                 m_frameConverter.GetWidth(),
+                                 m_frameConverter.GetHeight());
+            }
+        }
+        return true;
+    };
 
     while (maxPackets-- > 0) {
         int ret = m_demuxer.ReadPacket(pkt);
-        if (ret == AVERROR_EOF || ret < 0) break;
+        if (ret == AVERROR_EOF) { eofHit = true; break; }
+        if (ret < 0) break;
 
         if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
             av_packet_unref(pkt);
@@ -791,23 +866,18 @@ void Player::PopulateCacheAroundCurrent() {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
-            // Past current position — done
-            if (frame->pts > currentPts) {
-                av_frame_unref(frame);
-                goto cacheDone;
-            }
-
-            // Only convert if not already cached
-            if (!m_frameCache.FindExact(frame->pts)) {
-                const uint8_t* rgba = m_frameConverter.Convert(frame);
-                if (rgba) {
-                    m_frameCache.Put(frame->pts, rgba,
-                                     m_frameConverter.GetWidth(),
-                                     m_frameConverter.GetHeight());
-                }
-            }
+            bool keepGoing = cacheFrame(frame);
             av_frame_unref(frame);
+            if (!keepGoing) goto cacheDone;
         }
+    }
+
+    // Flush the trailing frames the decoder pipeline has been buffering
+    // into the cache too — otherwise frame-step-backward from the last
+    // frame jumps over them (cache says the previous frame is several
+    // frames before what's displayed).
+    if (eofHit) {
+        m_videoDecoder.DrainAtEOF(frame, cacheFrame);
     }
 
 cacheDone:
@@ -1019,6 +1089,22 @@ void Player::VideoDecodeThread() {
                 goto done;
             }
         }
+    }
+
+    // The demuxer reached EOF; flush the trailing frames the decoder
+    // pipeline has been holding, otherwise playback stops ~thread_count
+    // frames short of the actual end.
+    if (m_eof.load(std::memory_order_relaxed) && !m_stopThreads.load(std::memory_order_relaxed)) {
+        bool pushFailed = false;
+        m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
+            if (m_stopThreads.load(std::memory_order_relaxed)) return false;
+            if (!m_videoFrameQueue.Push(f)) {
+                pushFailed = true;
+                return false;
+            }
+            return true;
+        });
+        if (pushFailed) goto done;
     }
 
 done:

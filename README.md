@@ -10,7 +10,9 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 - **Frame stepping** -- step forward/backward one frame at a time
 - **Trimming** -- mark multiple in/out segments, export them as separate files
 - **Frame grabbing** -- mark individual frames, export them as PNG stills
-- **Export formats** -- original format (stream copy, no re-encoding), GIF, or PNG
+- **Export formats**
+  - Segments: original format (stream copy, no re-encoding) or GIF. MKV/WebM sources are remuxed into MP4 so the cuts are frame-accurate at both ends — the bitstream is bit-identical, just a different container.
+  - Frames: PNG stills.
 - **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider
 
@@ -129,6 +131,7 @@ Where two modifiers are shown separated by `/`, the first is Windows and the sec
 | `-log`           | Allocate a console for stdout/stderr (Windows only)             |
 | `-resetlayout`   | Reset the docked panel layout to defaults                       |
 | `-profileseek`   | Enable seek-performance profiling                               |
+| `-export-segment <startSec> <endSec> <input> [outputBase]` | Headless stream-copy export of a single segment; no UI. Defaults `outputBase` to the input's directory and stem. Output is `<outputBase>_001.<input_ext>`. |
 
 ## Tech stack
 

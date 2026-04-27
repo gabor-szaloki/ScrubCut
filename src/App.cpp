@@ -9,6 +9,8 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -1638,7 +1640,16 @@ void App::Render() {
         const auto& progress = m_exporter.GetProgress();
         const auto& segs = m_segments.GetSegments();
         const auto& frames = m_segments.GetFrames();
+        // Source-format segment exports use the source's extension, except
+        // MKV/WebM are remuxed to MP4 (so the cuts can be frame-accurate at
+        // both ends via MP4 edit lists) — must match Exporter::ExportThread.
         std::string inputExt = std::filesystem::path(m_currentFilePath).extension().string();
+        {
+            std::string lower = inputExt;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c){ return std::tolower(c); });
+            if (lower == ".mkv" || lower == ".webm") inputExt = ".mp4";
+        }
 
         // Interleaved-by-time row list (same pattern as the Segments panel)
         struct Row { bool isFrame; int index; double t; uint64_t seq; };

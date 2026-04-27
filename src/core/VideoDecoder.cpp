@@ -64,6 +64,20 @@ void VideoDecoder::Flush() {
         avcodec_flush_buffers(m_codecCtx);
 }
 
+void VideoDecoder::DrainAtEOF(AVFrame* tmp, const std::function<bool(AVFrame*)>& onFrame) {
+    if (!m_codecCtx) return;
+    avcodec_send_packet(m_codecCtx, nullptr);
+    while (true) {
+        // avcodec_receive_frame unrefs `tmp` before refilling, so the
+        // helper doesn't need to. If onFrame returns false, the caller
+        // may want to take ownership of `tmp` — leave it intact.
+        int ret = avcodec_receive_frame(m_codecCtx, tmp);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+        if (ret < 0) break;
+        if (!onFrame(tmp)) break;
+    }
+}
+
 int VideoDecoder::GetWidth() const {
     return m_codecCtx ? m_codecCtx->width : 0;
 }

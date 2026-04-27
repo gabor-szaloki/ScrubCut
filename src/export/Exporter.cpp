@@ -9,6 +9,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb/stb_image_write.h"
 
+#include <algorithm>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -51,6 +52,17 @@ void Exporter::ExportThread() {
     int itemsDone = 0;
     std::string srcExt = std::filesystem::path(m_inputPath).extension().string();
 
+    // Matroska (.mkv/.webm) doesn't support edit lists, so stream-copy
+    // exports show the keyframe pre-roll at the start (mark-in is not
+    // frame-accurate). Re-mux the same packets into an MP4 container, which
+    // supports edit lists. The bitstream is bit-identical — no quality loss.
+    // Only safe for codecs MP4 also accepts; for arbitrary MKV-only codecs
+    // (Vorbis audio, etc.) the muxer will fail and we'll fall back below.
+    std::string srcExtLower = srcExt;
+    std::transform(srcExtLower.begin(), srcExtLower.end(), srcExtLower.begin(), ::tolower);
+    bool remuxToMp4 = (srcExtLower == ".mkv" || srcExtLower == ".webm");
+    std::string sourceFormatExt = remuxToMp4 ? ".mp4" : srcExt;
+
     for (int i = 0; i < static_cast<int>(m_settings.segments.size()); i++) {
         if (m_cancel) break;
 
@@ -59,10 +71,21 @@ void Exporter::ExportThread() {
 
         bool ok = false;
         if (seg.mode == ExportMode::SourceFormat) {
-            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, srcExt);
+            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, sourceFormatExt);
             LOG_INFO("Exporting segment %d/%d (stream copy) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentStreamCopy(m_inputPath, seg, outPath);
+            // Fallback: if MP4 mux failed (incompatible codec), retry with
+            // original .mkv/.webm extension.
+            if (!ok && !m_cancel && remuxToMp4) {
+                LOG_WARN("MP4 remux failed; falling back to %s", srcExt.c_str());
+                m_progress.Reset();
+                m_progress.totalItems = totalItems;
+                m_progress.currentItem = itemsDone + 1;
+                m_progress.running = true;
+                outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, srcExt);
+                ok = ExportSegmentStreamCopy(m_inputPath, seg, outPath);
+            }
         } else {
             std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
             LOG_INFO("Exporting segment %d/%d (GIF) -> %s",
@@ -188,21 +211,28 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         return false;
     }
 
-    // Seek to start of range
+    // Seek to start of range. av_seek_frame with BACKWARD lands on the
+    // keyframe at or before range.startSec — stream copy can only start at a
+    // keyframe.
     demuxer.Seek(range.startSec);
 
-    // Compute end PTS for each stream
-    auto toPts = [](double sec, AVRational tb) -> int64_t {
-        return static_cast<int64_t>(sec / av_q2d(tb));
+    // Compute start/end PTS for each stream from the mark, NOT from the first
+    // keyframe we read. Packets between the pre-roll keyframe and the mark-in
+    // flow through with negative PTS; MP4/MOV muxers pick that up and emit an
+    // edit list so players skip the pre-roll on playback and start at mark-in
+    // frame-accurately. MKV has no equivalent — the pre-roll will play as
+    // leading content in .mkv exports.
+    // Convert user timeline seconds to raw stream PTS. The Player's clock
+    // tracks time as `frame->pts * tb` directly (no stream start_time
+    // subtraction), so user seconds correspond 1:1 to raw pts seconds.
+    auto toPts = [](double sec, AVStream* s) -> int64_t {
+        return static_cast<int64_t>(sec / av_q2d(s->time_base));
     };
 
-    int64_t videoEndPts = (videoInIdx >= 0) ? toPts(range.endSec, inFmt->streams[videoInIdx]->time_base) : 0;
-    int64_t audioEndPts = (audioInIdx >= 0) ? toPts(range.endSec, inFmt->streams[audioInIdx]->time_base) : 0;
-
-    // We'll determine the actual start offset from the first keyframe we read
-    // (the seek lands on a keyframe at or before startSec)
-    int64_t videoStartPts = AV_NOPTS_VALUE;
-    int64_t audioStartPts = AV_NOPTS_VALUE;
+    int64_t videoStartPts = (videoInIdx >= 0) ? toPts(range.startSec, inFmt->streams[videoInIdx]) : 0;
+    int64_t audioStartPts = (audioInIdx >= 0) ? toPts(range.startSec, inFmt->streams[audioInIdx]) : 0;
+    int64_t videoEndPts   = (videoInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[videoInIdx]) : 0;
+    int64_t audioEndPts   = (audioInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[audioInIdx]) : 0;
 
     double segDuration = range.endSec - range.startSec;
 
@@ -224,43 +254,50 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
 
         if (inIdx == videoInIdx) {
             outIdx = videoOutIdx;
-            // Capture actual start PTS from first video packet (keyframe after seek)
-            if (videoStartPts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
-                videoStartPts = pkt->pts;
             endPts = videoEndPts;
         } else if (inIdx == audioInIdx) {
             outIdx = audioOutIdx;
-            if (audioStartPts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
-                audioStartPts = pkt->pts;
             endPts = audioEndPts;
         } else {
             av_packet_unref(pkt);
             continue;
         }
 
-        // Check if past end
+        // Terminate via DTS (monotonic) with a safety margin for B-frame
+        // reorder depth — stopping on first pts > endPts would drop trailing
+        // B-frames whose pts falls at/before mark-out but which arrive later
+        // in decode order.
+        if (inIdx == videoInIdx && pkt->dts != AV_NOPTS_VALUE) {
+            AVRational vtb = inFmt->streams[videoInIdx]->time_base;
+            int64_t marginTs = static_cast<int64_t>(1.0 / av_q2d(vtb));
+            if (pkt->dts > endPts + marginTs) {
+                done = true;
+                av_packet_unref(pkt);
+                continue;
+            }
+        }
+
+        // Drop packets whose display time is past mark-out, but keep reading
+        // — later packets in decode order may still be within range.
         if (pkt->pts != AV_NOPTS_VALUE && pkt->pts > endPts) {
-            if (inIdx == videoInIdx) done = true;
             av_packet_unref(pkt);
             continue;
         }
 
-        // Get the start offset for this stream
+        // Rebase timestamps against mark-in. Packets before mark-in (keyframe
+        // pre-roll) will get negative PTS/DTS — intentional. The muxer
+        // flows these into an edit list for MP4/MOV so playback skips the
+        // pre-roll. (MKV has no edit list equivalent; pre-roll will play.)
         int64_t startPts = (inIdx == videoInIdx) ? videoStartPts : audioStartPts;
-        if (startPts == AV_NOPTS_VALUE) startPts = 0;
-
-        // Remap timestamps relative to the actual first packet
         AVStream* inStream = inFmt->streams[inIdx];
         AVStream* outStream = outFmt->streams[outIdx];
 
         pkt->stream_index = outIdx;
         if (pkt->pts != AV_NOPTS_VALUE) {
             pkt->pts = av_rescale_q(pkt->pts - startPts, inStream->time_base, outStream->time_base);
-            if (pkt->pts < 0) pkt->pts = 0;
         }
         if (pkt->dts != AV_NOPTS_VALUE) {
             pkt->dts = av_rescale_q(pkt->dts - startPts, inStream->time_base, outStream->time_base);
-            if (pkt->dts < 0) pkt->dts = 0;
         }
         pkt->duration = av_rescale_q(pkt->duration, inStream->time_base, outStream->time_base);
         pkt->pos = -1;
