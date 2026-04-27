@@ -28,6 +28,15 @@ bool Player::Open(const std::string& path) {
     if (!m_videoDecoder.Open(m_demuxer.GetVideoCodecParams()))
         return false;
 
+    // Independent demuxer + decoder for backward-step cache population.
+    // Failure here is non-fatal — caching just falls back to no-op and
+    // backward stepping does a full re-seek per step like before.
+    if (!m_cacheDemuxer.Open(path) ||
+        !m_cacheDecoder.Open(m_cacheDemuxer.GetVideoCodecParams())) {
+        m_cacheDecoder.Close();
+        m_cacheDemuxer.Close();
+    }
+
     m_hasAudio = false;
     if (m_demuxer.GetAudioStreamIndex() >= 0) {
         if (m_audioDecoder.Open(m_demuxer.GetAudioCodecParams())) {
@@ -85,6 +94,9 @@ void Player::Close() {
     m_audioDecoder.Close();
     m_videoDecoder.Close();
     m_demuxer.Close();
+    m_cacheDecoder.Close();
+    m_cacheDemuxer.Close();
+    if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
 
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
@@ -120,6 +132,7 @@ void Player::Play() {
         m_videoDecoder.Flush();
         if (m_hasAudio) m_audioDecoder.Flush();
         m_demuxer.Seek(0.0);
+        if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
         m_clock.SetTime(0.0);
     }
     m_eof = false;
@@ -130,14 +143,41 @@ void Player::Play() {
 
     // Start threads if not running
     if (!m_threadsRunning) {
-        m_videoPacketQueue.Flush();
-        m_audioPacketQueue.Flush();
-        m_videoFrameQueue.Flush();
-        m_videoDecoder.Flush();
-        if (m_hasAudio) m_audioDecoder.Flush();
+        // Warm continuation: the decoder + queues are already in a state
+        // that produces the next playable frames, so we skip the flush +
+        // re-seek that a cold start would do. Two situations qualify:
+        //
+        //  (1) Just-seeked (SyncSeekAndDecode left the video decoder warm
+        //      at lastDisplayedPts; queues are empty; demuxer points at
+        //      the next packet).
+        //  (2) Just-paused-during-playback (queues hold the next frames
+        //      already decoded; decoder still warm; demuxer read-ahead).
+        //
+        // Either way Play just restarts the threads and TryGetVideoFrame
+        // picks up the first frame at-or-past resumeTime.
+        bool warm = !m_decoderDirty &&
+                    m_lastDisplayedPts != AV_NOPTS_VALUE;
 
-        m_demuxer.Seek(resumeTime);
+        if (!warm) {
+            m_videoPacketQueue.Flush();
+            m_audioPacketQueue.Flush();
+            m_videoFrameQueue.Flush();
+            m_videoDecoder.Flush();
+            if (m_hasAudio) m_audioDecoder.Flush();
+            m_demuxer.Seek(resumeTime);
+            if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
+            // Decoder, queues, and demuxer are now consistent at resumeTime.
+            // Without clearing this, a backward-step cache hit's dirty flag
+            // would persist forever, forcing every Pause→Play to take the
+            // cold path even after this resync already aligned everything.
+            m_decoderDirty = false;
+        }
         StartThreads();
+
+        if (m_profileSeek) {
+            LOG_INFO("Play: %s start (resume=%.3fs)",
+                     warm ? "warm" : "cold", resumeTime);
+        }
     }
 
     if (m_hasAudio) {
@@ -152,6 +192,10 @@ void Player::Play() {
     m_resumeTime = resumeTime;
     m_playing = true;
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
+    if (m_profileSeek) {
+        m_playStartNS = SDL_GetTicksNS();
+        m_playDroppedFrames = 0;
+    }
     // Clock stays paused; TryGetVideoFrame will unpause it when ready.
 }
 
@@ -165,10 +209,13 @@ void Player::Pause() {
     if (m_hasAudio) m_audioOutput.Pause();
 
     if (wasPlaying) {
-        // Stop threads — we'll do synchronous decode while paused
+        // Stop threads — we'll do synchronous decode while paused. The
+        // packet/frame queues and decoder state are *not* flushed: the
+        // queues hold the next several frames already decoded, ready to
+        // display the moment Play() resumes. Play()'s warm path picks
+        // these up and avoids the GOP catchup that a cold restart would
+        // need.
         StopThreads();
-        // Drain any frames left in the queue into decoder state
-        // (so SyncDecodeNextFrame picks up where threads left off)
     }
 }
 
@@ -364,6 +411,7 @@ void Player::StepFrame(int direction) {
             m_videoFrameQueue.Flush();
             m_videoPacketQueue.Flush();
             m_demuxer.Seek(currentSec);
+            if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
             // Decode forward to current position, then one more
             AVRational tb = m_demuxer.GetVideoTimeBase();
             int64_t currentPts = m_lastDisplayedPts;
@@ -412,7 +460,10 @@ void Player::StepFrame(int direction) {
             m_videoDecoder.Flush();
             m_decoderDirty = false;
         } else {
-            // Decoder is in sync — just decode next frame
+            // Decoder is in sync — just decode next frame.
+            // SyncDecodeNextFrame drains m_videoPacketQueue before reading
+            // from the demuxer, so the decoder's reference chain stays
+            // intact across packets read ahead by the now-stopped DemuxThread.
             AVFrame* frame = av_frame_alloc();
             if (m_videoFrameQueue.TryPop(frame)) {
                 AVRational tb = m_demuxer.GetVideoTimeBase();
@@ -527,7 +578,40 @@ bool Player::SyncDecodeNextFrame() {
             break;
         }
 
-        // Need more input — read packets
+        // Need more input. Prefer packets already sitting in
+        // m_videoPacketQueue — DemuxThread read them ahead before pause
+        // but VideoDecodeThread didn't get to deliver them. Skipping
+        // them (jumping straight to demuxer.ReadPacket, which is past
+        // them) would punch holes in the decoder's reference chain and
+        // corrupt subsequent frames. Drain the queue first.
+        if (m_videoPacketQueue.Size() > 0) {
+            // Threads are stopped before SyncDecodeNextFrame is called,
+            // so no producer is racing — Pop won't block.
+            if (!m_videoPacketQueue.Pop(pkt)) continue;
+            m_videoDecoder.SendPacket(pkt);
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        // After the queue, m_pendingDemuxPacket may hold the packet that
+        // DemuxThread had read but couldn't push when the queue aborted
+        // mid-pause. The demuxer is positioned PAST it, so reading from
+        // the demuxer next would skip it — the same ref-chain hole as
+        // skipping queued packets. Process it now.
+        if (m_pendingDemuxPacket) {
+            AVPacket* p = m_pendingDemuxPacket;
+            m_pendingDemuxPacket = nullptr;
+            if (p->stream_index == m_demuxer.GetVideoStreamIndex()) {
+                m_videoDecoder.SendPacket(p);
+            }
+            // Audio pending: discard. Audio gets flushed + repositioned
+            // on Play() anyway, so a one-packet gap at the pause boundary
+            // is at worst an inaudible click.
+            av_packet_free(&p);
+            continue;
+        }
+
+        // Queue empty — read fresh packets from the demuxer.
         ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
             m_eof = true;
@@ -595,6 +679,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
     // Seek demuxer to keyframe at or before target
     m_demuxer.Seek(targetSec);
+    if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
     m_eof = false;
     m_decoderDirty = false;
 
@@ -740,6 +825,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     while (attempt < 4) {
         m_videoDecoder.Flush();
         m_demuxer.Seek(trySec);
+        if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
         m_eof = false;
 
         int maxPackets = 500;
@@ -821,14 +907,17 @@ void Player::PopulateCacheAroundCurrent() {
     TRACE_EVENT("PopulateCacheAroundCurrent");
     if (!m_hasMedia) return;
     if (m_playing) return; // only when paused
+    // Cache decoder failed to open — skip cache population.
+    if (m_cacheDemuxer.GetVideoStreamIndex() < 0) return;
 
-    AVRational tb = m_demuxer.GetVideoTimeBase();
     double currentSec = m_clock.GetTime();
     int64_t currentPts = m_lastDisplayedPts;
 
-    // Seek to keyframe before current position
-    m_videoDecoder.Flush();
-    m_demuxer.Seek(currentSec);
+    // Use the dedicated cache demuxer + decoder so we don't touch the
+    // main pipeline. The main decoder stays warm at lastDisplayedPts and
+    // Play() can resume without a re-seek + GOP catchup.
+    m_cacheDecoder.Flush();
+    m_cacheDemuxer.Seek(currentSec);
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
@@ -838,31 +927,31 @@ void Player::PopulateCacheAroundCurrent() {
     auto cacheFrame = [&](AVFrame* f) -> bool {
         if (f->pts > currentPts) return false;  // past current — stop
         if (!m_frameCache.FindExact(f->pts)) {
-            const uint8_t* rgba = m_frameConverter.Convert(f);
+            const uint8_t* rgba = m_cacheConverter.Convert(f);
             if (rgba) {
                 m_frameCache.Put(f->pts, rgba,
-                                 m_frameConverter.GetWidth(),
-                                 m_frameConverter.GetHeight());
+                                 m_cacheConverter.GetWidth(),
+                                 m_cacheConverter.GetHeight());
             }
         }
         return true;
     };
 
     while (maxPackets-- > 0) {
-        int ret = m_demuxer.ReadPacket(pkt);
+        int ret = m_cacheDemuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) { eofHit = true; break; }
         if (ret < 0) break;
 
-        if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
+        if (pkt->stream_index != m_cacheDemuxer.GetVideoStreamIndex()) {
             av_packet_unref(pkt);
             continue;
         }
 
-        m_videoDecoder.SendPacket(pkt);
+        m_cacheDecoder.SendPacket(pkt);
         av_packet_unref(pkt);
 
         while (true) {
-            ret = m_videoDecoder.ReceiveFrame(frame);
+            ret = m_cacheDecoder.ReceiveFrame(frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
@@ -872,21 +961,17 @@ void Player::PopulateCacheAroundCurrent() {
         }
     }
 
-    // Flush the trailing frames the decoder pipeline has been buffering
-    // into the cache too — otherwise frame-step-backward from the last
-    // frame jumps over them (cache says the previous frame is several
-    // frames before what's displayed).
+    // Flush the trailing frames the cache decoder pipeline has been
+    // buffering into the cache too — otherwise frame-step-backward from
+    // the last frame jumps over them.
     if (eofHit) {
-        m_videoDecoder.DrainAtEOF(frame, cacheFrame);
+        m_cacheDecoder.DrainAtEOF(frame, cacheFrame);
     }
 
 cacheDone:
     av_packet_free(&pkt);
     av_frame_free(&frame);
-
-    // Demuxer/decoder position is uncertain after cache population.
-    // Mark dirty so the next step operation will re-seek properly.
-    m_decoderDirty = true;
+    // Main decoder is untouched, so don't dirty m_decoderDirty here.
 }
 
 // --- TryGetVideoFrame (used during playback) ---
@@ -924,6 +1009,12 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
             if (frameSec >= m_resumeTime - frameDur) {
                 // This frame is at or near our resume point — start playback
                 m_waitingForResumeFrame = false;
+                if (m_profileSeek && m_playStartNS) {
+                    double elapsedMs = (SDL_GetTicksNS() - m_playStartNS) / 1e6;
+                    LOG_INFO("Play: ready in %.1fms (resume=%.3fs first=%.3fs catchup=%d frames)",
+                             elapsedMs, m_resumeTime, frameSec, m_playDroppedFrames);
+                    m_playStartNS = 0;
+                }
                 m_clock.SetTime(frameSec);
                 m_clock.SetPaused(false);
                 if (m_hasAudio) m_audioOutput.Resume();
@@ -932,6 +1023,7 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
             // Drop this frame — it's before our resume point
             if (!m_videoFrameQueue.TryPop(frame)) break;
             av_frame_unref(frame);
+            if (m_profileSeek) m_playDroppedFrames++;
         }
         av_frame_free(&frame);
         if (m_waitingForResumeFrame) return false;
@@ -1040,6 +1132,38 @@ void Player::StopThreads() {
 void Player::DemuxThread() {
     SetCurrentThreadName(L"ScrubCut Demux");
     AVPacket* pkt = av_packet_alloc();
+
+    // If the previous run was aborted mid-push, we held the packet that
+    // couldn't be delivered. Push it now before reading anything new; the
+    // demuxer has already advanced past it, so dropping it would lose
+    // bitstream and break the decoder's reference chain.
+    auto pushOrSave = [&](AVPacket* p) -> bool {
+        int idx = p->stream_index;
+        if (idx == m_demuxer.GetVideoStreamIndex()) {
+            if (m_videoPacketQueue.Push(p)) return true;
+        } else if (idx == m_demuxer.GetAudioStreamIndex()) {
+            if (m_audioPacketQueue.Push(p)) return true;
+        } else {
+            av_packet_unref(p);
+            return true;
+        }
+        // Push failed (queue aborted). Save for the next run.
+        if (!m_pendingDemuxPacket) m_pendingDemuxPacket = av_packet_alloc();
+        av_packet_move_ref(m_pendingDemuxPacket, p);
+        return false;
+    };
+
+    if (m_pendingDemuxPacket) {
+        AVPacket* held = m_pendingDemuxPacket;
+        m_pendingDemuxPacket = nullptr;
+        if (!pushOrSave(held)) {
+            av_packet_free(&held);
+            av_packet_free(&pkt);
+            return;
+        }
+        av_packet_free(&held);
+    }
+
     while (!m_stopThreads) {
         int ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
@@ -1050,19 +1174,7 @@ void Player::DemuxThread() {
         }
         if (ret < 0) break;
 
-        if (pkt->stream_index == m_demuxer.GetVideoStreamIndex()) {
-            if (!m_videoPacketQueue.Push(pkt)) {
-                av_packet_unref(pkt);
-                break;
-            }
-        } else if (pkt->stream_index == m_demuxer.GetAudioStreamIndex()) {
-            if (!m_audioPacketQueue.Push(pkt)) {
-                av_packet_unref(pkt);
-                break;
-            }
-        } else {
-            av_packet_unref(pkt);
-        }
+        if (!pushOrSave(pkt)) break;
     }
     av_packet_free(&pkt);
 }

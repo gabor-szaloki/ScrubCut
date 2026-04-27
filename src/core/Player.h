@@ -135,6 +135,17 @@ private:
     FrameConverter m_frameConverter;
     Clock m_clock;
 
+    // Cache-population uses its own demuxer + decoder so populating the
+    // backward-step frame cache after a seek doesn't disturb the main
+    // decoder's state. With a single shared decoder, PopulateCacheAround-
+    // Current would seek the demuxer and flush the decoder, forcing the
+    // next Play() to re-seek and decode a full GOP of catchup. With a
+    // separate decoder, the main one stays warm at the seeked position
+    // and Play() can resume instantly.
+    Demuxer m_cacheDemuxer;
+    VideoDecoder m_cacheDecoder;
+    FrameConverter m_cacheConverter;
+
     PacketQueue m_videoPacketQueue{64};
     PacketQueue m_audioPacketQueue{64};
     FrameQueue m_videoFrameQueue{4};
@@ -151,6 +162,15 @@ private:
     bool m_hasAudio = false;
 
     int64_t m_lastDisplayedPts = AV_NOPTS_VALUE;
+
+    // When the packet queue is aborted mid-push (StopThreads during
+    // playback), DemuxThread holds a packet it couldn't deliver. The
+    // demuxer has already advanced past that packet, so dropping it would
+    // permanently lose a frame's worth of bitstream — and after many
+    // pause/play cycles the decoder's reference chain falls apart and
+    // playback corrupts. Save the packet here so the next DemuxThread
+    // run pushes it before reading anything new.
+    AVPacket* m_pendingDemuxPacket = nullptr;
 
     // Cached RGBA frame from synchronous decode (single frame, consumed on read)
     const uint8_t* m_cachedFrame = nullptr;
@@ -169,6 +189,12 @@ private:
     // threads arrives at or after m_resumeTime. Prevents fast-forward on Play.
     bool m_waitingForResumeFrame = false;
     double m_resumeTime = 0.0;
+
+    // Profiling: timestamp of last Play() entry, and counters that tally
+    // the catchup work done between Play() and the first playable frame.
+    // Logged when -profileseek is enabled.
+    uint64_t m_playStartNS = 0;
+    int m_playDroppedFrames = 0;
 
     // Volume
     float m_volume = 1.0f;
