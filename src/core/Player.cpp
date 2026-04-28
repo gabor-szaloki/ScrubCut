@@ -306,9 +306,16 @@ void Player::SeekThread() {
 
         bool shouldResume = m_wantsToPlay.load(std::memory_order_relaxed);
 
-        // Populate cache for backward stepping (skip during scrubbing)
+        // Populate cache for backward stepping (skip during scrubbing).
+        // Abort early if a fresh seek arrives — the displayable frame is
+        // already set inside SyncSeekAndDecode, so the next seek can run
+        // immediately rather than waiting out a stale cache build.
         if (!shouldResume && !scrubbing) {
-            PopulateCacheAroundCurrent();
+            PopulateCacheAroundCurrent([this] {
+                if (m_stopSeekThread.load(std::memory_order_relaxed)) return true;
+                std::lock_guard<std::mutex> lock(m_seekMutex);
+                return m_seekRequest >= 0.0;
+            });
         }
 
         // Pipeline stays parked. PollSeekComplete on main thread will call
@@ -337,8 +344,13 @@ void Player::PollSeekComplete() {
 }
 
 void Player::SeekRelative(double deltaSec) {
-    double target = m_clock.GetTime() + deltaSec;
-    SeekTo(target);
+    // When a seek is already in flight (or pending), chain off its target
+    // rather than off m_clock. Otherwise, two arrow presses fired before
+    // the first seek's m_clock update both compute target = same_clock +
+    // delta, collapsing into a single move instead of accumulating.
+    double pending = m_pendingSeekTarget.load(std::memory_order_relaxed);
+    double base = (pending >= 0.0) ? pending : m_clock.GetTime();
+    SeekTo(base + deltaSec);
 }
 
 void Player::StepFrame(int direction) {
@@ -849,7 +861,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     return false;
 }
 
-void Player::PopulateCacheAroundCurrent() {
+void Player::PopulateCacheAroundCurrent(std::function<bool()> shouldAbort) {
     TRACE_EVENT("PopulateCacheAroundCurrent");
     if (!m_hasMedia) return;
     if (m_playing) return; // only when paused
@@ -884,6 +896,10 @@ void Player::PopulateCacheAroundCurrent() {
     };
 
     while (maxPackets-- > 0) {
+        if (shouldAbort && shouldAbort()) {
+            TRACE_LOG("PopulateCache_Aborted");
+            goto cacheDone;
+        }
         int ret = m_cacheDemuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) { eofHit = true; break; }
         if (ret < 0) break;

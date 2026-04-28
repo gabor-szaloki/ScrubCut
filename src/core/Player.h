@@ -12,6 +12,7 @@
 
 #include <thread>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
 #include <string>
@@ -37,8 +38,11 @@ public:
 
     // Populate frame cache around the current position (for backward stepping).
     // Called after a seek drag is released. Runs synchronously but only does
-    // RGBA conversion of frames not already in cache.
-    void PopulateCacheAroundCurrent();
+    // RGBA conversion of frames not already in cache. If `shouldAbort` is
+    // provided, it's polled per packet — return true to bail early (used by
+    // SeekThread to abort if a fresh seek arrives while we're still building
+    // cache from a now-stale position).
+    void PopulateCacheAroundCurrent(std::function<bool()> shouldAbort = nullptr);
 
     // Called from the main thread each render frame.
     bool TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHeight);
