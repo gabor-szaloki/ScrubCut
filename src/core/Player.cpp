@@ -71,14 +71,18 @@ bool Player::Open(const std::string& path) {
     m_seekThreadRunning = true;
     m_seekThread = std::thread(&Player::SeekThread, this);
 
-    // Decode first frame synchronously so we have something to show
+    // Spawn pipeline workers in parked state. They'll be unparked by Play.
+    SpawnPipelineThreads();
+
+    // Decode first frame synchronously so we have something to show.
+    // Pipeline is parked, so this owns the demuxer + video decoder.
     SyncDecodeNextFrame();
 
     return true;
 }
 
 void Player::Close() {
-    // Stop seek thread
+    // Stop seek thread first (it may park/unpark the pipeline).
     if (m_seekThreadRunning) {
         m_stopSeekThread = true;
         m_seekCv.notify_one();
@@ -86,7 +90,7 @@ void Player::Close() {
         m_seekThreadRunning = false;
     }
 
-    StopThreads();
+    StopPipelineThreads();
     m_frameCache.Clear();
     CloseResampler();
 
@@ -96,7 +100,6 @@ void Player::Close() {
     m_demuxer.Close();
     m_cacheDecoder.Close();
     m_cacheDemuxer.Close();
-    if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
 
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
@@ -119,65 +122,34 @@ void Player::Play() {
     // user seeks/steps near (but not at) the end of the file, where the
     // decoder pipeline drained packets through EOF to retrieve buffered
     // frames. Don't treat that as "user at end". Only restart from the
-    // beginning if the playback clock has actually reached the duration
-    // (PollSeekComplete sets clock = duration exactly when playback
-    // hits EOF; any seeked/stepped position ends up at a frame's pts,
-    // strictly less than duration).
+    // beginning if the playback clock has actually reached the duration.
     double curTime = m_clock.GetTime();
     double duration = m_demuxer.GetDuration();
     bool atActualEnd = duration > 0.0 && curTime >= duration - 0.001;
     if (m_eof && atActualEnd) {
-        // Restart from beginning
-        EnsureThreadsStopped();
-        m_videoDecoder.Flush();
-        if (m_hasAudio) m_audioDecoder.Flush();
+        // Restart from beginning. Pipeline is parked (Pause did that, or
+        // playback ended which leaves it parked too).
+        ParkPipeline();
+        FlushPipelineState();
         m_demuxer.Seek(0.0);
-        if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
+        m_eof = false;
         m_clock.SetTime(0.0);
     }
     m_eof = false;
 
     double resumeTime = m_clock.GetTime();
-
     m_hasCachedFrame = false;
 
-    // Start threads if not running
-    if (!m_threadsRunning) {
-        // Warm continuation: the decoder + queues are already in a state
-        // that produces the next playable frames, so we skip the flush +
-        // re-seek that a cold start would do. Two situations qualify:
-        //
-        //  (1) Just-seeked (SyncSeekAndDecode left the video decoder warm
-        //      at lastDisplayedPts; queues are empty; demuxer points at
-        //      the next packet).
-        //  (2) Just-paused-during-playback (queues hold the next frames
-        //      already decoded; decoder still warm; demuxer read-ahead).
-        //
-        // Either way Play just restarts the threads and TryGetVideoFrame
-        // picks up the first frame at-or-past resumeTime.
-        bool warm = !m_decoderDirty &&
-                    m_lastDisplayedPts != AV_NOPTS_VALUE;
-
-        if (!warm) {
-            m_videoPacketQueue.Flush();
-            m_audioPacketQueue.Flush();
-            m_videoFrameQueue.Flush();
-            m_videoDecoder.Flush();
-            if (m_hasAudio) m_audioDecoder.Flush();
-            m_demuxer.Seek(resumeTime);
-            if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
-            // Decoder, queues, and demuxer are now consistent at resumeTime.
-            // Without clearing this, a backward-step cache hit's dirty flag
-            // would persist forever, forcing every Pause→Play to take the
-            // cold path even after this resync already aligned everything.
-            m_decoderDirty = false;
-        }
-        StartThreads();
-
-        if (m_profileSeek) {
-            LOG_INFO("Play: %s start (resume=%.3fs)",
-                     warm ? "warm" : "cold", resumeTime);
-        }
+    // If the last operation left the decoder out of sync with what's
+    // displayed (backward-step cache hit), re-seek now so the threads
+    // produce frames matching m_lastDisplayedPts forward.
+    if (m_needsResync) {
+        ParkPipeline();  // idempotent if already parked
+        FlushPipelineState();
+        AVRational tb = m_demuxer.GetVideoTimeBase();
+        double seekSec = (m_lastDisplayedPts + 0.5) * av_q2d(tb);
+        SyncSeekAndDecode(seekSec);
+        m_needsResync = false;
     }
 
     if (m_hasAudio) {
@@ -185,8 +157,8 @@ void Player::Play() {
         m_audioOutput.ResetPosition(resumeTime);
     }
 
-    // Don't start the clock yet — wait for the first frame at/after resumeTime
-    // to arrive from the decode threads. This prevents fast-forward catch-up.
+    // Don't start the clock yet — wait for the first frame at/after
+    // resumeTime to land in the queue. This prevents fast-forward catch-up.
     m_clock.SetTime(resumeTime);
     m_waitingForResumeFrame = true;
     m_resumeTime = resumeTime;
@@ -195,27 +167,31 @@ void Player::Play() {
     if (m_profileSeek) {
         m_playStartNS = SDL_GetTicksNS();
         m_playDroppedFrames = 0;
+        LOG_INFO("Play: resume=%.3fs", resumeTime);
     }
+
+    // Unpark workers — they were idle since the last Pause/Seek, with
+    // queues + decoder state intact. No flush, no seek. TryGetVideoFrame
+    // picks up the first frame at-or-past resumeTime.
+    UnparkPipeline();
     // Clock stays paused; TryGetVideoFrame will unpause it when ready.
 }
 
 void Player::Pause() {
     TRACE_EVENT("Player::Pause");
-    bool wasPlaying = m_playing.load(std::memory_order_relaxed);
+    uint64_t t0 = m_profileSeek ? SDL_GetTicksNS() : 0;
     m_playing = false;
     m_wantsToPlay = false;
     m_waitingForResumeFrame = false;
     m_clock.SetPaused(true);
     if (m_hasAudio) m_audioOutput.Pause();
 
-    if (wasPlaying) {
-        // Stop threads — we'll do synchronous decode while paused. The
-        // packet/frame queues and decoder state are *not* flushed: the
-        // queues hold the next several frames already decoded, ready to
-        // display the moment Play() resumes. Play()'s warm path picks
-        // these up and avoids the GOP catchup that a cold restart would
-        // need.
-        StopThreads();
+    // Park workers at the top of their loop. Queues + decoder state stay
+    // intact — they'll resume on the next Play. Held packet inside
+    // DemuxThread (if any) survives via the pipeline-flush-gen check.
+    ParkPipeline();
+    if (m_profileSeek) {
+        LOG_INFO("Pause: %.2fms", (SDL_GetTicksNS() - t0) / 1e6);
     }
 }
 
@@ -283,27 +259,22 @@ void Player::SeekThread() {
             }
         }
 
-        bool threadsWereRunning = m_threadsRunning;
-        EnsureThreadsStopped();
+        // Park pipeline so we own the demuxer + decoder. SyncSeekAndDecode
+        // does its own flush (and bumps m_pipelineFlushGen) — we don't
+        // pre-flush here so the REUSE fast-path below can preserve state.
+        ParkPipeline();
 
-        if (threadsWereRunning) {
-            // Threads were mid-decode — flush to clear corrupt decoder state
-            m_videoDecoder.Flush();
-            if (m_hasAudio) m_audioDecoder.Flush();
-            m_videoPacketQueue.Flush();
-            m_audioPacketQueue.Flush();
-            m_videoFrameQueue.Flush();
-            m_decoderDirty = true;
-        }
-
+        // m_wantsToPlay carries "was playing" or "resume-after" intent from
+        // SeekTo. False means user is scrubbing while paused — small delta
+        // can be a no-op (keep displayed frame, only update clock).
+        bool wasPlayingOrResume = m_wantsToPlay.load(std::memory_order_relaxed);
         bool scrubbing = m_scrubbing.load(std::memory_order_relaxed);
 
-        // Skip seek if already at the right frame (within one frame duration)
         {
             double currentSec = m_clock.GetTime();
             double delta = target - currentSec;
             double frameDur = GetFrameDuration();
-            if (!m_decoderDirty && delta > -frameDur && delta <= 0.0) {
+            if (!wasPlayingOrResume && delta > -frameDur && delta <= 0.0) {
                 if (m_profileSeek) LOG_INFO("Seek: REUSE delta=%.3f", delta);
                 goto seekDone;
             }
@@ -319,8 +290,9 @@ void Player::SeekThread() {
             }
         }
 
-        if (m_profileSeek) LOG_INFO("Seek: FULL scrub=%d dirty=%d", scrubbing, (int)m_decoderDirty);
+        if (m_profileSeek) LOG_INFO("Seek: FULL scrub=%d", scrubbing);
         SyncSeekAndDecode(target);
+        m_needsResync = false;
 
     seekDone:
         // Check if a newer seek request arrived while we were decoding
@@ -339,8 +311,8 @@ void Player::SeekThread() {
             PopulateCacheAroundCurrent();
         }
 
-        // Signal main thread to resume playback if needed.
-        // Never call Play() from this thread — it would race with SeekTo().
+        // Pipeline stays parked. PollSeekComplete on main thread will call
+        // Play() if shouldResume — Play unparks. Otherwise we stay paused.
         m_seekShouldResume = shouldResume;
         m_seekDone = true;
         m_seekBusy = false;
@@ -372,23 +344,23 @@ void Player::SeekRelative(double deltaSec) {
 void Player::StepFrame(int direction) {
     TRACE_EVENT("Player::StepFrame");
     if (!m_hasMedia) return;
+    uint64_t stepStartNS = m_profileSeek ? SDL_GetTicksNS() : 0;
+    const char* stepKind = "unknown";
 
     WaitForSeek();
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
     bool wasPlaying = m_playing.load(std::memory_order_relaxed);
     if (wasPlaying) Pause();
-
-    EnsureThreadsStopped();
+    // Pipeline is now parked (Pause does that, or it was already parked).
 
     if (direction > 0) {
-        // Forward: check if next frame is already in cache
+        // Forward: check if next frame is already in cache.
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
             AVRational tb = m_demuxer.GetVideoTimeBase();
             double frameDurSec = GetFrameDuration();
             int64_t nextPts = m_lastDisplayedPts + static_cast<int64_t>(frameDurSec / av_q2d(tb));
             const auto* cached = m_frameCache.FindNearest(nextPts);
-            // Accept if within half a frame duration
             int64_t halfFrame = static_cast<int64_t>(frameDurSec / 2.0 / av_q2d(tb));
             if (cached && cached->pts > m_lastDisplayedPts &&
                 std::abs(cached->pts - nextPts) <= halfFrame) {
@@ -399,91 +371,83 @@ void Player::StepFrame(int direction) {
                 m_cachedWidth = cached->width;
                 m_cachedHeight = cached->height;
                 m_hasCachedFrame = true;
-                m_decoderDirty = true;
-                goto stepDone;
+                if (m_profileSeek) {
+                    LOG_INFO("StepFrame +1 cache-hit %.2fms",
+                             (SDL_GetTicksNS() - stepStartNS) / 1e6);
+                }
+                return;
             }
         }
 
-        // If decoder is out of sync (e.g. after cache-hit backward step), resync it
-        if (m_decoderDirty) {
-            double currentSec = m_clock.GetTime();
-            m_videoDecoder.Flush();
-            m_videoFrameQueue.Flush();
-            m_videoPacketQueue.Flush();
-            m_demuxer.Seek(currentSec);
-            if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
-            // Decode forward to current position, then one more
+        // If a prior backward-step cache hit deferred the decoder reseek,
+        // do it now — we're about to produce the next frame from the
+        // decoder pipeline and need it aligned with m_lastDisplayedPts.
+        if (m_needsResync) {
+            stepKind = "+1 resync";
+            FlushPipelineState();
             AVRational tb = m_demuxer.GetVideoTimeBase();
-            int64_t currentPts = m_lastDisplayedPts;
-            AVPacket* pkt = av_packet_alloc();
-            AVFrame* tmpFrame = av_frame_alloc();
-            int limit = 500;
-            while (limit-- > 0) {
-                int ret = m_demuxer.ReadPacket(pkt);
-                if (ret < 0) break;
-                if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
-                    av_packet_unref(pkt);
-                    continue;
-                }
-                m_videoDecoder.SendPacket(pkt);
-                av_packet_unref(pkt);
-                while (true) {
-                    ret = m_videoDecoder.ReceiveFrame(tmpFrame);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-                    if (ret < 0) break;
-                    if (tmpFrame->pts > currentPts) {
-                        // This is the next frame after current
-                        double frameSec = static_cast<double>(tmpFrame->pts) * av_q2d(tb);
-                        m_clock.SetTime(frameSec);
-                        m_lastDisplayedPts = tmpFrame->pts;
-                        m_cachedFrame = m_frameConverter.Convert(tmpFrame);
-                        m_cachedWidth = m_frameConverter.GetWidth();
-                        m_cachedHeight = m_frameConverter.GetHeight();
-                        m_hasCachedFrame = (m_cachedFrame != nullptr);
-                        if (m_hasCachedFrame)
-                            m_frameCache.Put(tmpFrame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
-                        av_frame_unref(tmpFrame);
-                        av_frame_free(&tmpFrame);
-                        av_packet_free(&pkt);
-                        m_decoderDirty = false;
-                        goto stepDone;
-                    }
-                    av_frame_unref(tmpFrame);
-                }
+            double seekSec = (m_lastDisplayedPts + 0.5) * av_q2d(tb);
+            SyncSeekAndDecode(seekSec);
+            m_needsResync = false;
+            // SyncSeekAndDecode already populated m_cachedFrame for the
+            // current pts; we want the NEXT frame instead. Fall through to
+            // the tick path below to produce one.
+            m_hasCachedFrame = false;
+        }
+
+        // Try the prefetched FrameQueue (filled by VideoDecodeThread before
+        // pause). If a frame is sitting there, it's already display-ordered
+        // immediately after m_lastDisplayedPts — use it.
+        AVFrame* frame = av_frame_alloc();
+        if (m_videoFrameQueue.TryPop(frame)) {
+            stepKind = "+1 queue";
+            AVRational tb = m_demuxer.GetVideoTimeBase();
+            double frameSec = static_cast<double>(frame->pts) * av_q2d(tb);
+            m_clock.SetTime(frameSec);
+            m_lastDisplayedPts = frame->pts;
+            m_cachedFrame = m_frameConverter.Convert(frame);
+            m_cachedWidth = m_frameConverter.GetWidth();
+            m_cachedHeight = m_frameConverter.GetHeight();
+            m_hasCachedFrame = (m_cachedFrame != nullptr);
+            if (m_hasCachedFrame)
+                m_frameCache.Put(frame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
+            av_frame_free(&frame);
+            if (m_profileSeek) {
+                LOG_INFO("StepFrame %s %.2fms", stepKind,
+                         (SDL_GetTicksNS() - stepStartNS) / 1e6);
             }
-            av_frame_free(&tmpFrame);
-            av_packet_free(&pkt);
-            // The decoder still has up to thread_count buffered frames from
-            // the speculative resync. If we leave them in place, the next
-            // step (taking the !dirty in-sync path) will pull a stale early
-            // frame out of the pipeline and jump backwards. Flush.
-            m_videoDecoder.Flush();
-            m_decoderDirty = false;
-        } else {
-            // Decoder is in sync — just decode next frame.
-            // SyncDecodeNextFrame drains m_videoPacketQueue before reading
-            // from the demuxer, so the decoder's reference chain stays
-            // intact across packets read ahead by the now-stopped DemuxThread.
-            AVFrame* frame = av_frame_alloc();
-            if (m_videoFrameQueue.TryPop(frame)) {
+            return;
+        }
+        av_frame_free(&frame);
+
+        // Frame queue empty. Tick the pipeline once: unpark briefly so
+        // VideoDecodeThread can produce one or more frames, then re-park.
+        // This handles both "queue exhausted but decoder pipeline buffered"
+        // and "needs new packets" cases without us touching demuxer/decoder
+        // directly — the worker threads own that.
+        if (strcmp(stepKind, "unknown") == 0) stepKind = "+1 tick";
+        if (TickPipelineOneFrame(500)) {
+            AVFrame* tickFrame = av_frame_alloc();
+            if (m_videoFrameQueue.TryPop(tickFrame)) {
                 AVRational tb = m_demuxer.GetVideoTimeBase();
-                double frameSec = static_cast<double>(frame->pts) * av_q2d(tb);
+                double frameSec = static_cast<double>(tickFrame->pts) * av_q2d(tb);
                 m_clock.SetTime(frameSec);
-                m_lastDisplayedPts = frame->pts;
-                m_cachedFrame = m_frameConverter.Convert(frame);
+                m_lastDisplayedPts = tickFrame->pts;
+                m_cachedFrame = m_frameConverter.Convert(tickFrame);
                 m_cachedWidth = m_frameConverter.GetWidth();
                 m_cachedHeight = m_frameConverter.GetHeight();
                 m_hasCachedFrame = (m_cachedFrame != nullptr);
                 if (m_hasCachedFrame)
-                    m_frameCache.Put(frame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
-            } else {
-                SyncDecodeNextFrame();
+                    m_frameCache.Put(tickFrame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
             }
-            av_frame_free(&frame);
+            av_frame_free(&tickFrame);
         }
-    stepDone:;
+        if (m_profileSeek) {
+            LOG_INFO("StepFrame %s %.2fms", stepKind,
+                     (SDL_GetTicksNS() - stepStartNS) / 1e6);
+        }
     } else {
-        // Backward: check frame cache first (instant)
+        // Backward: check frame cache first (instant).
         bool cacheHit = false;
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
             const auto* cached = m_frameCache.FindBefore(m_lastDisplayedPts);
@@ -497,23 +461,40 @@ void Player::StepFrame(int direction) {
                 m_cachedWidth = cached->width;
                 m_cachedHeight = cached->height;
                 m_hasCachedFrame = true;
-                m_decoderDirty = true; // decoder is at wrong position
                 cacheHit = true;
             }
         }
 
-        if (!cacheHit) {
-            // Cache miss — seek back and decode the frame immediately before
-            // the current one. SyncSeekAndDecode's `pts >= target` rule can
-            // snap forward onto the current frame after B-frame reordering;
-            // SyncSeekAndDecodeBefore guarantees a strictly-earlier frame.
-            TRACE_LOG("StepBack_CacheMiss");
-            double frameDur = GetFrameDuration();
-            double targetSec = m_clock.GetTime() - frameDur;
-            if (targetSec < 0.0) targetSec = 0.0;
-            int64_t maxPts = m_lastDisplayedPts;
-            SyncSeekAndDecodeBefore(targetSec, maxPts);
-            PopulateCacheAroundCurrent();
+        if (cacheHit) {
+            // Decoder is now at the wrong position relative to
+            // m_lastDisplayedPts, but we've shown the cached frame and
+            // we're paused — there's no need to fix the decoder NOW.
+            // Defer the reseek until the next forward-direction operation
+            // (Play or StepFrame(+1)). Without this, every backward step
+            // would cost a full GOP catchup decode (hundreds of ms on a
+            // 4-second GOP), defeating the cache entirely.
+            m_needsResync = true;
+            if (m_profileSeek) {
+                LOG_INFO("StepFrame -1 cache-hit %.2fms",
+                         (SDL_GetTicksNS() - stepStartNS) / 1e6);
+            }
+            return;
+        }
+
+        // Cache miss — seek back and decode the frame immediately before
+        // the current one.
+        TRACE_LOG("StepBack_CacheMiss");
+        FlushPipelineState();
+        double frameDur = GetFrameDuration();
+        double targetSec = m_clock.GetTime() - frameDur;
+        if (targetSec < 0.0) targetSec = 0.0;
+        int64_t maxPts = m_lastDisplayedPts;
+        SyncSeekAndDecodeBefore(targetSec, maxPts);
+        m_needsResync = false;
+        PopulateCacheAroundCurrent();
+        if (m_profileSeek) {
+            LOG_INFO("StepFrame -1 cache-miss %.2fms",
+                     (SDL_GetTicksNS() - stepStartNS) / 1e6);
         }
     }
 }
@@ -578,40 +559,7 @@ bool Player::SyncDecodeNextFrame() {
             break;
         }
 
-        // Need more input. Prefer packets already sitting in
-        // m_videoPacketQueue — DemuxThread read them ahead before pause
-        // but VideoDecodeThread didn't get to deliver them. Skipping
-        // them (jumping straight to demuxer.ReadPacket, which is past
-        // them) would punch holes in the decoder's reference chain and
-        // corrupt subsequent frames. Drain the queue first.
-        if (m_videoPacketQueue.Size() > 0) {
-            // Threads are stopped before SyncDecodeNextFrame is called,
-            // so no producer is racing — Pop won't block.
-            if (!m_videoPacketQueue.Pop(pkt)) continue;
-            m_videoDecoder.SendPacket(pkt);
-            av_packet_unref(pkt);
-            continue;
-        }
-
-        // After the queue, m_pendingDemuxPacket may hold the packet that
-        // DemuxThread had read but couldn't push when the queue aborted
-        // mid-pause. The demuxer is positioned PAST it, so reading from
-        // the demuxer next would skip it — the same ref-chain hole as
-        // skipping queued packets. Process it now.
-        if (m_pendingDemuxPacket) {
-            AVPacket* p = m_pendingDemuxPacket;
-            m_pendingDemuxPacket = nullptr;
-            if (p->stream_index == m_demuxer.GetVideoStreamIndex()) {
-                m_videoDecoder.SendPacket(p);
-            }
-            // Audio pending: discard. Audio gets flushed + repositioned
-            // on Play() anyway, so a one-packet gap at the pause boundary
-            // is at worst an inaudible click.
-            av_packet_free(&p);
-            continue;
-        }
-
-        // Queue empty — read fresh packets from the demuxer.
+        // Need more input — read packets from the demuxer.
         ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
             m_eof = true;
@@ -679,9 +627,8 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
     // Seek demuxer to keyframe at or before target
     m_demuxer.Seek(targetSec);
-    if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
+    m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
     m_eof = false;
-    m_decoderDirty = false;
 
     // Decode forward until we reach the target PTS
     AVRational tb = m_demuxer.GetVideoTimeBase();
@@ -825,7 +772,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     while (attempt < 4) {
         m_videoDecoder.Flush();
         m_demuxer.Seek(trySec);
-        if (m_pendingDemuxPacket) av_packet_free(&m_pendingDemuxPacket);
+        m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
         m_eof = false;
 
         int maxPackets = 500;
@@ -895,7 +842,6 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
             m_cachedHeight = m_frameConverter.GetHeight();
             m_hasCachedFrame = true;
         }
-        m_decoderDirty = false;
         av_frame_free(&bestFrame);
         return m_hasCachedFrame;
     }
@@ -971,7 +917,7 @@ void Player::PopulateCacheAroundCurrent() {
 cacheDone:
     av_packet_free(&pkt);
     av_frame_free(&frame);
-    // Main decoder is untouched, so don't dirty m_decoderDirty here.
+    // Main decoder is untouched.
 }
 
 // --- TryGetVideoFrame (used during playback) ---
@@ -1083,12 +1029,6 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 
 // --- Thread management ---
 
-void Player::EnsureThreadsStopped() {
-    if (m_threadsRunning) {
-        StopThreads();
-    }
-}
-
 void Player::WaitForSeek() {
     // Spin-wait for the seek thread to finish its current operation.
     // This is only called for operations that need decoder consistency
@@ -1098,9 +1038,15 @@ void Player::WaitForSeek() {
     }
 }
 
-void Player::StartThreads() {
-    TRACE_EVENT("StartThreads");
-    m_stopThreads = false;
+void Player::SpawnPipelineThreads() {
+    TRACE_EVENT("SpawnPipelineThreads");
+    {
+        std::lock_guard<std::mutex> lk(m_pipelineMutex);
+        m_pipelineActive = false;
+        m_pipelineParkedCount = 0;
+        m_pipelineExit = false;
+        m_pipelineThreadCount = m_hasAudio ? 3 : 2;
+    }
     m_videoPacketQueue.Reset();
     m_audioPacketQueue.Reset();
     m_videoFrameQueue.Reset();
@@ -1110,14 +1056,16 @@ void Player::StartThreads() {
     if (m_hasAudio) {
         m_audioDecodeThread = std::thread(&Player::AudioDecodeThread, this);
     }
-    m_threadsRunning = true;
 }
 
-void Player::StopThreads() {
-    TRACE_EVENT("StopThreads");
-    if (!m_threadsRunning) return;
-
-    m_stopThreads = true;
+void Player::StopPipelineThreads() {
+    TRACE_EVENT("StopPipelineThreads");
+    {
+        std::lock_guard<std::mutex> lk(m_pipelineMutex);
+        m_pipelineExit = true;
+        m_pipelineActive = false;
+    }
+    m_pipelineCv.notify_all();
     m_videoPacketQueue.Abort();
     m_audioPacketQueue.Abort();
     m_videoFrameQueue.Abort();
@@ -1125,57 +1073,136 @@ void Player::StopThreads() {
     if (m_demuxThread.joinable()) m_demuxThread.join();
     if (m_videoDecodeThread.joinable()) m_videoDecodeThread.join();
     if (m_audioDecodeThread.joinable()) m_audioDecodeThread.join();
+}
 
-    m_threadsRunning = false;
+void Player::ParkPipeline() {
+    TRACE_EVENT("ParkPipeline");
+    {
+        std::lock_guard<std::mutex> lk(m_pipelineMutex);
+        if (!m_pipelineActive && m_pipelineParkedCount == m_pipelineThreadCount) {
+            // Already parked.
+            return;
+        }
+        m_pipelineActive = false;
+    }
+    // Notify any thread in an EOF or I/O backoff cv wait so it re-evaluates
+    // its predicate (which includes !m_pipelineActive) and parks promptly.
+    m_pipelineCv.notify_all();
+    // Wake any thread mid-Push/Pop so it returns false and falls through to
+    // the top-of-loop park gate.
+    m_videoPacketQueue.Interrupt();
+    m_audioPacketQueue.Interrupt();
+    m_videoFrameQueue.Interrupt();
+
+    std::unique_lock<std::mutex> lk(m_pipelineMutex);
+    m_pipelineParkedCv.wait(lk, [&] {
+        return m_pipelineParkedCount == m_pipelineThreadCount || m_pipelineExit;
+    });
+}
+
+void Player::UnparkPipeline() {
+    TRACE_EVENT("UnparkPipeline");
+    m_videoPacketQueue.ClearInterrupt();
+    m_audioPacketQueue.ClearInterrupt();
+    m_videoFrameQueue.ClearInterrupt();
+    {
+        std::lock_guard<std::mutex> lk(m_pipelineMutex);
+        m_pipelineActive = true;
+    }
+    m_pipelineCv.notify_all();
+}
+
+bool Player::WorkerParkOrExit() {
+    std::unique_lock<std::mutex> lk(m_pipelineMutex);
+    if (m_pipelineExit) return false;
+    if (m_pipelineActive) return true;
+
+    m_pipelineParkedCount++;
+    m_pipelineParkedCv.notify_all();
+    m_pipelineCv.wait(lk, [&] { return m_pipelineActive || m_pipelineExit; });
+    m_pipelineParkedCount--;
+    return !m_pipelineExit;
 }
 
 void Player::DemuxThread() {
     SetCurrentThreadName(L"ScrubCut Demux");
     AVPacket* pkt = av_packet_alloc();
+    AVPacket* held = nullptr;          // packet awaiting push (preserved across pause)
+    uint64_t  heldGen = 0;
 
-    // If the previous run was aborted mid-push, we held the packet that
-    // couldn't be delivered. Push it now before reading anything new; the
-    // demuxer has already advanced past it, so dropping it would lose
-    // bitstream and break the decoder's reference chain.
-    auto pushOrSave = [&](AVPacket* p) -> bool {
-        int idx = p->stream_index;
-        if (idx == m_demuxer.GetVideoStreamIndex()) {
-            if (m_videoPacketQueue.Push(p)) return true;
-        } else if (idx == m_demuxer.GetAudioStreamIndex()) {
-            if (m_audioPacketQueue.Push(p)) return true;
-        } else {
-            av_packet_unref(p);
-            return true;
-        }
-        // Push failed (queue aborted). Save for the next run.
-        if (!m_pendingDemuxPacket) m_pendingDemuxPacket = av_packet_alloc();
-        av_packet_move_ref(m_pendingDemuxPacket, p);
-        return false;
-    };
+    while (true) {
+        if (!WorkerParkOrExit()) break;
 
-    if (m_pendingDemuxPacket) {
-        AVPacket* held = m_pendingDemuxPacket;
-        m_pendingDemuxPacket = nullptr;
-        if (!pushOrSave(held)) {
+        // If a flush happened while we were parked, the held packet is from
+        // the previous demuxer position — discard it.
+        if (held && m_pipelineFlushGen.load(std::memory_order_relaxed) != heldGen) {
             av_packet_free(&held);
-            av_packet_free(&pkt);
-            return;
+            held = nullptr;
         }
-        av_packet_free(&held);
-    }
 
-    while (!m_stopThreads) {
+        // EOF idle. Poll: m_eof gets cleared by Seek's flush. Short timed
+        // wait so we don't busy-loop and so Park can wake us promptly.
+        if (m_eof.load(std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> lk(m_pipelineMutex);
+            m_pipelineCv.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                return m_pipelineExit || !m_pipelineActive ||
+                       !m_eof.load(std::memory_order_relaxed);
+            });
+            continue;
+        }
+
+        // Try to deliver any held packet first — preserves bitstream
+        // continuity across pause (if Push got interrupted previously).
+        if (held) {
+            int idx = held->stream_index;
+            bool pushed = false;
+            if (idx == m_demuxer.GetVideoStreamIndex()) {
+                pushed = m_videoPacketQueue.Push(held);
+            } else if (idx == m_demuxer.GetAudioStreamIndex()) {
+                pushed = m_audioPacketQueue.Push(held);
+            } else {
+                av_packet_unref(held);
+                pushed = true;
+            }
+            if (pushed) {
+                av_packet_free(&held);
+                held = nullptr;
+            } else {
+                continue; // park requested; top-of-loop handles
+            }
+        }
+
         int ret = m_demuxer.ReadPacket(pkt);
         if (ret == AVERROR_EOF) {
             m_eof = true;
-            m_videoPacketQueue.Abort();
-            m_audioPacketQueue.Abort();
-            break;
+            continue;
         }
-        if (ret < 0) break;
+        if (ret < 0) {
+            // I/O error — short backoff
+            std::unique_lock<std::mutex> lk(m_pipelineMutex);
+            m_pipelineCv.wait_for(lk, std::chrono::milliseconds(50));
+            continue;
+        }
 
-        if (!pushOrSave(pkt)) break;
+        int idx = pkt->stream_index;
+        bool isVideo = (idx == m_demuxer.GetVideoStreamIndex());
+        bool isAudio = (idx == m_demuxer.GetAudioStreamIndex());
+        if (!isVideo && !isAudio) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        bool pushed = isVideo ? m_videoPacketQueue.Push(pkt)
+                              : m_audioPacketQueue.Push(pkt);
+        if (!pushed) {
+            // Park requested while waiting on Push. Save for redelivery.
+            held = av_packet_alloc();
+            av_packet_move_ref(held, pkt);
+            heldGen = m_pipelineFlushGen.load(std::memory_order_relaxed);
+        }
     }
+
+    if (held) av_packet_free(&held);
     av_packet_free(&pkt);
 }
 
@@ -1183,43 +1210,51 @@ void Player::VideoDecodeThread() {
     SetCurrentThreadName(L"ScrubCut VideoDecode");
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
+    bool drainedEof = false;
 
-    while (!m_stopThreads) {
-        if (!m_videoPacketQueue.Pop(pkt)) break;
+    while (true) {
+        if (!WorkerParkOrExit()) break;
+
+        // Re-arm EOF drain whenever m_eof goes back to false (post-seek).
+        if (!m_eof.load(std::memory_order_relaxed)) drainedEof = false;
+
+        // EOF idle: drain decoder once, then poll until state changes.
+        if (m_eof.load(std::memory_order_relaxed) && m_videoPacketQueue.Empty()) {
+            if (!drainedEof) {
+                drainedEof = true;
+                m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
+                    return m_videoFrameQueue.Push(f);
+                });
+            }
+            std::unique_lock<std::mutex> lk(m_pipelineMutex);
+            m_pipelineCv.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                return m_pipelineExit || !m_pipelineActive ||
+                       !m_eof.load(std::memory_order_relaxed) ||
+                       !m_videoPacketQueue.Empty();
+            });
+            continue;
+        }
+
+        // Use timed pop so we periodically re-check EOF and park state
+        // even when DemuxThread is briefly behind.
+        if (!m_videoPacketQueue.PopWithTimeout(pkt, 50)) continue;
 
         int ret = m_videoDecoder.SendPacket(pkt);
         av_packet_unref(pkt);
         if (ret < 0) continue;
 
-        while (!m_stopThreads) {
+        while (true) {
             ret = m_videoDecoder.ReceiveFrame(frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
             if (!m_videoFrameQueue.Push(frame)) {
                 av_frame_unref(frame);
-                goto done;
+                break;  // park requested; top-of-loop handles
             }
         }
     }
 
-    // The demuxer reached EOF; flush the trailing frames the decoder
-    // pipeline has been holding, otherwise playback stops ~thread_count
-    // frames short of the actual end.
-    if (m_eof.load(std::memory_order_relaxed) && !m_stopThreads.load(std::memory_order_relaxed)) {
-        bool pushFailed = false;
-        m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
-            if (m_stopThreads.load(std::memory_order_relaxed)) return false;
-            if (!m_videoFrameQueue.Push(f)) {
-                pushFailed = true;
-                return false;
-            }
-            return true;
-        });
-        if (pushFailed) goto done;
-    }
-
-done:
     av_packet_free(&pkt);
     av_frame_free(&frame);
 }
@@ -1231,14 +1266,16 @@ void Player::AudioDecodeThread() {
     uint8_t* outBuf = nullptr;
     int outBufSize = 0;
 
-    while (!m_stopThreads) {
-        if (!m_audioPacketQueue.Pop(pkt)) break;
+    while (true) {
+        if (!WorkerParkOrExit()) break;
+
+        if (!m_audioPacketQueue.PopWithTimeout(pkt, 50)) continue;
 
         int ret = m_audioDecoder.SendPacket(pkt);
         av_packet_unref(pkt);
         if (ret < 0) continue;
 
-        while (!m_stopThreads) {
+        while (true) {
             ret = m_audioDecoder.ReceiveFrame(frame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
@@ -1269,6 +1306,22 @@ void Player::AudioDecodeThread() {
     av_free(outBuf);
     av_packet_free(&pkt);
     av_frame_free(&frame);
+}
+
+void Player::FlushPipelineState() {
+    m_videoDecoder.Flush();
+    if (m_hasAudio) m_audioDecoder.Flush();
+    m_videoPacketQueue.Flush();
+    m_audioPacketQueue.Flush();
+    m_videoFrameQueue.Flush();
+    m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Player::TickPipelineOneFrame(int timeoutMs) {
+    UnparkPipeline();
+    bool got = m_videoFrameQueue.WaitForOne(timeoutMs);
+    ParkPipeline();
+    return got;
 }
 
 void Player::SetupResampler() {

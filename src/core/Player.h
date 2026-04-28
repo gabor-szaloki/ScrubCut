@@ -84,21 +84,38 @@ private:
     void VideoDecodeThread();
     void AudioDecodeThread();
 
-    void StopThreads();
-    void StartThreads();
+    // Spawn worker threads (parked). Called from Open.
+    void SpawnPipelineThreads();
 
-    // Ensure threads are stopped (for paused operations). No-op if already stopped.
-    void EnsureThreadsStopped();
+    // Signal exit + join all worker threads. Called from Close.
+    void StopPipelineThreads();
+
+    // Park: signal threads to wait at top-of-loop, wake any blocked queue ops,
+    // and wait for the parked count to match the thread count. After this
+    // returns, queues + decoder may be safely flushed/reseeked.
+    void ParkPipeline();
+
+    // Unpark: clear queue interrupts, set pipeline active, notify_all.
+    void UnparkPipeline();
+
+    // True between Park() and Unpark(). Threads use this at the top of their
+    // loop to decide whether to do work or park.
+    bool IsPipelineActiveLocked() const { return m_pipelineActive; }
+
+    // Top-of-loop park gate, called by each worker thread. Returns false if
+    // the pipeline is exiting (thread should return).
+    bool WorkerParkOrExit();
 
     // Wait for any pending async seek to complete.
     void WaitForSeek();
 
     // Synchronously decode the next video frame from the current demuxer/decoder state.
     // No seek, no flush. Returns true if a frame was decoded and cached.
+    // Used only for the initial-frame decode in Open() — pipeline must be parked.
     bool SyncDecodeNextFrame();
 
     // Seek to targetSec, then synchronously decode forward to the target frame.
-    // Flushes decoder. Threads must be stopped.
+    // Flushes decoder. Pipeline must be parked.
     bool SyncSeekAndDecode(double targetSec);
 
     // Like SyncSeekAndDecode, but lands on the frame with the largest pts that
@@ -107,6 +124,14 @@ private:
     // alignment causes the first decoded pts to already be >= the target.
     bool SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts);
 
+    // Tick the pipeline once: unpark, wait until at least one frame lands in
+    // m_videoFrameQueue, then re-park. Used by StepFrame(+1) when the queue
+    // is empty. timeoutMs caps the wait.
+    bool TickPipelineOneFrame(int timeoutMs);
+
+    // Flush queues + decoder; bumps m_pipelineFlushGen so DemuxThread's
+    // held packet (if any) is discarded as stale. Pipeline must be parked.
+    void FlushPipelineState();
 
 
     // Background seek thread
@@ -155,22 +180,38 @@ private:
     std::thread m_audioDecodeThread;
 
     std::atomic<bool> m_playing{false};
-    std::atomic<bool> m_stopThreads{false};
     std::atomic<bool> m_eof{false};
-    std::atomic<bool> m_threadsRunning{false};
     bool m_hasMedia = false;
     bool m_hasAudio = false;
 
     int64_t m_lastDisplayedPts = AV_NOPTS_VALUE;
 
-    // When the packet queue is aborted mid-push (StopThreads during
-    // playback), DemuxThread holds a packet it couldn't deliver. The
-    // demuxer has already advanced past that packet, so dropping it would
-    // permanently lose a frame's worth of bitstream — and after many
-    // pause/play cycles the decoder's reference chain falls apart and
-    // playback corrupts. Save the packet here so the next DemuxThread
-    // run pushes it before reading anything new.
-    AVPacket* m_pendingDemuxPacket = nullptr;
+    // Pipeline park state. The DemuxThread/VideoDecodeThread/AudioDecodeThread
+    // workers run continuously between Open() and Close(); pause is
+    // implemented by parking them at the top of their loop instead of
+    // tearing down + respawning. Eliminates entire bug classes around
+    // mid-abort lost packets and stale state. See ParkPipeline()/Unpark().
+    mutable std::mutex m_pipelineMutex;
+    std::condition_variable m_pipelineCv;        // wakes parked threads
+    std::condition_variable m_pipelineParkedCv;  // wakes the parker
+    bool m_pipelineActive = false;
+    int  m_pipelineParkedCount = 0;
+    int  m_pipelineThreadCount = 0;
+    bool m_pipelineExit = false;
+
+    // Generation counter bumped on every flush of the demuxer/decoder/queues.
+    // DemuxThread captures this when it stashes a packet that couldn't be
+    // pushed (queue full + park interrupted); on resume, if the gen has
+    // changed, the held packet is stale (demuxer was repositioned) and
+    // gets discarded. Without this, Pause would leak the packet across a
+    // subsequent Seek.
+    std::atomic<uint64_t> m_pipelineFlushGen{0};
+
+    // True when m_lastDisplayedPts was changed without a matching decoder
+    // reseek — i.e. backward-step cache hit. The next forward-direction
+    // operation (Play, StepFrame(+1)) re-seeks the decoder before producing
+    // frames. Cleared the moment a resync runs.
+    bool m_needsResync = false;
 
     // Cached RGBA frame from synchronous decode (single frame, consumed on read)
     const uint8_t* m_cachedFrame = nullptr;
@@ -180,10 +221,6 @@ private:
 
     // Frame cache for instant backward stepping
     FrameCache m_frameCache{128};
-
-    // True when decoder/demuxer position doesn't match m_lastDisplayedPts
-    // (e.g. after a cache-hit backward step). Next forward decode must seek first.
-    bool m_decoderDirty = false;
 
     // When true, the clock is held paused until the first frame from decode
     // threads arrives at or after m_resumeTime. Prevents fast-forward on Play.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/FFmpegUtils.h"
+#include <chrono>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
@@ -14,11 +15,12 @@ public:
     FrameQueue& operator=(const FrameQueue&) = delete;
 
     // Push a frame (takes ownership via av_frame_move_ref).
-    // Blocks if queue is full. Returns false if aborted.
+    // Blocks if queue is full. Returns false if aborted or interrupted —
+    // contents preserved on interrupt.
     bool Push(AVFrame* frame) {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_condPush.wait(lock, [&] { return m_queue.size() < static_cast<size_t>(m_maxSize) || m_abort; });
-        if (m_abort) return false;
+        m_condPush.wait(lock, [&] { return m_queue.size() < static_cast<size_t>(m_maxSize) || m_abort || m_interrupt; });
+        if (m_abort || m_interrupt) return false;
 
         AVFrame* copy = av_frame_alloc();
         av_frame_move_ref(copy, frame);
@@ -27,10 +29,12 @@ public:
         return true;
     }
 
-    // Pop a frame. Blocks if queue is empty. Returns false if aborted.
+    // Pop a frame. Blocks if queue is empty. Returns false if aborted or
+    // interrupted (contents preserved on interrupt).
     bool Pop(AVFrame* frame) {
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_condPop.wait(lock, [&] { return !m_queue.empty() || m_abort; });
+        m_condPop.wait(lock, [&] { return !m_queue.empty() || m_abort || m_interrupt; });
+        if (m_interrupt) return false;
         if (m_abort && m_queue.empty()) return false;
 
         AVFrame* front = m_queue.front();
@@ -81,6 +85,31 @@ public:
     void Reset() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_abort = false;
+        m_interrupt = false;
+    }
+
+    // Wake any waiting Push/Pop and make them return false without erasing
+    // queue contents. See PacketQueue::Interrupt for usage.
+    void Interrupt() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_interrupt = true;
+        m_condPush.notify_all();
+        m_condPop.notify_all();
+    }
+
+    void ClearInterrupt() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_interrupt = false;
+    }
+
+    // Wait until queue has at least one frame, an abort/interrupt occurs,
+    // or `timeoutMs` elapses. Used by StepFrame to tick the pipeline once.
+    // Returns true if a frame is now available.
+    bool WaitForOne(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_condPop.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+            [&] { return !m_queue.empty() || m_abort || m_interrupt; })
+            && !m_queue.empty();
     }
 
     int Size() {
@@ -95,4 +124,5 @@ private:
     std::condition_variable m_condPop;
     int m_maxSize;
     bool m_abort = false;
+    bool m_interrupt = false;
 };

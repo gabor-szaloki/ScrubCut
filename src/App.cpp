@@ -1142,12 +1142,12 @@ void App::Render() {
             if (ImGui::IsItemHovered() || ImGui::IsItemActive())
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
-                if (m_wasPlayingBeforeTimelineSeek) {
-                    m_player.SetScrubbing(false);
-                    m_player.SeekTo(m_seekTarget, true);
-                } else {
-                    m_player.SetScrubbing(false);
-                }
+                m_player.SetScrubbing(false);
+                // SeekTo on release in both cases: when was-playing it
+                // resumes playback; when was-paused the SeekThread's
+                // REUSE fast-path runs PopulateCacheAroundCurrent (cache
+                // population is skipped during drag when scrubbing=true).
+                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }
 
@@ -1180,8 +1180,7 @@ void App::Render() {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
                 m_player.SetScrubbing(false);
-                if (m_wasPlayingBeforeTimelineSeek)
-                    m_player.SeekTo(m_seekTarget, true);
+                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }
         }
@@ -1222,8 +1221,7 @@ void App::Render() {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
                 m_player.SetScrubbing(false);
-                if (m_wasPlayingBeforeTimelineSeek)
-                    m_player.SeekTo(m_seekTarget, true);
+                m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }
         }
@@ -1297,8 +1295,7 @@ void App::Render() {
 
         if (m_isTimelineSeeking && !ImGui::IsItemActive()) {
             m_player.SetScrubbing(false);
-            if (m_wasPlayingBeforeTimelineSeek)
-                m_player.SeekTo(m_seekTarget, true);
+            m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
             m_isTimelineSeeking = false;
         }
 
