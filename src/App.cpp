@@ -41,6 +41,7 @@ struct PlatformKeys {
     const char* jumpName;       // "Cmd + Left / Right  or  Home / End" / "Home / End"
     const char* deleteName;     // "Backspace" / "Delete"
     const char* quitShortcut;   // "Cmd + Q" / "Alt+F4"
+    const char* altKeyName;     // "Option" / "Alt"  — the SDL_KMOD_ALT-bearing key
 };
 
 #ifdef __APPLE__
@@ -48,14 +49,14 @@ static constexpr PlatformKeys kKeys = {
     SDL_KMOD_GUI, SDL_KMOD_ALT, SDL_KMOD_ALT, SDL_KMOD_GUI, true,
     "Cmd", "Option", "Cmd + Option",
     "Cmd + Left / Right  or  Home / End",
-    "Backspace", "Cmd + Q"
+    "Backspace", "Cmd + Q", "Option"
 };
 #else
 static constexpr PlatformKeys kKeys = {
     SDL_KMOD_CTRL, SDL_KMOD_CTRL, SDL_KMOD_ALT, SDL_Keymod(0), false,
     "Ctrl", "Ctrl", "Alt",
     "Home / End",
-    "Delete", "Alt+F4"
+    "Delete", "Alt+F4", "Alt"
 };
 #endif
 
@@ -1614,8 +1615,9 @@ void App::Render() {
             row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());
             row("Toggle marks",        (std::string(kKeys.cmdName) + " + M").c_str());
             row("Quit",                 kKeys.quitShortcut);
-            row("Precision scrub",      "Alt + drag timeline");
-            row("Add mark on timeline", "Ctrl + click (frame) / drag (segment)");
+            row("Precision scrub",      (std::string(kKeys.altKeyName) + " + drag timeline").c_str());
+            row("Add mark on timeline",
+                (std::string(kKeys.cmdName) + " + click (frame) / drag (segment)").c_str());
             row("Toggle help",          "?");
 
             ImGui::EndTable();
