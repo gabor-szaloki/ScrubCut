@@ -99,9 +99,40 @@ void UIManager::EndFrame() {
 
 void UIManager::SetupDockspace() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    // Always cover the full viewport so video renders behind the menu bar
-    ImVec2 dockPos  = viewport->Pos;
-    ImVec2 dockSize = viewport->Size;
+    ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
+
+    // Build default layout on first run (no saved layout yet)
+    if (!m_layoutInitialized) {
+        m_layoutInitialized = true;
+
+        if (ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
+            ImGui::DockBuilderRemoveNode(dockspaceId);
+            ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+            ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
+
+            // Viewport fills the entire dockspace, no splits
+            ImGui::DockBuilderDockWindow("Viewport", dockspaceId);
+            ImGui::DockBuilderFinish(dockspaceId);
+        }
+    }
+
+    // Suppress the tab bar on the Viewport's node — we never want a
+    // "Viewport" tab. Other docked windows show their tab bar by default
+    // (user can right-click a tab → "Hide Tab Bar" to hide; that choice
+    // persists in imgui.ini per dock node).
+    if (ImGuiDockNode* centralNode = ImGui::DockBuilderGetCentralNode(dockspaceId)) {
+        centralNode->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
+    }
+
+    // When non-viewport windows are docked, the root node is split; reserve
+    // the menu bar's height so docked windows don't get clipped under it.
+    // When only the viewport is docked, cover the full viewport so video
+    // renders behind the (overlay) menu bar — the intended look.
+    ImGuiDockNode* rootNode = ImGui::DockBuilderGetNode(dockspaceId);
+    bool hasDockedSiblings = rootNode && !rootNode->IsLeafNode();
+
+    ImVec2 dockPos  = hasDockedSiblings ? viewport->WorkPos  : viewport->Pos;
+    ImVec2 dockSize = hasDockedSiblings ? viewport->WorkSize : viewport->Size;
     ImGui::SetNextWindowPos(dockPos);
     ImGui::SetNextWindowSize(dockSize);
     ImGui::SetNextWindowViewport(viewport->ID);
@@ -122,25 +153,8 @@ void UIManager::SetupDockspace() {
     ImGui::Begin("DockSpace", nullptr, flags);
     ImGui::PopStyleVar(3);
 
-    ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
-
-    // Build default layout on first run (no saved layout yet)
-    if (!m_layoutInitialized) {
-        m_layoutInitialized = true;
-
-        if (ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
-            ImGui::DockBuilderRemoveNode(dockspaceId);
-            ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
-            ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
-
-            // Viewport fills the entire dockspace, no splits
-            ImGui::DockBuilderDockWindow("Viewport", dockspaceId);
-            ImGui::DockBuilderFinish(dockspaceId);
-        }
-    }
-
     ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f),
-        ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_AutoHideTabBar);
+        ImGuiDockNodeFlags_PassthruCentralNode);
 
     ImGui::End();
 }
