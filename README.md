@@ -2,7 +2,7 @@
 
 A lightweight video player for fast frame-accurate scrubbing, trimming, and exporting.
 
-<video src="https://github.com/user-attachments/assets/5b82612a-8015-4c31-8e7b-94dfa60347d7" controls width="720"></video>
+<video src="https://github.com/user-attachments/assets/4800c503-a0df-4697-b780-9de4a54129db" controls width="720"></video>
 
 ## Features
 
