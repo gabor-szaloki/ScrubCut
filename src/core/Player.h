@@ -153,6 +153,13 @@ private:
     bool m_seekThreadRunning = false;
     bool m_profileSeek = false;
 
+    // A/V sync diagnostics. When -profileseek is on, a counter is set after
+    // each seek so the next few audio packets and video frames log their
+    // pts vs the seek target — lets us see whether audio/video drift after
+    // a seek is from skewed packet pts or from elsewhere.
+    std::atomic<int>    m_avsyncLogPackets{0};
+    std::atomic<double> m_avsyncSeekTarget{0.0};
+
     // Sticky flag: true when the user intends playback to continue after seeking.
     // Set by SeekTo when playback was active, cleared only when Play() is called.
     std::atomic<bool> m_wantsToPlay{false};

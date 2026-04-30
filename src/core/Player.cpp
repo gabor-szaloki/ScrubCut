@@ -3,6 +3,7 @@
 #include "util/Trace.h"
 
 #include <algorithm>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -46,6 +47,11 @@ bool Player::Open(const std::string& path) {
                 SetupResampler();
                 m_hasAudio = true;
                 m_clock.SetAudioOutput(&m_audioOutput);
+                // Apply volume/mute state that may have been set BEFORE
+                // audio existed (e.g. from saved preferences at launch).
+                // Without this, a saved muted=true never reaches the audio
+                // output until the user toggles mute again.
+                SetMuted(m_muted);
             }
         }
     }
@@ -294,6 +300,18 @@ void Player::SeekThread() {
         SyncSeekAndDecode(target);
         m_needsResync = false;
 
+        if (m_profileSeek) {
+            // Arm A/V sync diagnostics: AudioDecodeThread + VideoDecodeThread
+            // log the next few packet/frame ptss vs this seek target.
+            AVRational vtb = m_demuxer.GetVideoTimeBase();
+            double videoFirstSec = (m_lastDisplayedPts != AV_NOPTS_VALUE)
+                ? static_cast<double>(m_lastDisplayedPts) * av_q2d(vtb) : 0.0;
+            LOG_INFO("AVSync: seek target=%.3fs video first frame pts=%.3fs (delta=%+.3fs)",
+                     target, videoFirstSec, videoFirstSec - target);
+            m_avsyncSeekTarget.store(target, std::memory_order_relaxed);
+            m_avsyncLogPackets.store(5, std::memory_order_relaxed);
+        }
+
     seekDone:
         // Check if a newer seek request arrived while we were decoding
         {
@@ -541,16 +559,28 @@ void Player::SetSpeed(double speed) {
     }
 }
 
+// Map linear slider position (m_volume, 0..1) to perceptual gain via a
+// cubic taper. Loudness perception is roughly logarithmic, so a linear
+// slider sounds "stuck near full" through most of its travel; cubing the
+// position gives a much more useful range — 50% → ~-18 dB, 10% → ~-60 dB.
+// m_volume itself stays linear so the UI shows the slider value verbatim
+// and saved-prefs round-trip correctly.
+static inline float VolumeToGain(float v) {
+    if (v <= 0.0f) return 0.0f;
+    if (v >= 1.0f) return 1.0f;
+    return v * v * v;
+}
+
 void Player::SetVolume(float volume) {
     m_volume = volume;
     if (m_hasAudio && !m_muted)
-        m_audioOutput.SetVolume(volume);
+        m_audioOutput.SetVolume(VolumeToGain(volume));
 }
 
 void Player::SetMuted(bool muted) {
     m_muted = muted;
     if (m_hasAudio)
-        m_audioOutput.SetVolume(muted ? 0.0f : m_volume);
+        m_audioOutput.SetVolume(muted ? 0.0f : VolumeToGain(m_volume));
 }
 
 // --- Synchronous decode (used when paused) ---
@@ -631,9 +661,18 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     m_videoFrameQueue.Flush();
     m_frameCache.Clear();
 
+    // Clear the audio queue's interrupt flag so we can push audio packets
+    // captured during the forward decode below. ParkPipeline left the queues
+    // interrupted to wake the workers; while we run here the workers are
+    // parked at their gate, but Push still rejects on m_interrupt=true.
+    // Workers stay parked because they wait on m_pipelineCv, not the queue.
+    m_audioPacketQueue.ClearInterrupt();
+
     if (m_hasAudio) {
         m_audioOutput.Flush();
-        m_audioOutput.ResetPosition(targetSec);
+        // Position is reset to the actual landed video pts after decode
+        // (long-GOP files can land hundreds of ms past target; aligning
+        // audio to target instead of the actual frame would desync them).
     }
 
     uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
@@ -662,6 +701,31 @@ bool Player::SyncSeekAndDecode(double targetSec) {
             break;
         }
         if (ret < 0) break;
+
+        if (pkt->stream_index == m_demuxer.GetAudioStreamIndex() && m_hasAudio) {
+            // Capture audio packets covering target into the audio queue.
+            // Without this, every packet read here gets dropped — by the
+            // time SyncSeekAndDecode finishes, the demuxer is hundreds of
+            // ms past target, and the audio packets near target are gone.
+            // m_audioOutput.ResetPosition(target) would then claim the
+            // first post-seek audio sample is at target, but the actual
+            // content is from later, so audio plays ahead of video.
+            AVRational atb = m_demuxer.GetAudioTimeBase();
+            double pktSec = (pkt->pts != AV_NOPTS_VALUE)
+                ? static_cast<double>(pkt->pts) * av_q2d(atb) : 0.0;
+            // Include the packet straddling target (audio frames are
+            // typically ~21ms; allow a small margin so we don't skip the
+            // packet whose end is at target).
+            if (pktSec + 0.025 >= targetSec &&
+                m_audioPacketQueue.Size() < 60) {
+                if (!m_audioPacketQueue.Push(pkt)) {
+                    av_packet_unref(pkt);
+                }
+            } else {
+                av_packet_unref(pkt);
+            }
+            continue;
+        }
 
         if (pkt->stream_index != m_demuxer.GetVideoStreamIndex()) {
             av_packet_unref(pkt);
@@ -729,6 +793,47 @@ done:
         m_clock.SetTime(frameSec);
         m_lastDisplayedPts = bestFrame->pts;
 
+        if (m_hasAudio) {
+            // Align audio to the actual landed video frame rather than
+            // the requested target — long-GOP files can land hundreds of
+            // ms past target. Then drop captured audio packets whose pts
+            // is earlier than the video frame: their content would play
+            // before video catches up, manifesting as audio-leads-video
+            // by up to a GOP duration.
+            m_audioOutput.ResetPosition(frameSec);
+
+            AVRational atb = m_demuxer.GetAudioTimeBase();
+            double atb_d = av_q2d(atb);
+            int origCount = m_audioPacketQueue.Size();
+            int dropped = 0;
+            AVPacket* drainPkt = av_packet_alloc();
+            // Pop, filter, re-push. Pop won't block here — pipeline workers
+            // are parked, no other consumer.
+            std::vector<AVPacket*> keep;
+            for (int i = 0; i < origCount; ++i) {
+                if (!m_audioPacketQueue.Pop(drainPkt)) break;
+                double pktSec = (drainPkt->pts != AV_NOPTS_VALUE)
+                    ? static_cast<double>(drainPkt->pts) * atb_d : 0.0;
+                if (pktSec + 0.025 >= frameSec) {
+                    AVPacket* k = av_packet_alloc();
+                    av_packet_move_ref(k, drainPkt);
+                    keep.push_back(k);
+                } else {
+                    av_packet_unref(drainPkt);
+                    dropped++;
+                }
+            }
+            for (AVPacket* k : keep) {
+                if (!m_audioPacketQueue.Push(k)) av_packet_unref(k);
+                av_packet_free(&k);
+            }
+            av_packet_free(&drainPkt);
+            if (m_profileSeek && dropped > 0) {
+                LOG_INFO("AVSync: dropped %d audio packets (< video first frame %.3fs)",
+                         dropped, frameSec);
+            }
+        }
+
         // Only convert the final target frame to RGBA (skip intermediates for speed)
         const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
         if (rgba) {
@@ -753,6 +858,7 @@ done:
     }
 
     m_clock.SetTime(targetSec);
+    if (m_hasAudio) m_audioOutput.ResetPosition(targetSec);
     return false;
 }
 
@@ -1286,6 +1392,19 @@ void Player::AudioDecodeThread() {
         if (!WorkerParkOrExit()) break;
 
         if (!m_audioPacketQueue.PopWithTimeout(pkt, 50)) continue;
+
+        if (m_avsyncLogPackets.load(std::memory_order_relaxed) > 0) {
+            int n = m_avsyncLogPackets.fetch_sub(1, std::memory_order_relaxed);
+            if (n > 0) {
+                AVRational atb = m_demuxer.GetAudioTimeBase();
+                double pktSec = (pkt->pts != AV_NOPTS_VALUE)
+                    ? static_cast<double>(pkt->pts) * av_q2d(atb) : -1.0;
+                double tgt = m_avsyncSeekTarget.load(std::memory_order_relaxed);
+                double pos = m_audioOutput.GetPlaybackPosition();
+                LOG_INFO("AVSync: audio pkt pts=%.3fs target=%.3fs (delta=%+.3fs) audio_clock=%.3fs",
+                         pktSec, tgt, pktSec - tgt, pos);
+            }
+        }
 
         int ret = m_audioDecoder.SendPacket(pkt);
         av_packet_unref(pkt);

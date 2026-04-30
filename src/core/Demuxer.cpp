@@ -93,6 +93,12 @@ AVRational Demuxer::GetVideoTimeBase() const {
     return {1, 1};
 }
 
+AVRational Demuxer::GetAudioTimeBase() const {
+    if (m_fmtCtx && m_audioStreamIdx >= 0)
+        return m_fmtCtx->streams[m_audioStreamIdx]->time_base;
+    return {1, 1};
+}
+
 double Demuxer::GetVideoFrameRate() const {
     if (!m_fmtCtx || m_videoStreamIdx < 0)
         return 0.0;

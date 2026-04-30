@@ -29,6 +29,7 @@ public:
 
     double GetDuration() const; // in seconds
     AVRational GetVideoTimeBase() const;
+    AVRational GetAudioTimeBase() const;
     double GetVideoFrameRate() const; // fps
 
 private:
