@@ -40,8 +40,19 @@ void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) 
     m_height = height;
     m_srcFmt = srcFmt;
 
+    // Normalize deprecated JPEG-range formats to their standard equivalents.
+    // The actual range is communicated via sws_setColorspaceDetails below.
+    bool fullRange = false;
+    AVPixelFormat normalizedFmt = srcFmt;
+    switch (srcFmt) {
+        case AV_PIX_FMT_YUVJ420P: normalizedFmt = AV_PIX_FMT_YUV420P; fullRange = true; break;
+        case AV_PIX_FMT_YUVJ422P: normalizedFmt = AV_PIX_FMT_YUV422P; fullRange = true; break;
+        case AV_PIX_FMT_YUVJ444P: normalizedFmt = AV_PIX_FMT_YUV444P; fullRange = true; break;
+        default: break;
+    }
+
     m_swsCtx = sws_getContext(
-        width, height, srcFmt,
+        width, height, normalizedFmt,
         width, height, AV_PIX_FMT_RGBA,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
@@ -49,6 +60,15 @@ void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) 
     if (!m_swsCtx) {
         LOG_ERROR("sws_getContext failed");
         return;
+    }
+
+    // Set correct color range so sws_scale uses the right conversion matrix
+    if (fullRange) {
+        int srcRange = 1;  // full range
+        int dstRange = 1;
+        const int* inv_table = sws_getCoefficients(SWS_CS_DEFAULT);
+        const int* table = sws_getCoefficients(SWS_CS_DEFAULT);
+        sws_setColorspaceDetails(m_swsCtx, inv_table, srcRange, table, dstRange, 0, 1 << 16, 1 << 16);
     }
 
     int needed = av_image_get_buffer_size(AV_PIX_FMT_RGBA, width, height, 1);
