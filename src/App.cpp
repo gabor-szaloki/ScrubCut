@@ -30,12 +30,14 @@
 
 struct PlatformKeys {
     SDL_Keymod cmdMod;          // Cmd on Mac, Ctrl on Windows — for app commands (quit, export, open)
+    SDL_Keymod winMod;          // Ctrl on both — for window toggles (avoids system hotkey clashes)
     SDL_Keymod seekFineMod;     // Option on Mac, Ctrl on Windows — for 1s seeking
     SDL_Keymod frameStepMod;    // Alt on both — for frame stepping (+ cmdMod on Mac)
     SDL_Keymod jumpMod;         // Cmd on Mac, none on Windows (uses Home/End) — for jump to start/end
     bool frameStepNeedsCmd;     // true on Mac (Cmd+Option), false on Windows (Alt alone)
 
     const char* cmdName;        // "Cmd" / "Ctrl"
+    const char* winModName;     // "Ctrl" / "Ctrl"
     const char* seekFineName;   // "Option" / "Ctrl"
     const char* frameStepName;  // "Cmd + Option" / "Alt"
     const char* jumpName;       // "Cmd + Left / Right  or  Home / End" / "Home / End"
@@ -46,15 +48,15 @@ struct PlatformKeys {
 
 #ifdef __APPLE__
 static constexpr PlatformKeys kKeys = {
-    SDL_KMOD_GUI, SDL_KMOD_ALT, SDL_KMOD_ALT, SDL_KMOD_GUI, true,
-    "Cmd", "Option", "Cmd + Option",
+    SDL_KMOD_GUI, SDL_KMOD_CTRL, SDL_KMOD_ALT, SDL_KMOD_ALT, SDL_KMOD_GUI, true,
+    "Cmd", "Ctrl", "Option", "Cmd + Option",
     "Cmd + Left / Right  or  Home / End",
     "Backspace", "Cmd + Q", "Option"
 };
 #else
 static constexpr PlatformKeys kKeys = {
-    SDL_KMOD_CTRL, SDL_KMOD_CTRL, SDL_KMOD_ALT, SDL_Keymod(0), false,
-    "Ctrl", "Ctrl", "Alt",
+    SDL_KMOD_CTRL, SDL_KMOD_CTRL, SDL_KMOD_CTRL, SDL_KMOD_ALT, SDL_Keymod(0), false,
+    "Ctrl", "Ctrl", "Ctrl", "Alt",
     "Home / End",
     "Delete", "Alt+F4", "Alt"
 };
@@ -386,6 +388,7 @@ void App::ProcessEvents() {
             SDL_Keymod mod = event.key.mod;
             bool shift     = (mod & SDL_KMOD_SHIFT)      != 0;
             bool cmd       = (mod & kKeys.cmdMod)        != 0;
+            bool winMod    = (mod & kKeys.winMod)        != 0;
             bool seekFine  = (mod & kKeys.seekFineMod)   != 0;
             bool frameStep = (mod & kKeys.frameStepMod)  != 0 && (!kKeys.frameStepNeedsCmd || cmd);
             bool jump      = kKeys.jumpMod && (mod & kKeys.jumpMod) != 0 && !frameStep;
@@ -530,10 +533,10 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_T:
-                if (cmd) m_showTimeline = !m_showTimeline;
+                if (winMod) m_showTimeline = !m_showTimeline;
                 break;
             case SDLK_M:
-                if (cmd) {
+                if (winMod) {
                     m_showSegments = !m_showSegments;
                     if (!m_showSegments) m_segmentsClosedManually = true;
                 }
@@ -598,7 +601,8 @@ void App::Render() {
     {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         ImVec2 newSize = mvp->Size;
-        if (layoutCond != ImGuiCond_Always &&
+        if (!m_waitingForFullscreenExit && layoutCond != ImGuiCond_Always &&
+            newSize.x > 0 && newSize.y > 0 &&
             m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
             (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
 
@@ -638,6 +642,20 @@ void App::Render() {
             }
         }
         m_prevViewportSize = newSize;
+    }
+
+    // After fullscreen exit on macOS, wait for the viewport to settle at
+    // windowed size, then restore snapshot positions and suppress the
+    // proportional repositioning that would have fired from the size change.
+    if (m_waitingForFullscreenExit) {
+        ImVec2 vpSize = ImGui::GetMainViewport()->Size;
+        float expectedW = static_cast<float>(m_windowedW);
+        float expectedH = static_cast<float>(m_windowedH);
+        if (std::abs(vpSize.x - expectedW) < 2.0f && std::abs(vpSize.y - expectedH) < 2.0f) {
+            m_waitingForFullscreenExit = false;
+            RestoreFloatingWindowSnapshots();
+            m_prevViewportSize = vpSize;
+        }
     }
 
     // Keep UI visible while hovering any panel or menu (except the Viewport)
@@ -722,9 +740,9 @@ void App::Render() {
                 SetFullscreen(!m_fullscreen);
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Timeline", (std::string(kKeys.cmdName) + "+T").c_str(), m_showTimeline))
+            if (ImGui::MenuItem("Timeline", (std::string(kKeys.winModName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
-            if (ImGui::MenuItem("Marks", (std::string(kKeys.cmdName) + "+M").c_str(), m_showSegments)) {
+            if (ImGui::MenuItem("Marks", (std::string(kKeys.winModName) + "+M").c_str(), m_showSegments)) {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
             }
@@ -1612,8 +1630,8 @@ void App::Render() {
             row("Mark Frame",           "P");
             row("Remove last mark",     kKeys.deleteName);
             row("Export",               (std::string(kKeys.cmdName) + " + E").c_str());
-            row("Toggle timeline",     (std::string(kKeys.cmdName) + " + T").c_str());
-            row("Toggle marks",        (std::string(kKeys.cmdName) + " + M").c_str());
+            row("Toggle timeline",     (std::string(kKeys.winModName) + " + T").c_str());
+            row("Toggle marks",        (std::string(kKeys.winModName) + " + M").c_str());
             row("Quit",                 kKeys.quitShortcut);
             row("Precision scrub",      (std::string(kKeys.altKeyName) + " + drag timeline").c_str());
             row("Add mark on timeline",
@@ -2161,21 +2179,26 @@ void App::SetFullscreen(bool fullscreen) {
     // Snapshot / restore floating windows so repeated fullscreen toggles don't
     // accumulate rounding drift from proportional repositioning.
     if (fullscreen) {
-        auto snap = [](App::FloatingWindowSnap& s, const char* name) {
-            ImGuiWindow* w = ImGui::FindWindowByName(name);
-            if (!w || w->DockId != 0) { s.valid = false; return; }
-            s.pos = w->Pos;
-            s.size = w->SizeFull;
-            s.valid = true;
-        };
-        snap(m_snapTimeline, "Timeline");
-        snap(m_snapSegments, "Marks");
-        snap(m_snapHelp,     "Help");
+        // If we're re-entering fullscreen before the previous exit settled,
+        // keep the existing snapshots (they hold the correct windowed positions).
+        if (!m_waitingForFullscreenExit) {
+            auto snap = [](App::FloatingWindowSnap& s, const char* name) {
+                ImGuiWindow* w = ImGui::FindWindowByName(name);
+                if (!w || w->DockId != 0) { s.valid = false; return; }
+                s.pos = w->Pos;
+                s.size = w->SizeFull;
+                s.valid = true;
+            };
+            snap(m_snapTimeline, "Timeline");
+            snap(m_snapSegments, "Marks");
+            snap(m_snapHelp,     "Help");
+        }
+        m_waitingForFullscreenExit = false;
     } else {
-        RestoreFloatingWindowSnapshots();
-        // Bypass the next frame's proportional reposition — we just set the
-        // exact pre-fullscreen position/size.
-        m_prevViewportSize = ImVec2(0, 0);
+        // macOS animates the fullscreen exit — the viewport stays at
+        // fullscreen size during the animation, then snaps to windowed.
+        // Wait for that snap before restoring window positions.
+        m_waitingForFullscreenExit = true;
     }
 
 #ifdef _WIN32
