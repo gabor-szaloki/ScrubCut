@@ -52,17 +52,21 @@ vcpkg\bootstrap-vcpkg.bat
 Configure (downloads and builds dependencies via vcpkg on first run):
 
 ```bash
-cmake --preset default
+# Debug
+cmake --preset debug
+
+# Release
+cmake --preset release
 ```
 
 Build:
 
 ```bash
-# Release
-cmake --build --preset release
-
 # Debug
 cmake --build --preset debug
+
+# Release
+cmake --build --preset release
 ```
 
 The executable is at `build/release/bin/ScrubCut[.exe]` (or `build/debug/bin/` for the debug build). On macOS this is a bare binary — see [Packaging](#packaging) to produce a `.app` bundle.
