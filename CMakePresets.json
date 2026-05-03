@@ -6,8 +6,7 @@
       "binaryDir": "${sourceDir}/build/debug",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_INSTALL_PREFIX": "C:/Program Files/ScrubCut"
+        "CMAKE_BUILD_TYPE": "Debug"
       }
     },
     {
@@ -15,8 +14,7 @@
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_INSTALL_PREFIX": "C:/Program Files/ScrubCut"
+        "CMAKE_BUILD_TYPE": "Release"
       }
     }
   ],

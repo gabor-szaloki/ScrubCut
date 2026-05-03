@@ -39,7 +39,7 @@
             "group": "build",
             "problemMatcher": "$msCompile",
             "osx": {
-                "command": "cmake --build --preset release && cmake --install build/release --prefix /Applications"
+                "command": "cmake --build --preset release && cmake --install build/release"
             }
         }
     ]
