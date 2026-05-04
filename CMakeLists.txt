@@ -49,7 +49,6 @@ add_custom_target(generate_version
         -DOUTPUT_FILE=${_VERSION_HEADER}
         -P ${CMAKE_SOURCE_DIR}/cmake/GenerateVersion.cmake
     BYPRODUCTS ${_VERSION_HEADER}
-    COMMENT "Generating scrubcut_version.h"
     VERBATIM
 )
 add_dependencies(ScrubCut generate_version)
