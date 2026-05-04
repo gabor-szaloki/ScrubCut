@@ -29,6 +29,21 @@ bool Player::Open(const std::string& path) {
     if (!m_videoDecoder.Open(m_demuxer.GetVideoCodecParams()))
         return false;
 
+    m_chapters.clear();
+    if (AVFormatContext* fmt = m_demuxer.GetFormatContext()) {
+        m_chapters.reserve(fmt->nb_chapters);
+        for (unsigned i = 0; i < fmt->nb_chapters; ++i) {
+            AVChapter* c = fmt->chapters[i];
+            double tb = av_q2d(c->time_base);
+            Chapter ch;
+            ch.startSec = c->start * tb;
+            ch.endSec   = c->end   * tb;
+            AVDictionaryEntry* t = av_dict_get(c->metadata, "title", nullptr, 0);
+            if (t && t->value) ch.title = t->value;
+            m_chapters.push_back(std::move(ch));
+        }
+    }
+
     // Independent demuxer + decoder for backward-step cache population.
     // Failure here is non-fatal — caching just falls back to no-op and
     // backward stepping does a full re-seek per step like before.
@@ -117,6 +132,7 @@ void Player::Close() {
     m_eof = false;
     m_lastDisplayedPts = AV_NOPTS_VALUE;
     m_hasCachedFrame = false;
+    m_chapters.clear();
 }
 
 void Player::Play() {

@@ -9,6 +9,7 @@
 #include "core/PacketQueue.h"
 #include "core/FrameQueue.h"
 #include "core/FrameCache.h"
+#include "util/Types.h"
 
 #include <thread>
 #include <atomic>
@@ -68,6 +69,8 @@ public:
     const char* GetVideoCodecName() const;
     int64_t GetBitRate() const;
     int64_t GetFileSize() const;
+
+    const std::vector<Chapter>& GetChapters() const { return m_chapters; }
 
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
@@ -181,6 +184,9 @@ private:
     Demuxer m_cacheDemuxer;
     VideoDecoder m_cacheDecoder;
     FrameConverter m_cacheConverter;
+
+    // Read-only chapter metadata extracted from the source file at Open().
+    std::vector<Chapter> m_chapters;
 
     PacketQueue m_videoPacketQueue{64};
     PacketQueue m_audioPacketQueue{64};

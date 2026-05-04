@@ -22,6 +22,12 @@ struct FrameMark {
     uint64_t addSeq = 0;
 };
 
+struct Chapter {
+    double startSec = 0.0;
+    double endSec   = 0.0;
+    std::string title;
+};
+
 struct ExportSettings {
     std::string outputPath;
     std::vector<TimeRange> segments;

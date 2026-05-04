@@ -81,6 +81,7 @@ Launch the app and drag-and-drop a video file onto the window, or press **Ctrl/C
 | Frame step                  | Alt + Left / Right  or  , / .        | Cmd + Option + Left / Right  or  , / .      |
 | Speed up / down             | + / -                                | + / -                                       |
 | Jump to start / end         | Home / End                           | Cmd + Left / Right  or  Home / End          |
+| Prev / next chapter         | J / K                                | J / K                                       |
 | Mark In                     | I  or  [                             | I  or  [                                    |
 | Mark Out                    | O  or  ]                             | O  or  ]                                    |
 | Mark Frame                  | P                                    | P                                           |

@@ -169,6 +169,7 @@ bool App::Init() {
     m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
 
     // Preferences always load
+    m_showChapters = m_prefSettings.GetBool("show_chapters", true);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
@@ -275,6 +276,7 @@ void App::Shutdown() {
         m_layoutSettings.SetBool("show_segments", m_showSegments);
         m_layoutSettings.Save();
 
+        m_prefSettings.SetBool("show_chapters", m_showChapters);
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
@@ -430,6 +432,37 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 m_player.SeekTo(m_player.GetDuration());
                 break;
+            case SDLK_J: {
+                if (!noMod) break;
+                const auto& chs = m_player.GetChapters();
+                if (chs.empty()) break;
+                double now_t = m_player.GetPlaybackTime();
+                // Largest startSec strictly less than (now - epsilon) so a
+                // second press steps back even when slightly past a boundary.
+                const double eps = 0.25;
+                double target = -1.0;
+                for (const auto& c : chs) {
+                    if (c.startSec < now_t - eps && c.startSec > target)
+                        target = c.startSec;
+                }
+                if (target < 0.0) target = 0.0; // before first chapter → jump to start
+                m_player.SeekTo(target);
+                break;
+            }
+            case SDLK_K: {
+                if (!noMod) break;
+                const auto& chs = m_player.GetChapters();
+                if (chs.empty()) break;
+                double now_t = m_player.GetPlaybackTime();
+                const double eps = 0.05;
+                double target = -1.0;
+                for (const auto& c : chs) {
+                    if (c.startSec > now_t + eps && (target < 0.0 || c.startSec < target))
+                        target = c.startSec;
+                }
+                if (target >= 0.0) m_player.SeekTo(target);
+                break;
+            }
             case SDLK_EQUALS: // + key (= without shift, + with shift)
             case SDLK_KP_PLUS: {
                 if (cmd) break;
@@ -753,6 +786,8 @@ void App::Render() {
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str(), m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
             ImGui::Separator();
+            if (ImGui::MenuItem("Show Chapters", nullptr, m_showChapters))
+                m_showChapters = !m_showChapters;
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
                 m_showTooltips = !m_showTooltips;
 #ifdef _WIN32
@@ -854,7 +889,7 @@ void App::Render() {
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float dpi = m_ui.GetDpiScale();
     float tlPad = 40.0f * dpi;
-    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1000.0f * dpi);
+    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1100.0f * dpi);
     float tlHeight = 110.0f * dpi;
     ImGui::SetNextWindowPos(
         ImVec2(vp->WorkPos.x + (vp->WorkSize.x - tlWidth) * 0.5f, vp->WorkPos.y + vp->WorkSize.y - tlHeight - tlPad),
@@ -896,10 +931,10 @@ void App::Render() {
         const char* playLabel = m_player.IsPlaying() ? "Pause" : "Play";
         const float playBtnW = std::max(btnW("Play"), btnW("Pause"));
         float transportWidth =
-            btnW("|<") + btnW("<<30") + btnW("<<5") + btnW("<<1") +
+            btnW("|<") + btnW("<|<") + btnW("<<30") + btnW("<<5") + btnW("<<1") +
             btnW("<") + playBtnW + btnW(">") +
-            btnW("1>>") + btnW("5>>") + btnW("30>>") + btnW(">|") +
-            10 * sp;
+            btnW("1>>") + btnW("5>>") + btnW("30>>") + btnW(">|>") + btnW(">|") +
+            12 * sp;
         float transportStart = (panelWidth - transportWidth) * 0.5f;
         ImGui::SameLine(transportStart > 0 ? transportStart : 0);
 
@@ -907,8 +942,25 @@ void App::Render() {
         std::string nextFrameSc = std::string(kKeys.frameStepName) + " + Right  or  .";
         std::string back1Sc     = std::string(kKeys.seekFineName)  + " + Left";
         std::string fwd1Sc      = std::string(kKeys.seekFineName)  + " + Right";
+        const auto& chs = m_player.GetChapters();
+        bool hasChapters = !chs.empty();
         if (ImGui::Button("|<")) { m_player.SeekTo(0.0); }
         TooltipFor("Jump to start", "Home");
+        ImGui::SameLine();
+        if (!hasChapters) ImGui::BeginDisabled();
+        if (ImGui::Button("<|<")) {
+            double now_t = m_player.GetPlaybackTime();
+            const double eps = 0.25;
+            double target = -1.0;
+            for (const auto& c : chs) {
+                if (c.startSec < now_t - eps && c.startSec > target)
+                    target = c.startSec;
+            }
+            if (target < 0.0) target = 0.0;
+            m_player.SeekTo(target);
+        }
+        if (!hasChapters) ImGui::EndDisabled();
+        TooltipFor("Previous chapter", "J");
         ImGui::SameLine();
         if (ImGui::Button("<<30")) { m_player.SeekRelative(-30.0); }
         TooltipFor("Back 30s", "Shift + Left");
@@ -938,6 +990,20 @@ void App::Render() {
         ImGui::SameLine();
         if (ImGui::Button("30>>")) { m_player.SeekRelative(30.0); }
         TooltipFor("Forward 30s", "Shift + Right");
+        ImGui::SameLine();
+        if (!hasChapters) ImGui::BeginDisabled();
+        if (ImGui::Button(">|>")) {
+            double now_t = m_player.GetPlaybackTime();
+            const double eps = 0.05;
+            double target = -1.0;
+            for (const auto& c : chs) {
+                if (c.startSec > now_t + eps && (target < 0.0 || c.startSec < target))
+                    target = c.startSec;
+            }
+            if (target >= 0.0) m_player.SeekTo(target);
+        }
+        if (!hasChapters) ImGui::EndDisabled();
+        TooltipFor("Next chapter", "K");
         ImGui::SameLine();
         if (ImGui::Button(">|")) { m_player.SeekTo(duration); }
         TooltipFor("Jump to end", "End");
@@ -1031,15 +1097,66 @@ void App::Render() {
             return IM_COL32(r, g, b, static_cast<int>(a * m_uiAlpha));
         };
 
-        // Background (matches ImGui's FrameBg color)
+        ImVec2 mousePos = ImGui::GetIO().MousePos;
+
+        // Background — single rect when the file has no chapters, or one rect
+        // per chapter (with a small gap between) when it does. The hovered
+        // chapter region brightens slightly and shows a tooltip with the title.
         ImVec4 frameBg = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
-        drawList->AddRectFilled(barPos, ImVec2(barPos.x + barWidth, barPos.y + barHeight),
-                                IM_COL32(static_cast<int>(frameBg.x * 255), static_cast<int>(frameBg.y * 255),
-                                         static_cast<int>(frameBg.z * 255), static_cast<int>(frameBg.w * 255 * m_uiAlpha)));
+        ImU32 bgCol = IM_COL32(static_cast<int>(frameBg.x * 255), static_cast<int>(frameBg.y * 255),
+                               static_cast<int>(frameBg.z * 255), static_cast<int>(frameBg.w * 255 * m_uiAlpha));
+        const auto& chapters = m_player.GetChapters();
+        int hoveredChapter = -1;
+        bool hoveredChapterOverflows = false;
+        if (duration > 0.0 && !chapters.empty() && m_showChapters) {
+            const float kChapGap = 2.0f;
+            bool overBar = mousePos.y >= barPos.y && mousePos.y <= barPos.y + barHeight;
+            for (int i = 0; i < static_cast<int>(chapters.size()); i++) {
+                float x0 = barPos.x + static_cast<float>(chapters[i].startSec / duration) * barWidth;
+                float x1 = barPos.x + static_cast<float>(chapters[i].endSec   / duration) * barWidth;
+                if (i + 1 < static_cast<int>(chapters.size())) x1 -= kChapGap;
+                if (x1 <= x0) continue;
+                bool hovered = overBar && mousePos.x >= x0 && mousePos.x <= x1;
+                if (hovered) hoveredChapter = i;
+                drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), bgCol);
+                if (hovered) {
+                    drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight),
+                                            IM_COL32(255, 255, 255, static_cast<int>(12 * m_uiAlpha)));
+                }
+
+                // Chapter title drawn inside the rect, clipped so long titles
+                // don't bleed into the next chapter. Falls back to "Chapter N"
+                // when the file's chapter has no title set.
+                char fallback[32];
+                const char* label = chapters[i].title.empty()
+                    ? (snprintf(fallback, sizeof(fallback), "Chapter %d", i + 1), fallback)
+                    : chapters[i].title.c_str();
+                const float labelPadX = 6.0f;
+                ImVec2 textSize = ImGui::CalcTextSize(label);
+                float textY = barPos.y + (barHeight - textSize.y) * 0.5f;
+                int textAlpha = static_cast<int>((hovered ? 230 : 160) * m_uiAlpha);
+                ImU32 textCol = IM_COL32(255, 255, 255, textAlpha);
+                float availTextW = (x1 - 2.0f) - (x0 + labelPadX);
+                if (hovered && textSize.x > availTextW)
+                    hoveredChapterOverflows = true;
+                drawList->PushClipRect(ImVec2(x0 + 2.0f, barPos.y),
+                                       ImVec2(x1 - 2.0f, barPos.y + barHeight), true);
+                drawList->AddText(ImVec2(x0 + labelPadX, textY), textCol, label);
+                drawList->PopClipRect();
+            }
+            if (hoveredChapter >= 0 && hoveredChapterOverflows) {
+                const Chapter& ch = chapters[hoveredChapter];
+                if (!ch.title.empty())
+                    ImGui::SetTooltip("%s", ch.title.c_str());
+                else
+                    ImGui::SetTooltip("Chapter %d", hoveredChapter + 1);
+            }
+        } else {
+            drawList->AddRectFilled(barPos, ImVec2(barPos.x + barWidth, barPos.y + barHeight), bgCol);
+        }
 
         // Segments
         const auto& segs = m_segments.GetSegments();
-        ImVec2 mousePos = ImGui::GetIO().MousePos;
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
             float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
@@ -1651,6 +1768,7 @@ void App::Render() {
             row("Frame step",           (std::string(kKeys.frameStepName) + " + Left / Right  or  , / .").c_str());
             row("Speed up / down",      "+ / -");
             row("Jump to start / end",  kKeys.jumpName);
+            row("Prev / next chapter",  "J / K");
             row("Mark In",              "I  or  [");
             row("Mark Out",             "O  or  ]");
             row("Mark Frame",           "P");
