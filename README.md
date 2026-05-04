@@ -66,6 +66,16 @@ Notes:
 - Packaging requires [NSIS](https://nsis.sourceforge.io/) on Windows (`winget install NSIS.NSIS`).
 - The Windows installer registers ScrubCut as an "Open with" handler for common video extensions; the macOS DMG includes a drag-to-`/Applications` shortcut.
 
+### macOS first-launch warning
+
+The `.app` inside the DMG is ad-hoc codesigned (no Apple Developer ID, not notarized). When you launch ScrubCut from `/Applications` for the first time, macOS Gatekeeper will show **"ScrubCut Not Opened — Apple could not verify ScrubCut is free of malware..."**. Two ways to get past it (both are one-time per install):
+
+- **Terminal** — strip the quarantine attribute, then launch normally:
+  ```
+  xattr -dr com.apple.quarantine /Applications/ScrubCut.app
+  ```
+- **System Settings** — dismiss the warning dialog, then open **System Settings → Privacy & Security**, scroll to the bottom: there'll be a *"ScrubCut was blocked… Open Anyway"* entry. Click it and confirm. macOS remembers the approval.
+
 ## Usage
 
 Launch the app and drag-and-drop a video file onto the window, or press **Ctrl/Cmd + O** to open one via a file dialog.
