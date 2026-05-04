@@ -3,6 +3,7 @@
 #include "util/Trace.h"
 #include "util/CommandLine.h"
 #include "util/AppPaths.h"
+#include "scrubcut_version.h"
 
 #include "stb/stb_image_write.h"
 
@@ -789,6 +790,22 @@ void App::Render() {
             }
             ImGui::EndMenu();
         }
+
+        // Version string at right edge of the menu bar
+        {
+            char verBuf[64];
+            snprintf(verBuf, sizeof(verBuf), "v%s - %s%s",
+                     SCRUBCUT_VERSION, SCRUBCUT_GIT_HASH,
+                     SCRUBCUT_GIT_DIRTY ? "*" : "");
+            float w = ImGui::CalcTextSize(verBuf).x;
+            float avail = ImGui::GetContentRegionAvail().x;
+            float pad = ImGui::GetStyle().ItemSpacing.x;
+            if (avail > w + pad) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - w - pad);
+                ImGui::TextDisabled("%s", verBuf);
+            }
+        }
+
         ImGui::EndMainMenuBar();
     }
     if (showMenuBar) {

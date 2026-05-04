@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(ScrubCut VERSION 0.1.0 LANGUAGES CXX)
+project(ScrubCut VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,10 +38,26 @@ endif()
 
 add_executable(ScrubCut WIN32 ${SOURCES} ${APP_ICON_RC})
 
+# --- Generated version header (project version + git hash/dirty flag) ---
+set(_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+set(_VERSION_HEADER "${_GENERATED_DIR}/scrubcut_version.h")
+file(MAKE_DIRECTORY "${_GENERATED_DIR}")
+add_custom_target(generate_version
+    COMMAND ${CMAKE_COMMAND}
+        -DPROJECT_VERSION=${PROJECT_VERSION}
+        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+        -DOUTPUT_FILE=${_VERSION_HEADER}
+        -P ${CMAKE_SOURCE_DIR}/cmake/GenerateVersion.cmake
+    BYPRODUCTS ${_VERSION_HEADER}
+    COMMENT "Generating scrubcut_version.h"
+    VERBATIM
+)
+add_dependencies(ScrubCut generate_version)
 
 target_include_directories(ScrubCut PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party
+    ${_GENERATED_DIR}
     ${FFMPEG_INCLUDE_DIRS}
 )
 
@@ -118,9 +134,17 @@ if(WIN32)
 
     include(CPack)
 elseif(APPLE)
+    # Configure Info.plist with the current PROJECT_VERSION so we don't have to
+    # bump the version in two places.
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist.in"
+        "${CMAKE_BINARY_DIR}/Info.plist"
+        @ONLY
+    )
+
     # Package as .app bundle at install time
     install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
-    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist" DESTINATION "ScrubCut.app/Contents")
+    install(FILES "${CMAKE_BINARY_DIR}/Info.plist" DESTINATION "ScrubCut.app/Contents")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
     install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
 
