@@ -555,10 +555,13 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_H:
-                if (!noMod) break;
-                if (!m_autoHideUI) {
-                    m_uiHidden = !m_uiHidden;
-                    m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
+                if (winMod) {
+                    m_showHelpPanel = !m_showHelpPanel;
+                } else if (noMod) {
+                    if (!m_autoHideUI) {
+                        m_uiHidden = !m_uiHidden;
+                        m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
+                    }
                 }
                 break;
             case SDLK_Q:
@@ -746,7 +749,7 @@ void App::Render() {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
             }
-            if (ImGui::MenuItem("Help", "?", m_showHelpPanel))
+            if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str(), m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
             ImGui::Separator();
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
@@ -781,7 +784,7 @@ void App::Render() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
-            if (ImGui::MenuItem("Help", "?")) {
+            if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str())) {
                 m_showHelpPanel = !m_showHelpPanel;
             }
             ImGui::EndMenu();
@@ -1636,7 +1639,7 @@ void App::Render() {
             row("Precision scrub",      (std::string(kKeys.altKeyName) + " + drag timeline").c_str());
             row("Add mark on timeline",
                 (std::string(kKeys.cmdName) + " + click (frame) / drag (segment)").c_str());
-            row("Toggle help",          "?");
+            row("Toggle help",         (std::string(kKeys.winModName) + " + H  or  ?").c_str());
 
             ImGui::EndTable();
         }

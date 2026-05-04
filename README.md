@@ -72,32 +72,30 @@ Launch the app and drag-and-drop a video file onto the window, or press **Ctrl/C
 
 ### Keyboard shortcuts
 
-Where two modifiers are shown separated by `/`, the first is Windows and the second is macOS.
-
-| Action                      | Hotkey                                      |
-|-----------------------------|---------------------------------------------|
-| Play / Pause                | Space                                       |
-| Seek +/- 5s                 | Left / Right                                |
-| Seek +/- 1s                 | Ctrl/Option + Left / Right                  |
-| Seek +/- 30s                | Shift + Left / Right                        |
-| Frame step                  | Alt/Cmd+Option + Left / Right  or  , / .    |
-| Speed up / down             | + / -                                       |
-| Jump to start / end         | Home / End  (also Cmd + Left / Right on macOS) |
-| Mark In                     | I  or  [                                    |
-| Mark Out                    | O  or  ]                                    |
-| Mark Frame                  | P                                           |
-| Remove last mark            | Delete / Backspace                          |
-| Open file                   | Ctrl/Cmd + O                                |
-| Export                      | Ctrl/Cmd + E                                |
-| Toggle timeline panel       | Ctrl/Cmd + T                                |
-| Toggle marks panel          | Ctrl/Cmd + M                                |
-| Toggle fullscreen           | F                                           |
-| Toggle UI visibility        | H                                           |
-| Exit fullscreen / show UI   | Esc                                         |
-| Quit                        | Alt+F4 / Cmd + Q                            |
-| Toggle help                 | ?                                           |
-| Precision scrub             | Alt + drag timeline (0.1× sensitivity)      |
-| Add mark on timeline        | Ctrl + click (frame) / drag (segment)       |
+| Action                      | Windows                              | macOS                                       |
+|-----------------------------|--------------------------------------|---------------------------------------------|
+| Play / Pause                | Space                                | Space                                       |
+| Seek +/- 5s                 | Left / Right                         | Left / Right                                |
+| Seek +/- 1s                 | Ctrl + Left / Right                  | Option + Left / Right                       |
+| Seek +/- 30s                | Shift + Left / Right                 | Shift + Left / Right                        |
+| Frame step                  | Alt + Left / Right  or  , / .        | Cmd + Option + Left / Right  or  , / .      |
+| Speed up / down             | + / -                                | + / -                                       |
+| Jump to start / end         | Home / End                           | Cmd + Left / Right  or  Home / End          |
+| Mark In                     | I  or  [                             | I  or  [                                    |
+| Mark Out                    | O  or  ]                             | O  or  ]                                    |
+| Mark Frame                  | P                                    | P                                           |
+| Remove last mark            | Delete  or  Backspace                | Delete  or  Backspace                       |
+| Open file                   | Ctrl + O                             | Cmd + O                                     |
+| Export                      | Ctrl + E                             | Cmd + E                                     |
+| Toggle timeline panel       | Ctrl + T                             | Ctrl + T                                    |
+| Toggle marks panel          | Ctrl + M                             | Ctrl + M                                    |
+| Toggle fullscreen           | F                                    | F                                           |
+| Toggle UI visibility        | H                                    | H                                           |
+| Exit fullscreen / show UI   | Esc                                  | Esc                                         |
+| Quit                        | Alt + F4                             | Cmd + Q                                     |
+| Toggle help                 | Ctrl + H  or  ?                      | Ctrl + H  or  ?                             |
+| Precision scrub             | Alt + drag timeline (0.1× sensitivity) | Option + drag timeline (0.1× sensitivity) |
+| Add mark on timeline        | Ctrl + click (frame) / drag (segment) | Ctrl + click (frame) / drag (segment)      |
 
 ### Command-line flags
 
