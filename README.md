@@ -47,51 +47,24 @@ vcpkg\bootstrap-vcpkg.bat
 ./vcpkg/bootstrap-vcpkg.sh
 ```
 
-## Build
+## Build, install, package
 
-Configure (downloads and builds dependencies via vcpkg on first run):
+The same four commands work on both platforms — each platform's tooling produces its native artifact.
 
-```bash
-# Debug
-cmake --preset debug
+| Step       | Command (from project root)                  | Windows result                                         | macOS result                                                |
+|------------|----------------------------------------------|--------------------------------------------------------|-------------------------------------------------------------|
+| Configure  | `cmake --preset release`                     | configures `build/release/`                            | configures `build/release/`                                 |
+| Build      | `cmake --build --preset release`             | exe in `build/release/bin/`                            | binary in `build/release/bin/`                              |
+| Install    | `cmake --install build/release`              | `C:/Program Files/ScrubCut/` (admin)                   | `/Applications/ScrubCut.app` (signed)                       |
+| Package    | `cpack --config build/release/CPackConfig.cmake` | `build/release/ScrubCut-<version>-win64.exe`     | `build/release/ScrubCut-<version>-mac.dmg`                  |
 
-# Release
-cmake --preset release
-```
+Notes:
 
-Build:
-
-```bash
-# Debug
-cmake --build --preset debug
-
-# Release
-cmake --build --preset release
-```
-
-The executable is at `build/release/bin/ScrubCut[.exe]` (or `build/debug/bin/` for the debug build). On macOS this is a bare binary — see [Packaging](#packaging) to produce a `.app` bundle.
-
-## Packaging
-
-### Windows installer (NSIS)
-
-Install [NSIS](https://nsis.sourceforge.io/) (`winget install NSIS.NSIS`), then from the configured build dir:
-
-```bash
-cpack -G NSIS --config build/release/CPackConfig.cmake -B build/release
-```
-
-This produces `build/release/ScrubCut-<version>-win64.exe`, which installs ScrubCut, bundled DLLs, a desktop shortcut, and registers the app as an "Open with" handler for common video extensions.
-
-### macOS .app bundle
-
-The `.app` is produced by the **install** step, not a plain build:
-
-```bash
-cmake --install build/release --prefix <output-dir>
-```
-
-`<output-dir>/ScrubCut.app` can be dragged to `/Applications`. The bundle is ad-hoc codesigned (runs locally without a developer certificate), so Gatekeeper will show a first-launch warning. No DMG is produced.
+- For a debug build, swap `release` → `debug` in the configure and build commands.
+- On Windows, install requires admin privileges and bundles vcpkg DLLs alongside the exe.
+- On macOS, install creates an ad-hoc codesigned `.app` bundle. Gatekeeper will show a first-launch warning since there's no Developer ID signature.
+- Packaging requires [NSIS](https://nsis.sourceforge.io/) on Windows (`winget install NSIS.NSIS`).
+- The Windows installer registers ScrubCut as an "Open with" handler for common video extensions; the macOS DMG includes a drag-to-`/Applications` shortcut.
 
 ## Usage
 

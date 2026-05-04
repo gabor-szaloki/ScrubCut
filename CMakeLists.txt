@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Default install prefix per platform
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-    if(APPLE)
-        set(CMAKE_INSTALL_PREFIX "/Applications" CACHE PATH "" FORCE)
-    elseif(WIN32)
+    if(WIN32)
         set(CMAKE_INSTALL_PREFIX "C:/Program Files/ScrubCut" CACHE PATH "" FORCE)
+    elseif(APPLE)
+        set(CMAKE_INSTALL_PREFIX "/Applications" CACHE PATH "" FORCE)
     endif()
 endif()
 
@@ -58,13 +58,14 @@ if(WIN32)
 endif()
 
 # --- Install ---
-if(APPLE)
-    # Package as .app bundle at install time
-    install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
-    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist" DESTINATION "ScrubCut.app/Contents")
-    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
-    install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
-elseif(WIN32)
+
+# Common CPack metadata
+set(CPACK_PACKAGE_NAME "ScrubCut")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VENDOR "Gabor Szaloki")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast video scrubbing, trimming, and exporting")
+
+if(WIN32)
     install(TARGETS ScrubCut RUNTIME DESTINATION ".")
 
     # Bundle vcpkg DLLs (FFmpeg, SDL3)
@@ -78,12 +79,9 @@ elseif(WIN32)
 
     # --- CPack / NSIS installer ---
     set(CPACK_GENERATOR "NSIS")
-    set(CPACK_PACKAGE_NAME "ScrubCut")
-    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-    set(CPACK_PACKAGE_VENDOR "Gabor Szaloki")
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast video scrubbing, trimming, and exporting")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    set(CPACK_PACKAGE_FILE_NAME "ScrubCut-${PROJECT_VERSION}-win64")
     set(CPACK_PACKAGE_INSTALL_DIRECTORY "ScrubCut")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
     # Icons
     set(CPACK_NSIS_MUI_ICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
     set(CPACK_NSIS_MUI_UNIICON "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico")
@@ -117,6 +115,21 @@ elseif(WIN32)
 
     set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS "${_NSIS_REG_INSTALL}")
     set(CPACK_NSIS_EXTRA_UNINSTALL_COMMANDS "${_NSIS_REG_UNINSTALL}")
+
+    include(CPack)
+elseif(APPLE)
+    # Package as .app bundle at install time
+    install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
+    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/Info.plist" DESTINATION "ScrubCut.app/Contents")
+    install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
+    install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
+
+    # --- CPack / DragNDrop DMG ---
+    set(CPACK_GENERATOR "DragNDrop")
+    set(CPACK_PACKAGE_FILE_NAME "ScrubCut-${PROJECT_VERSION}-mac")
+    set(CPACK_DMG_VOLUME_NAME "ScrubCut ${PROJECT_VERSION}")
+    # Stage the .app at the DMG root (no install prefix prepended)
+    set(CPACK_PACKAGING_INSTALL_PREFIX "/")
 
     include(CPack)
 endif()
