@@ -1282,7 +1282,13 @@ void App::Render() {
 
         if (ImGui::IsItemActive() && !handleActive) {
             float mouseX = ImGui::GetIO().MousePos.x - barPos.x;
-            double initial = static_cast<double>(mouseX / barWidth) * duration;
+            // Alt-click: anchor at the current playhead instead of jumping to
+            // the click position. Lets the user release/re-click while
+            // precision-scrubbing without disrupting the timeline.
+            bool altHeld = (ImGui::GetIO().KeyMods & ImGuiMod_Alt) != 0;
+            double initial = altHeld
+                ? m_seekTarget
+                : static_cast<double>(mouseX / barWidth) * duration;
             double clickTime = ComputeScrubTarget(mouseX, barWidth, duration,
                                                   initial, ImGui::IsItemActivated());
             clickTime = std::max(0.0, std::min(clickTime, duration));
