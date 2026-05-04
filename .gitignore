@@ -2,6 +2,7 @@
 build/
 out/
 cmake-build-*/
+_CPack_Packages/
 
 
 # IDE
