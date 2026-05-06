@@ -573,8 +573,25 @@ void App::ProcessEvents() {
                 if (winMod) {
                     m_showSegments = !m_showSegments;
                     if (!m_showSegments) m_segmentsClosedManually = true;
+                } else if (noMod) {
+                    m_player.SetMuted(!m_player.IsMuted());
                 }
                 break;
+            case SDLK_UP:
+            case SDLK_DOWN: {
+                if (!noMod) break;
+                // Step volume in 10% increments, snapped to a clean grid so a
+                // slider position like 0.77 lands on 0.8/0.7 rather than 0.87/0.67.
+                float v = m_player.GetVolume();
+                float snapped = std::round(v * 10.0f) / 10.0f;
+                float step = (event.key.key == SDLK_UP) ? 0.1f : -0.1f;
+                m_player.SetVolume(std::clamp(snapped + step, 0.0f, 1.0f));
+                // Bumping volume up should also unmute, matching the slider's
+                // existing behaviour. Down doesn't unmute.
+                if (event.key.key == SDLK_UP && m_player.IsMuted())
+                    m_player.SetMuted(false);
+                break;
+            }
             case SDLK_F:
                 if (!noMod) break;
                 SetFullscreen(!m_fullscreen);
@@ -1767,6 +1784,8 @@ void App::Render() {
             row("Seek +/- 30s",         "Shift + Left / Right");
             row("Frame step",           (std::string(kKeys.frameStepName) + " + Left / Right  or  , / .").c_str());
             row("Speed up / down",      "+ / -");
+            row("Volume up / down",     "Up / Down");
+            row("Mute / unmute",        "M");
             row("Jump to start / end",  kKeys.jumpName);
             row("Prev / next chapter",  "J / K");
             row("Mark In",              "I  or  [");
