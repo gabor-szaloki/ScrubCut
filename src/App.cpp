@@ -176,6 +176,12 @@ bool App::Init() {
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
     m_player.SetMuted(m_prefSettings.GetBool("muted", false));
+    m_exportDirMode = static_cast<ExportDirMode>(
+        std::clamp(m_prefSettings.GetInt("export_dir_mode", 0), 0, 1));
+    {
+        std::string customDir = m_prefSettings.GetString("export_custom_dir", "");
+        snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", customDir.c_str());
+    }
 
     // Apply initial DPI scale to the UI (1.0 unless DPI scaling is enabled on Windows).
     m_ui.SetDpiScale(GetEffectiveDpiScale());
@@ -283,6 +289,8 @@ void App::Shutdown() {
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
         m_prefSettings.SetFloat("volume", m_player.GetVolume());
         m_prefSettings.SetBool("muted", m_player.IsMuted());
+        m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
+        m_prefSettings.SetString("export_custom_dir", m_exportCustomDir);
         m_prefSettings.Save();
     }
     SDL_ShowCursor();
@@ -559,9 +567,8 @@ void App::ProcessEvents() {
             case SDLK_E:
                 if (cmd && m_segments.GetTotalCount() > 0 && !m_exporter.IsRunning()) {
                     m_showExportDialog = true;
-                    auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
                     auto stem = std::filesystem::path(m_currentFilePath).stem().string();
-                    snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+                    InitExportDir();
                     snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
                     m_pendingExport = ExportSettings{};
                 }
@@ -773,9 +780,8 @@ void App::Render() {
                                 false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
                 m_showExportDialog = true;
                 // Pre-fill defaults
-                auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
                 auto stem = std::filesystem::path(m_currentFilePath).stem().string();
-                snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+                InitExportDir();
                 snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
                 m_pendingExport = ExportSettings{};
             }
@@ -1743,9 +1749,8 @@ void App::Render() {
     float btnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
     if (ImGui::Button("Export", ImVec2(btnWidth, 0))) {
         m_showExportDialog = true;
-        auto dir = std::filesystem::path(m_currentFilePath).parent_path().string();
         auto stem = std::filesystem::path(m_currentFilePath).stem().string();
-        snprintf(m_exportDir, sizeof(m_exportDir), "%s", dir.c_str());
+        InitExportDir();
         snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
         m_pendingExport = ExportSettings{};
     }
@@ -1860,15 +1865,38 @@ void App::Render() {
         if (!progress.running && !progress.finished && !progress.error) {
             // --- Settings form ---
             const float dialogWidth = 600.0f;
+
+            // Output directory mode: same-as-video vs custom (persistent path).
             ImGui::Text("Output Directory:");
+            const char* modeLabels[] = { "Same as opened video", "Custom" };
+            int modeIdx = static_cast<int>(m_exportDirMode);
+            if (ImGui::RadioButton(modeLabels[0], &modeIdx, 0)) {
+                // SameAsVideo: re-derive from current video, ignore custom dir.
+                m_exportDirMode = ExportDirMode::SameAsVideo;
+                InitExportDir();
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton(modeLabels[1], &modeIdx, 1)) {
+                m_exportDirMode = ExportDirMode::Custom;
+                InitExportDir();
+            }
+
             float padX = ImGui::GetStyle().FramePadding.x * 2;
             float dirSpacing = ImGui::GetStyle().ItemSpacing.x;
             float browseW = ImGui::CalcTextSize("Browse").x + padX;
             float openW = ImGui::CalcTextSize("Open").x + padX;
+            bool sameAsVideo = (m_exportDirMode == ExportDirMode::SameAsVideo);
+
+            if (sameAsVideo) ImGui::BeginDisabled();
             ImGui::SetNextItemWidth(dialogWidth - browseW - openW - dirSpacing * 2);
             ImGui::InputText("##dir", m_exportDir, sizeof(m_exportDir));
             ImGui::SameLine();
             if (ImGui::Button("Browse")) {
+                // SDL's folder picker is async: the callback fires later
+                // when the user confirms. The InputText above is the
+                // (sync) target buffer — Browse just hands SDL a pointer.
+                // We sync m_exportDir → m_exportCustomDir each frame below,
+                // which catches both typed edits and Browse results.
                 SDL_ShowOpenFolderDialog([](void* userdata, const char* const* filelist, int) {
                     if (filelist && filelist[0]) {
                         char* dst = static_cast<char*>(userdata);
@@ -1876,6 +1904,8 @@ void App::Render() {
                     }
                 }, m_exportDir, m_window, m_exportDir, false);
             }
+            if (sameAsVideo) ImGui::EndDisabled();
+            else snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", m_exportDir);
             ImGui::SameLine();
             std::error_code dirCheckEc;
             bool dirExists = std::filesystem::is_directory(m_exportDir, dirCheckEc);
@@ -2290,6 +2320,20 @@ double App::ComputeScrubTarget(float mouseX, float barWidth, double duration,
     double scale = altNow ? 0.1 : 1.0;
     return m_scrubAnchorTime +
         static_cast<double>(mouseX - m_scrubAnchorX) / barWidth * duration * scale;
+}
+
+void App::InitExportDir() {
+    auto videoParent = std::filesystem::path(m_currentFilePath).parent_path().string();
+    if (m_exportDirMode == ExportDirMode::Custom) {
+        // First time using Custom: seed from the opened video's parent so
+        // the user has a sensible starting point rather than an empty box.
+        if (m_exportCustomDir[0] == '\0') {
+            snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", videoParent.c_str());
+        }
+        snprintf(m_exportDir, sizeof(m_exportDir), "%s", m_exportCustomDir);
+    } else {
+        snprintf(m_exportDir, sizeof(m_exportDir), "%s", videoParent.c_str());
+    }
 }
 
 void App::TakeScreenshot() {

@@ -45,9 +45,15 @@ public:
         try { return std::stof(it->second); } catch (...) { return def; }
     }
 
+    std::string GetString(const std::string& key, const std::string& def) const {
+        auto it = m_data.find(key);
+        return it == m_data.end() ? def : it->second;
+    }
+
     void SetInt(const std::string& key, int val) { m_data[key] = std::to_string(val); }
     void SetBool(const std::string& key, bool val) { m_data[key] = val ? "1" : "0"; }
     void SetFloat(const std::string& key, float val) { m_data[key] = std::to_string(val); }
+    void SetString(const std::string& key, const std::string& val) { m_data[key] = val; }
 
 private:
     std::filesystem::path m_path;

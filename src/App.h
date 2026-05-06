@@ -31,6 +31,11 @@ private:
     void RestoreFloatingWindowSnapshots();
     void TakeScreenshot();
 
+    // Initialize m_exportDir for an export-dialog open based on mode:
+    //   SameAsVideo → opened video's parent
+    //   Custom      → m_exportCustomDir, defaulting to the video's parent if empty
+    void InitExportDir();
+
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
     UIManager m_ui;
@@ -80,6 +85,13 @@ private:
     std::vector<std::string> m_conflictingFiles;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";
+
+    // Export output-directory mode. SameAsVideo (default) auto-fills the
+    // export dir with the opened video's parent on each open. Custom uses
+    // m_exportCustomDir, persisted across sessions.
+    enum class ExportDirMode { SameAsVideo = 0, Custom = 1 };
+    ExportDirMode m_exportDirMode = ExportDirMode::SameAsVideo;
+    char m_exportCustomDir[512] = "";
     std::string m_currentFilePath;
 
     // Display
