@@ -316,6 +316,12 @@ bool App::Init() {
         m_showSegments = m_layoutSettings.GetBool("show_segments", false);
     }
 
+    // Block until the windowing system commits the requested size/position.
+    // Without this, on X11/Wayland SDL_GetWindowSize returns the creation
+    // default for several frames, and the proportional-resize logic in
+    // Render() sees a spurious viewport jump and inflates floating panels.
+    SDL_SyncWindow(m_window);
+
     SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
     SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
 
