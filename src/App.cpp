@@ -281,7 +281,16 @@ bool App::Init() {
     // Preferences always load
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
+    // Default ON for Linux: the user has already configured scaling at the OS
+    // level and expects apps to honor it. Windows defaults OFF for parity with
+    // legacy behavior; user can opt in via View → Use DPI scaling. On macOS the
+    // OS handles scaling natively (see GetEffectiveDpiScale), so the value is
+    // unused.
+#if defined(_WIN32) || defined(__APPLE__)
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
+#else
+    m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
+#endif
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
@@ -929,7 +938,7 @@ void App::Render() {
                 m_showChapters = !m_showChapters;
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
                 m_showTooltips = !m_showTooltips;
-#ifdef _WIN32
+#ifndef __APPLE__
             if (ImGui::MenuItem("Use DPI scaling", nullptr, m_useDpiScaling)) {
                 m_useDpiScaling = !m_useDpiScaling;
                 m_ui.SetDpiScale(GetEffectiveDpiScale());
@@ -2436,13 +2445,13 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
 }
 
 float App::GetEffectiveDpiScale() const {
-#ifdef _WIN32
-    if (!m_useDpiScaling) return 1.0f;
-    return SDL_GetWindowDisplayScale(m_window);
-#else
+#ifdef __APPLE__
     // On macOS the OS already handles scaling via the window's point/pixel
     // separation, so we leave UI at 1.0.
     return 1.0f;
+#else
+    if (!m_useDpiScaling) return 1.0f;
+    return SDL_GetWindowDisplayScale(m_window);
 #endif
 }
 
