@@ -165,24 +165,9 @@ void UIManager::ResetLayout() {
     ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
     ImGui::DockBuilderRemoveNode(dockspaceId);
 
-    // Destroy floating windows so ImGui recreates them fresh
-    const char* windows[] = { "Timeline", "Marks", "Help" };
-    ImGuiContext* ctx = ImGui::GetCurrentContext();
-    for (const char* name : windows) {
-        if (ImGuiWindow* w = ImGui::FindWindowByName(name)) {
-            // Remove from context window list
-            for (int i = 0; i < ctx->Windows.Size; i++) {
-                if (ctx->Windows[i] == w) {
-                    ctx->Windows.erase(ctx->Windows.Data + i);
-                    break;
-                }
-            }
-            // Remove from ID map
-            ctx->WindowsById.SetVoidPtr(w->ID, nullptr);
-            IM_DELETE(w);
-        }
-    }
-
+    // Don't free ImGuiWindow objects as several internal containers still
+    // reference them. m_layoutResetPending forces ImGuiCond_Always for one
+    // frame so SetNextWindowPos/Size in App::Render() reposition them.
     m_layoutInitialized = false;
     m_layoutResetPending = true;
 }
