@@ -1017,14 +1017,24 @@ void App::Render() {
         ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_videoTexture)),
                       ImVec2(displayW, displayH));
     } else {
-        const char* text = "Drag and drop a video file to open it.";
+        std::string line1 = "Drag and drop a video file to open it";
+        std::string line2 = "or press " + std::string(kKeys.cmdName) + "+O to browse";
+        std::string line3 = "Press ? or " + std::string(kKeys.winModName) + "+H for keyboard shortcuts";
         ImVec2 avail = ImGui::GetContentRegionAvail();
-        ImVec2 textSize = ImGui::CalcTextSize(text);
-        ImGui::SetCursorPos(ImVec2(
-            (avail.x - textSize.x) * 0.5f,
-            (avail.y - textSize.y) * 0.5f
-        ));
-        ImGui::TextUnformatted(text);
+        ImVec2 size1 = ImGui::CalcTextSize(line1.c_str());
+        ImVec2 size2 = ImGui::CalcTextSize(line2.c_str());
+        ImVec2 size3 = ImGui::CalcTextSize(line3.c_str());
+        float lineH = ImGui::GetTextLineHeightWithSpacing();
+        float blockH = lineH * 3.0f;
+        float startY = (avail.y - blockH) * 0.5f;
+        auto centerLine = [&](const std::string& s, const ImVec2& sz, int row, bool disabled) {
+            ImGui::SetCursorPos(ImVec2((avail.x - sz.x) * 0.5f, startY + lineH * row));
+            if (disabled) ImGui::TextDisabled("%s", s.c_str());
+            else          ImGui::TextUnformatted(s.c_str());
+        };
+        centerLine(line1, size1, 0, false);
+        centerLine(line2, size2, 1, false);
+        centerLine(line3, size3, 2, true);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
