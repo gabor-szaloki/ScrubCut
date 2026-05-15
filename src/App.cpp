@@ -770,6 +770,7 @@ void App::Render() {
     m_ui.BeginFrame();
 
     ImGuiCond layoutCond = m_ui.IsLayoutResetPending() ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    bool wasResetFrame = (layoutCond == ImGuiCond_Always);
 
     // Reposition floating windows proportionally when the viewport size changes.
     // Use the full viewport Size (not WorkSize) so that the menu bar appearing
@@ -947,10 +948,16 @@ void App::Render() {
             if (ImGui::MenuItem("Reset Layout")) {
                 SetFullscreen(false);
                 m_ui.ResetLayout();
+                // Force all floating panels visible so their Begin blocks
+                // run on the next frame with layoutCond = Always and apply
+                // their default Pos/Size. m_hideFloatingWindowsAfterReset
+                // re-hides Marks and Help once that's done, so the user-
+                // visible end state matches the intended hidden defaults.
                 m_showTimeline = true;
-                m_showSegments = false;
-                m_showHelpPanel = false;
+                m_showSegments = true;
+                m_showHelpPanel = true;
                 m_segmentsClosedManually = false;
+                m_hideFloatingWindowsAfterReset = true;
                 float scale = m_ui.GetDpiScale();
                 SDL_SetWindowSize(m_window, static_cast<int>(1280 * scale), static_cast<int>(720 * scale));
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
@@ -1909,7 +1916,18 @@ void App::Render() {
     if (m_showHelpPanel && !m_uiHidden) {
         ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-        ImGui::Begin("Help", &m_showHelpPanel);
+        // Default position: top-left of the workspace. layoutCond is
+        // FirstUseEver normally and Always on Reset Layout. On the reset
+        // frame we also pass AlwaysAutoResize so the size snaps to the
+        // shortcuts table's content size — that's the single source of
+        // truth, not a hardcoded number duplicated in the reset path.
+        float dpi = m_ui.GetDpiScale();
+        ImGui::SetNextWindowPos(
+            ImVec2(vp->WorkPos.x + 40 * dpi, vp->WorkPos.y + 40 * dpi),
+            layoutCond);
+        ImGuiWindowFlags helpFlags =
+            wasResetFrame ? ImGuiWindowFlags_AlwaysAutoResize : 0;
+        ImGui::Begin("Help", &m_showHelpPanel, helpFlags);
         if (ImGui::BeginTable("##shortcuts", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
             ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch);
@@ -1948,6 +1966,15 @@ void App::Render() {
         }
         ImGui::End();
         ImGui::PopStyleVar();
+    }
+
+    // Reset Layout briefly forced Marks/Help visible so their Begin blocks ran
+    // with layoutCond = Always (re-applying default Pos/Size). Now re-hide them
+    // so the user-visible end state matches the intended hidden defaults.
+    if (wasResetFrame && m_hideFloatingWindowsAfterReset) {
+        m_hideFloatingWindowsAfterReset = false;
+        m_showSegments = false;
+        m_showHelpPanel = false;
     }
 
     // Export dialog

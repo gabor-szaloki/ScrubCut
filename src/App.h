@@ -53,6 +53,11 @@ private:
     bool m_segmentsClosedManually = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    // Reset Layout briefly forces Marks/Help visible so their Begin blocks
+    // run with layoutCond = Always (re-applying their default Pos/Size).
+    // After that frame this flag triggers re-hiding them. Avoids
+    // duplicating window defaults in the reset code path.
+    bool m_hideFloatingWindowsAfterReset = false;
     bool m_showChapters = true;
     bool m_showTooltips = true;
     bool m_useDpiScaling = false;
