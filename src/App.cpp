@@ -281,16 +281,7 @@ bool App::Init() {
     // Preferences always load
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
-    // Default ON for Linux: the user has already configured scaling at the OS
-    // level and expects apps to honor it. Windows defaults OFF for parity with
-    // legacy behavior; user can opt in via View → Use DPI scaling. On macOS the
-    // OS handles scaling natively (see GetEffectiveDpiScale), so the value is
-    // unused.
-#if defined(_WIN32) || defined(__APPLE__)
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
-#else
-    m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
-#endif
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
