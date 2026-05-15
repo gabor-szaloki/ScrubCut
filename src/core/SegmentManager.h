@@ -15,7 +15,7 @@ public:
         int colorIndex = m_nextNameIndex;
         char nameBuf[8];
         snprintf(nameBuf, sizeof(nameBuf), "%03d", colorIndex + 1);
-        m_segments.push_back({startSec, endSec, ExportMode::SourceFormat, nameBuf, colorIndex, m_nextAddSeq++});
+        m_segments.push_back({startSec, endSec, ExportMode::SourceFormat, 1.0, true, nameBuf, colorIndex, m_nextAddSeq++});
         m_nextNameIndex++;
         int idx = static_cast<int>(m_segments.size()) - 1;
         LOG_INFO("AddSegment idx=%d t=%.3f-%.3fs name=%s", idx, startSec, endSec, nameBuf);
@@ -86,6 +86,16 @@ public:
     void SetSegmentMode(int index, ExportMode mode) {
         if (index >= 0 && index < static_cast<int>(m_segments.size()))
             m_segments[index].mode = mode;
+    }
+
+    void SetSegmentSpeed(int index, double speed) {
+        if (index >= 0 && index < static_cast<int>(m_segments.size()))
+            m_segments[index].speed = speed;
+    }
+
+    void SetSegmentKeepAudio(int index, bool keepAudio) {
+        if (index >= 0 && index < static_cast<int>(m_segments.size()))
+            m_segments[index].keepAudio = keepAudio;
     }
 
     void SetSegmentName(int index, const std::string& name) {

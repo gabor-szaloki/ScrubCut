@@ -10,6 +10,7 @@
 #include "stb/stb_image_write.h"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 #ifdef _WIN32
@@ -168,9 +169,11 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         return false;
     }
 
-    // Map streams: copy video and audio
+    // Map streams: copy video, and audio if effectively kept (GIF mode and
+    // non-1× speed force audio off because stream-copy can't produce clean
+    // audio output in those cases).
     int videoInIdx = demuxer.GetVideoStreamIndex();
-    int audioInIdx = demuxer.GetAudioStreamIndex();
+    int audioInIdx = EffectiveKeepAudio(range) ? demuxer.GetAudioStreamIndex() : -1;
     int videoOutIdx = -1;
     int audioOutIdx = -1;
     int outStreamCount = 0;
@@ -235,6 +238,13 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     int64_t audioEndPts   = (audioInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[audioInIdx]) : 0;
 
     double segDuration = range.endSec - range.startSec;
+    // Speed scaling. At speed != 1, audio packets are filtered out earlier
+    // (audioInIdx = -1 above) so this block only touches video packets:
+    // dividing video pts/dts/duration by `speed` compresses (>1×) or
+    // stretches (<1×) the output timeline.
+    bool speedScaled = range.speed > 0.0 && std::abs(range.speed - 1.0) > 1e-6;
+    double speedInv = speedScaled ? (1.0 / range.speed) : 1.0;
+    double effSegDuration = speedScaled ? segDuration / range.speed : segDuration;
 
     // Read and write packets
     AVPacket* pkt = av_packet_alloc();
@@ -302,10 +312,23 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         pkt->duration = av_rescale_q(pkt->duration, inStream->time_base, outStream->time_base);
         pkt->pos = -1;
 
-        // Update progress within segment
-        if (segDuration > 0.0 && pkt->pts != AV_NOPTS_VALUE) {
+        // Per-segment speed: scale this packet's timestamps. Audio at
+        // speed != 1 was already filtered out at stream-mapping time, so
+        // only video reaches here.
+        if (speedScaled) {
+            if (pkt->pts != AV_NOPTS_VALUE)
+                pkt->pts = static_cast<int64_t>(std::llround(static_cast<double>(pkt->pts) * speedInv));
+            if (pkt->dts != AV_NOPTS_VALUE)
+                pkt->dts = static_cast<int64_t>(std::llround(static_cast<double>(pkt->dts) * speedInv));
+            pkt->duration = static_cast<int64_t>(std::llround(static_cast<double>(pkt->duration) * speedInv));
+        }
+
+        // Update progress within segment. Output timestamps are post-speed
+        // scaled; compare to the effective (post-speed) duration so progress
+        // tops out at 1.0 regardless of speed.
+        if (effSegDuration > 0.0 && pkt->pts != AV_NOPTS_VALUE) {
             double pktTime = static_cast<double>(pkt->pts) * av_q2d(outStream->time_base);
-            float segProgress = static_cast<float>(pktTime / segDuration);
+            float segProgress = static_cast<float>(pktTime / effSegDuration);
             segProgress = std::max(0.0f, std::min(segProgress, 1.0f));
 
             int totalItems = std::max(1, m_progress.totalItems.load());
@@ -425,15 +448,20 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     inputs->pad_idx = 0;
     inputs->next = nullptr;
 
+    // Sample the source at gifFps/speed source-frames per source-second
+    // so the output GIF plays at a constant gifFps over a duration of
+    // src_duration/speed: slow-mo gets MORE unique frames (smoother
+    // motion) and fast-forward gets FEWER (no redundant duplicates).
+    double srcSampleFps = (range.speed > 0.0) ? gifFps / range.speed : gifFps;
     char filterDesc[512];
     snprintf(filterDesc, sizeof(filterDesc),
-             "fps=fps=%.2f,scale=%d:%d:flags=lanczos,"
+             "fps=fps=%.4f,scale=%d:%d:flags=lanczos,"
              "format=rgb24,colorspace=all=bt709:iall=bt709:fast=1,"
              "setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1,"
              "split[a][b];"
              "[a]palettegen=stats_mode=full[p];"
              "[b][p]paletteuse=dither=bayer:bayer_scale=3",
-             gifFps, gifWidth, outH);
+             srcSampleFps, gifWidth, outH);
 
     ret = avfilter_graph_parse_ptr(filterGraph, filterDesc, &inputs, &outputs, nullptr);
     avfilter_inout_free(&inputs);
@@ -537,7 +565,9 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
                 return false;
             }
 
-            // PTS in centiseconds (time_base = 1/100)
+            // PTS in centiseconds (time_base = 1/100). Output frames play
+            // at the requested gifFps regardless of speed — the speed
+            // effect comes from sampling the source at gifFps/speed above.
             filtFrame->pts = static_cast<int64_t>(std::round(frameCount * 100.0 / gifFps));
             frameCount++;
 

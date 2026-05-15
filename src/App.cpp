@@ -105,6 +105,116 @@ static ImU32 GetSegmentColor(int colorIndex, float alpha = 1.0f) {
                     static_cast<int>(c.z * 255), static_cast<int>(alpha * 255));
 }
 
+// Discrete playback-speed multipliers, matching the timeline's speed buttons.
+// Used both for export-segment speed and (separately) the in-app player speed.
+static constexpr double kPlaybackSpeeds[] = { 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 };
+static constexpr const char* kPlaybackSpeedLabels[] = { ".1x", ".25x", ".5x", "1x", "2x", "4x", "8x" };
+static constexpr int kPlaybackSpeedCount =
+    sizeof(kPlaybackSpeeds) / sizeof(kPlaybackSpeeds[0]);
+
+// Width helpers for fixed-size buttons. Sized to the widest possible label
+// so the button doesn't visually jump when the user toggles state.
+static float FixedAudioButtonWidth() {
+    return ImGui::CalcTextSize("No audio").x + ImGui::GetStyle().FramePadding.x * 2;
+}
+static float FixedSpeedButtonWidth() {
+    return ImGui::CalcTextSize(".25x").x + ImGui::GetStyle().FramePadding.x * 2;
+}
+
+// Fixed-width button. `small=true` mirrors SmallButton's geometry (zero
+// vertical padding + AlignTextBaseLine) so it sits on the same baseline as
+// neighboring SmallButtons in a row (e.g. the MP4/GIF Fmt toggle). `small=
+// false` uses a regular Button.
+static bool FixedWidthButton(const char* label, float width, bool small) {
+    if (!small) return ImGui::Button(label, ImVec2(width, 0));
+
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    float backupPadY = g.Style.FramePadding.y;
+    g.Style.FramePadding.y = 0.0f;
+    bool pressed = ImGui::ButtonEx(label, ImVec2(width, 0),
+                                   ImGuiButtonFlags_AlignTextBaseLine);
+    g.Style.FramePadding.y = backupPadY;
+    return pressed;
+}
+
+// Audio toggle for a TimeRange — pairs with the Fmt/MP4-GIF toggle in look
+// and behaviour. The button shows the current effective state. When the
+// format / speed force audio off, the button is greyed out and the tooltip
+// explains why. Returns true and writes the new `keepAudio` value if the
+// user toggled.
+//
+// `small=true` for SmallButton-height rows; `small=false` for the
+// export-dialog table cell variant.
+static bool KeepAudioToggle(const char* id, const TimeRange& range,
+                            bool& outKeepAudio, bool small) {
+    bool forced = AudioForciblyDropped(range);
+    bool effective = !forced && range.keepAudio;
+    const char* label = effective ? "Audio" : "No audio";
+    char btnLabel[24];
+    snprintf(btnLabel, sizeof(btnLabel), "%s%s", label, id);
+
+    if (forced) ImGui::BeginDisabled();
+    bool clicked = FixedWidthButton(btnLabel, FixedAudioButtonWidth(), small);
+    if (forced) ImGui::EndDisabled();
+
+    if (forced) {
+        // Disabled tooltips: ImGui suppresses tooltips on disabled items by
+        // default, so render an explicit one when hovered with the disabled-
+        // bypass flag.
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted((range.mode == ExportMode::GIF)
+                ? "GIF has no audio track."
+                : "Audio export is not supported with non-1x playback speeds.");
+            ImGui::EndTooltip();
+        }
+        return false;
+    }
+
+    if (clicked) {
+        outKeepAudio = !range.keepAudio;
+        return true;
+    }
+    return false;
+}
+
+// Dropdown picker over the discrete speed multipliers. Looks like a button
+// showing the current multiplier label (e.g. ".25x"); clicking opens a
+// popup with the options. Returns true and writes to `outSpeed` if the
+// user picked a different value than `currentSpeed`. `id` must be unique
+// within the current ImGui ID context; pass e.g. "##segspeed".
+//
+// `small=true` uses a SmallButton (matches the height of neighboring
+// SmallButtons in the Marks panel). `small=false` uses a regular Button
+// (matches an InputText / checkbox row, e.g. the Export dialog).
+static bool SpeedCombo(const char* id, double currentSpeed, double& outSpeed, bool small) {
+    int curIdx = 3; // default 1x
+    for (int i = 0; i < kPlaybackSpeedCount; i++) {
+        if (std::abs(kPlaybackSpeeds[i] - currentSpeed) < 0.01) {
+            curIdx = i;
+            break;
+        }
+    }
+
+    char btnLabel[32];
+    snprintf(btnLabel, sizeof(btnLabel), "%s%s", kPlaybackSpeedLabels[curIdx], id);
+
+    bool clicked = FixedWidthButton(btnLabel, FixedSpeedButtonWidth(), small);
+    if (clicked) ImGui::OpenPopup(id);
+
+    bool changed = false;
+    if (ImGui::BeginPopup(id)) {
+        for (int i = 0; i < kPlaybackSpeedCount; i++) {
+            if (ImGui::Selectable(kPlaybackSpeedLabels[i], i == curIdx)) {
+                outSpeed = kPlaybackSpeeds[i];
+                changed = true;
+            }
+        }
+        ImGui::EndPopup();
+    }
+    return changed;
+}
+
 bool App::Init() {
     LogFile::Get().Open();
 
@@ -1535,7 +1645,7 @@ void App::Render() {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float dpi = m_ui.GetDpiScale();
-    float marksW = 350.0f * dpi;
+    float marksW = 450.0f * dpi;
     float marksH = 250.0f * dpi;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * dpi, vp->WorkPos.y + 40 * dpi), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(marksW, marksH), layoutCond);
@@ -1690,9 +1800,31 @@ void App::Render() {
                         m_segments.UpdateSegment(row.index, s.startSec, playhead);
                     if (!canSetEnd) ImGui::EndDisabled();
                     TooltipFor("Set end to playhead");
-                    double dur = s.endSec - s.startSec;
+
+                    // Per-segment export playback speed (matches the timeline's
+                    // discrete multipliers). SpeedCombo renders as a SmallButton
+                    // so it fits inline with the other small buttons at the
+                    // same row height.
                     ImGui::SameLine();
-                    ImGui::TextDisabled("(%.1fs)", dur);
+                    double newSpeed;
+                    if (SpeedCombo("##segspeed", s.speed, newSpeed, /*small*/ true)) {
+                        m_segments.SetSegmentSpeed(row.index, newSpeed);
+                    }
+                    TooltipFor("Export playback speed");
+
+                    double dur = s.endSec - s.startSec;
+                    double effDur = (s.speed > 0.0) ? dur / s.speed : dur;
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%.1fs)", effDur);
+
+                    // Audio toggle at the end of the row. Disabled with an
+                    // explanatory tooltip when format/speed forces audio off.
+                    ImGui::SameLine();
+                    bool newKeep;
+                    if (KeepAudioToggle("##segaudio", s, newKeep, /*small*/ true)) {
+                        m_segments.SetSegmentKeepAudio(row.index, newKeep);
+                    }
+                    if (!AudioForciblyDropped(s)) TooltipFor("Toggle audio in export");
                 } else {
                     // Row 2 (frames): seek button + set-to-current
                     const FrameMark& f = frames[row.index];
@@ -1929,13 +2061,14 @@ void App::Render() {
                 tableFlags |= ImGuiTableFlags_ScrollY;
                 tableSize.y = 10 * rowH + 30;
             }
-            if (ImGui::BeginTable("##export_marks", 6, tableFlags, tableSize)) {
+            if (ImGui::BeginTable("##export_marks", 7, tableFlags, tableSize)) {
                 ImGui::TableSetupColumn("##chk_col", ImGuiTableColumnFlags_WidthFixed, 24);
-                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 65);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 160);
-                ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 60);
-                ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed, 50);
+                ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed, 45);
+                ImGui::TableSetupColumn("Speed", ImGuiTableColumnFlags_WidthFixed, 50);
+                ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 70);
+                ImGui::TableSetupColumn("Audio", ImGuiTableColumnFlags_WidthFixed, 80);
                 ImGui::TableHeadersRow();
 
                 for (size_t r = 0; r < rows.size(); r++) {
@@ -1966,47 +2099,53 @@ void App::Render() {
                         else             m_segments.SetSegmentName(row.index, nameBuf);
                     }
 
-                    // Time (or range)
-                    ImGui::TableNextColumn();
-                    if (row.isFrame) {
-                        const FrameMark& f = frames[row.index];
-                        int fMin = static_cast<int>(f.timeSec) / 60;
-                        int fSec = static_cast<int>(f.timeSec) % 60;
-                        int fMs  = static_cast<int>(f.timeSec * 1000) % 1000;
-                        ImGui::Text("%02d:%02d.%03d", fMin, fSec, fMs);
-                    } else {
-                        const TimeRange& s = segs[row.index];
-                        int sMin = static_cast<int>(s.startSec) / 60;
-                        int sSec = static_cast<int>(s.startSec) % 60;
-                        int sMs  = static_cast<int>(s.startSec * 1000) % 1000;
-                        int eMin = static_cast<int>(s.endSec) / 60;
-                        int eSec = static_cast<int>(s.endSec) % 60;
-                        int eMs  = static_cast<int>(s.endSec * 1000) % 1000;
-                        ImGui::Text("%02d:%02d.%03d-%02d:%02d.%03d", sMin, sSec, sMs, eMin, eSec, eMs);
-                    }
-
-                    // Duration
-                    ImGui::TableNextColumn();
-                    if (row.isFrame) {
-                        ImGui::TextDisabled("-");
-                    } else {
-                        double dur = segs[row.index].endSec - segs[row.index].startSec;
-                        ImGui::Text("%.1fs", dur);
-                    }
-
                     // Format (toggle for segments, static PNG label for frames)
                     ImGui::TableNextColumn();
                     if (row.isFrame) {
                         ImGui::TextDisabled("PNG");
                     } else {
                         const char* fmtLabel = (segs[row.index].mode == ExportMode::GIF) ? "GIF" : "MP4";
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 0.6f));
                         if (ImGui::SmallButton(fmtLabel)) {
                             ExportMode newMode = (segs[row.index].mode == ExportMode::GIF)
                                 ? ExportMode::SourceFormat : ExportMode::GIF;
                             m_segments.SetSegmentMode(row.index, newMode);
                         }
-                        ImGui::PopStyleColor();
+                    }
+
+                    // Speed (segments only) — placed before Duration so users
+                    // see the multiplier they're applying right next to the
+                    // effective output length.
+                    ImGui::TableNextColumn();
+                    if (row.isFrame) {
+                        ImGui::TextDisabled("-");
+                    } else {
+                        double newSpeed;
+                        if (SpeedCombo("##speed", segs[row.index].speed, newSpeed, /*small*/ true)) {
+                            m_segments.SetSegmentSpeed(row.index, newSpeed);
+                        }
+                    }
+
+                    // Duration (effective, after speed)
+                    ImGui::TableNextColumn();
+                    if (row.isFrame) {
+                        ImGui::TextDisabled("-");
+                    } else {
+                        const TimeRange& s = segs[row.index];
+                        double srcDur = s.endSec - s.startSec;
+                        double effDur = (s.speed > 0.0) ? srcDur / s.speed : srcDur;
+                        ImGui::Text("%.1fs", effDur);
+                    }
+
+                    // Audio toggle column. Frames have no audio anyway, so
+                    // we just show a disabled label.
+                    ImGui::TableNextColumn();
+                    if (row.isFrame) {
+                        ImGui::TextDisabled("-");
+                    } else {
+                        bool newKeep;
+                        if (KeepAudioToggle("##audio", segs[row.index], newKeep, /*small*/ true)) {
+                            m_segments.SetSegmentKeepAudio(row.index, newKeep);
+                        }
                     }
 
                     ImGui::PopID();
@@ -2023,7 +2162,7 @@ void App::Render() {
                 if (ImGui::CollapsingHeader("GIF Settings")) {
                     ImGui::SliderInt("Width", &m_pendingExport.gifWidth, 120, 1920);
                     float fps = static_cast<float>(m_pendingExport.gifFps);
-                    if (ImGui::SliderFloat("FPS", &fps, 5.0f, 30.0f, "%.0f")) {
+                    if (ImGui::SliderFloat("FPS", &fps, 5.0f, 60.0f, "%.0f")) {
                         m_pendingExport.gifFps = static_cast<double>(fps);
                     }
                 }
