@@ -3,6 +3,7 @@
 #include "ui/UIManager.h"
 #include "core/Player.h"
 #include "core/SegmentManager.h"
+#include "core/WaveformExtractor.h"
 #include "export/Exporter.h"
 #include "util/Settings.h"
 
@@ -46,6 +47,7 @@ private:
     Player m_player;
     SegmentManager m_segments;
     Exporter m_exporter;
+    WaveformExtractor m_waveform;
 
     // UI state — window visibility
     bool m_showTimeline = true;
@@ -59,6 +61,7 @@ private:
     // duplicating window defaults in the reset code path.
     bool m_hideFloatingWindowsAfterReset = false;
     bool m_showChapters = true;
+    bool m_showWaveform = false;
     bool m_showTooltips = true;
     bool m_useDpiScaling = false;
     bool m_autoHideCursor = true;

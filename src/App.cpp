@@ -280,6 +280,7 @@ bool App::Init() {
 
     // Preferences always load
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
+    m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
@@ -399,6 +400,7 @@ void App::Shutdown() {
         m_layoutSettings.Save();
 
         m_prefSettings.SetBool("show_chapters", m_showChapters);
+        m_prefSettings.SetBool("show_waveform", m_showWaveform);
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
@@ -458,6 +460,15 @@ void App::OpenFile(const std::string& path) {
     m_currentFilePath = path;
     m_segments.Clear();
     m_segmentsClosedManually = false;
+
+    // Kick off the background waveform scan only when enabled. Otherwise
+    // reset so stale peaks from the previously-open file don't show up if
+    // the user enables the waveform later (we Start it then).
+    if (m_showWaveform) {
+        m_waveform.Start(path, m_player.GetDuration());
+    } else {
+        m_waveform.Reset();
+    }
 
     m_videoWidth = m_player.GetVideoWidth();
     m_videoHeight = m_player.GetVideoHeight();
@@ -928,6 +939,18 @@ void App::Render() {
             ImGui::Separator();
             if (ImGui::MenuItem("Show Chapters", nullptr, m_showChapters))
                 m_showChapters = !m_showChapters;
+            if (ImGui::MenuItem("Show Waveform", nullptr, m_showWaveform)) {
+                m_showWaveform = !m_showWaveform;
+                // Lazily kick off a scan when enabled and there's nothing
+                // cached for the currently-open file yet. Disabling leaves
+                // any in-flight scan running so re-enabling is instant.
+                if (m_showWaveform &&
+                    m_player.HasMedia() && m_player.HasAudio() &&
+                    m_waveform.GetFilledBuckets() == 0 &&
+                    !m_waveform.IsRunning()) {
+                    m_waveform.Start(m_currentFilePath, m_player.GetDuration());
+                }
+            }
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
                 m_showTooltips = !m_showTooltips;
 #ifndef __APPLE__
@@ -1309,6 +1332,57 @@ void App::Render() {
             }
         } else {
             drawList->AddRectFilled(barPos, ImVec2(barPos.x + barWidth, barPos.y + barHeight), bgCol);
+        }
+
+        // Waveform overlay — drawn between the bar background and segments
+        // so user marks always stay visible on top. Reads peaks atomically
+        // up to GetFilledBuckets(); the worker thread fills them in order
+        // so visible buckets are stable.
+        if (m_showWaveform && duration > 0.0) {
+            int filled = m_waveform.GetFilledBuckets();
+            if (filled > 0) {
+                // Normalize against the loudest bucket processed so far so
+                // the peak always maxes out the bar height. As more audio is
+                // scanned and a louder bucket arrives, the whole visible
+                // waveform rescales — a slightly shifting envelope while
+                // filling in, then stable once the scan completes.
+                float maxPeak = 0.0f;
+                for (int b = 0; b < filled; b++) {
+                    float p = m_waveform.GetPeak(b);
+                    if (p > maxPeak) maxPeak = p;
+                }
+                if (maxPeak > 1e-6f) {
+                    // Filled buckets cover [0, filled/kBuckets * duration].
+                    // Clip the drawn x-range to that span so the waveform
+                    // grows left-to-right as decoding progresses.
+                    int barW = static_cast<int>(std::round(barWidth));
+                    int totalBuckets = WaveformExtractor::kBuckets;
+                    float fillFrac = static_cast<float>(filled) / static_cast<float>(totalBuckets);
+                    int xMax = static_cast<int>(std::round(barWidth * fillFrac));
+                    float cy = barPos.y + barHeight * 0.5f;
+                    float halfBar = barHeight * 0.45f;
+                    float invMax = 1.0f / maxPeak;
+                    ImU32 wfCol = fadeCol(180, 200, 230, 110);
+                    for (int xi = 0; xi < xMax && xi < barW; xi++) {
+                        int b0 = (xi * totalBuckets) / barW;
+                        int b1 = ((xi + 1) * totalBuckets) / barW;
+                        if (b1 <= b0) b1 = b0 + 1;
+                        if (b1 > filled) b1 = filled;
+                        if (b0 >= b1) break;
+                        float peak = 0.0f;
+                        for (int b = b0; b < b1; b++) {
+                            float p = m_waveform.GetPeak(b);
+                            if (p > peak) peak = p;
+                        }
+                        if (peak <= 0.0f) continue;
+                        float h = peak * invMax * halfBar;
+                        // Min visible height so very quiet sections still read.
+                        if (h < 0.5f) h = 0.5f;
+                        float x = barPos.x + static_cast<float>(xi);
+                        drawList->AddRectFilled(ImVec2(x, cy - h), ImVec2(x + 1.0f, cy + h), wfCol);
+                    }
+                }
+            }
         }
 
         // Segments
