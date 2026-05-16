@@ -10,6 +10,10 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -72,6 +76,27 @@ static void OpenFolderInShell(const std::filesystem::path& dir) {
     if (!path.empty() && path.front() == '/') path.erase(0, 1);  // unix leading slash is part of the URI
     std::string uri = "file:///" + path;
     SDL_OpenURL(uri.c_str());
+}
+
+// Open the system file browser with `file` highlighted (vs. just opening its
+// parent folder). Same non-blocking constraints as OpenFolderInShell.
+static void RevealInShell(const std::filesystem::path& file) {
+#ifdef _WIN32
+    std::wstring args = L"/select,\"" + file.wstring() + L"\"";
+    ShellExecuteW(NULL, L"open", L"explorer.exe", args.c_str(), NULL, SW_SHOWNORMAL);
+#elif defined(__APPLE__)
+    // `open -R` reveals (parent folder opens with the file selected) and
+    // returns immediately, so no need to background it.
+    std::string p = file.string();
+    // Escape any double quotes in the path so the shell command can't break.
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '"') { p.insert(i, "\\"); i++; }
+    }
+    std::string cmd = "open -R \"" + p + "\"";
+    std::system(cmd.c_str());
+#else
+    OpenFolderInShell(file.parent_path());
+#endif
 }
 
 // Fixed cycling color palette for segments
@@ -294,6 +319,8 @@ bool App::Init() {
         snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", customDir.c_str());
     }
 
+    LoadRecentFiles();
+
     // Apply initial DPI scale to the UI (1.0 unless DPI scaling is enabled on Windows).
     m_ui.SetDpiScale(GetEffectiveDpiScale());
 
@@ -409,6 +436,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("muted", m_player.IsMuted());
         m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
         m_prefSettings.SetString("export_custom_dir", m_exportCustomDir);
+        SaveRecentFiles();
         m_prefSettings.Save();
     }
     SDL_ShowCursor();
@@ -480,7 +508,37 @@ void App::OpenFile(const std::string& path) {
 #endif
     SDL_SetWindowTitle(m_window, title.c_str());
 
+    AddToRecent(path);
+
     m_player.Play();
+}
+
+void App::LoadRecentFiles() {
+    m_recentFiles.clear();
+    for (int i = 0; i < kRecentMax; i++) {
+        std::string key = "recent_" + std::to_string(i);
+        std::string p = m_prefSettings.GetString(key, "");
+        if (!p.empty()) m_recentFiles.push_back(std::move(p));
+    }
+}
+
+void App::SaveRecentFiles() {
+    for (int i = 0; i < kRecentMax; i++) {
+        std::string key = "recent_" + std::to_string(i);
+        m_prefSettings.SetString(key,
+            i < static_cast<int>(m_recentFiles.size()) ? m_recentFiles[i] : std::string());
+    }
+}
+
+void App::AddToRecent(const std::string& path) {
+    // Move-to-front: remove any existing entry for this path (so the list
+    // stays unique), prepend the new path, then trim to kRecentMax.
+    auto eq = [&](const std::string& s) { return s == path; };
+    m_recentFiles.erase(std::remove_if(m_recentFiles.begin(), m_recentFiles.end(), eq),
+                        m_recentFiles.end());
+    m_recentFiles.insert(m_recentFiles.begin(), path);
+    if (static_cast<int>(m_recentFiles.size()) > kRecentMax)
+        m_recentFiles.resize(kRecentMax);
 }
 
 void App::ProcessEvents() {
@@ -904,6 +962,24 @@ void App::Render() {
                         static_cast<App*>(userdata)->RequestOpenFile(filelist[0]);
                 }, this, m_window, videoFilters, 2, nullptr, false);
             }
+            if (ImGui::BeginMenu("Open Recent", !m_recentFiles.empty())) {
+                std::string toReopen;
+                bool clearRequested = false;
+                for (int i = 0; i < static_cast<int>(m_recentFiles.size()); i++) {
+                    const std::string& full = m_recentFiles[i];
+                    std::string label = std::filesystem::path(full).filename().string();
+                    // Suffix index lets duplicate filenames have unique IDs.
+                    std::string itemId = label + "##recent" + std::to_string(i);
+                    if (ImGui::MenuItem(itemId.c_str())) toReopen = full;
+                    if (ImGui::IsItemHovered() && g_tooltipsEnabled)
+                        ImGui::SetTooltip("%s", full.c_str());
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recent")) clearRequested = true;
+                ImGui::EndMenu();
+                if (!toReopen.empty()) RequestOpenFile(toReopen);
+                if (clearRequested) m_recentFiles.clear();
+            }
             if (ImGui::MenuItem("Export Segments...", (std::string(kKeys.cmdName) + "+E").c_str(),
                                 false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
                 m_showExportDialog = true;
@@ -914,8 +990,22 @@ void App::Render() {
                 m_pendingExport = ExportSettings{};
             }
             ImGui::Separator();
+#if defined(__APPLE__)
+            const char* revealLabel = "Show Current Video in Finder";
+#elif defined(_WIN32)
+            const char* revealLabel = "Show Current Video in Explorer";
+#else
+            const char* revealLabel = "Show Current Video in File Manager";
+#endif
+            if (ImGui::MenuItem(revealLabel, nullptr, false, !m_currentFilePath.empty())) {
+                RevealInShell(m_currentFilePath);
+            }
             if (ImGui::MenuItem("Open App Data Folder")) {
                 OpenFolderInShell(GetAppDataDir());
+            }
+            if (ImGui::MenuItem("Open App Install Folder")) {
+                if (const char* base = SDL_GetBasePath())
+                    OpenFolderInShell(base);
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {

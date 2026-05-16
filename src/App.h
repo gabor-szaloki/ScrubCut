@@ -26,6 +26,13 @@ private:
     void ProcessEvents();
     void Render();
 
+    // Recent files: persisted list, MRU on top, capped at kRecentMax entries.
+    static constexpr int kRecentMax = 10;
+    std::vector<std::string> m_recentFiles;
+    void LoadRecentFiles();
+    void SaveRecentFiles();
+    void AddToRecent(const std::string& path);
+
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
