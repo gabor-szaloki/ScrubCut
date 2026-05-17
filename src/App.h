@@ -95,6 +95,18 @@ private:
     std::vector<bool> m_frameExportChecked;
     bool m_showOverwriteConfirm = false;
     bool m_showOpenFileConfirm = false;
+    // Cmd+E from the global keyboard handler — resolved in Render where
+    // ImGui state is current. (The handler runs before BeginFrame, when
+    // ImGui's CurrentWindow is null and calls like IsPopupOpen crash.)
+    bool m_pendingExportToggle = false;
+    // Self-tracked "Export modal currently open" — updated from the result of
+    // BeginPopupModal each frame, used to gate the open path in the toggle
+    // resolution.
+    bool m_exportDialogOpen = false;
+    // Previous frame's "any item active" state inside the Export dialog. Used
+    // so an Esc-press that just deactivated an InputText/InputFloat doesn't
+    // also fire the dialog's Esc-closes-dialog shortcut.
+    bool m_exportDialogItemActiveLast = false;
     bool m_pendingOpenImmediate = false;
     std::string m_pendingOpenFilePath;
     std::vector<std::string> m_conflictingFiles;

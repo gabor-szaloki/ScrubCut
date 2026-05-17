@@ -750,13 +750,10 @@ void App::ProcessEvents() {
                 }
                 break;
             case SDLK_E:
-                if (cmd && m_segments.GetTotalCount() > 0 && !m_exporter.IsRunning()) {
-                    m_showExportDialog = true;
-                    auto stem = std::filesystem::path(m_currentFilePath).stem().string();
-                    InitExportDir();
-                    snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
-                    m_pendingExport = ExportSettings{};
-                }
+                // Defer: ImGui's IsPopupOpen needs a current window context
+                // (set up during BeginFrame), but this handler runs before
+                // BeginFrame. Resolve to open/close in Render.
+                if (cmd) m_pendingExportToggle = true;
                 break;
             case SDLK_T:
                 if (winMod) m_showTimeline = !m_showTimeline;
@@ -2000,9 +1997,27 @@ void App::Render() {
                     TooltipFor("Export playback speed");
 
                     double dur = s.endSec - s.startSec;
-                    double effDur = (s.speed > 0.0) ? dur / s.speed : dur;
+                    double effSpeed = (s.speed > 0.0) ? s.speed : 1.0;
+                    double effDur = dur / effSpeed;
+                    float effDurF = static_cast<float>(effDur);
                     ImGui::SameLine();
-                    ImGui::TextDisabled("(%.1fs)", effDur);
+                    // Match the surrounding SmallButton row height by flattening
+                    // the input's vertical frame padding (same trick as
+                    // FixedWidthButton uses for its small variant).
+                    ImGuiStyle& smallStyle = ImGui::GetStyle();
+                    float backupPadY = smallStyle.FramePadding.y;
+                    smallStyle.FramePadding.y = 0;
+                    ImGui::SetNextItemWidth(56.0f * dpi);
+                    bool durChanged = ImGui::InputFloat("##segdur", &effDurF, 0.0f, 0.0f, "%.1fs");
+                    smallStyle.FramePadding.y = backupPadY;
+                    if (durChanged) {
+                        if (effDurF < 0.05f) effDurF = 0.05f;
+                        double newEnd = s.startSec + effDurF * effSpeed;
+                        double maxEnd = m_player.GetDuration();
+                        if (newEnd > maxEnd) newEnd = maxEnd;
+                        m_segments.UpdateSegment(row.index, s.startSec, newEnd);
+                    }
+                    TooltipFor("Segment duration (after speed)");
 
                     // Audio toggle at the end of the row. Disabled with an
                     // explanatory tooltip when format/speed forces audio off.
@@ -2152,6 +2167,22 @@ void App::Render() {
     }
 
     // Export dialog
+    // Resolve a deferred Cmd+E from the global keyboard handler. We only
+    // handle "open" here; closing is done by the in-modal Cmd+E handler,
+    // which is the only path that actually fires while the modal is open
+    // (the global handler is gated by WantCaptureKeyboard at that point).
+    if (m_pendingExportToggle) {
+        m_pendingExportToggle = false;
+        if (!m_exportDialogOpen &&
+            m_segments.GetTotalCount() > 0 && !m_exporter.IsRunning()) {
+            m_showExportDialog = true;
+            auto stem = std::filesystem::path(m_currentFilePath).stem().string();
+            InitExportDir();
+            snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
+            m_pendingExport = ExportSettings{};
+        }
+    }
+
     if (m_showExportDialog) {
         m_exporter.ResetProgress();
         m_exportChecked.assign(m_segments.GetCount(), true);
@@ -2160,7 +2191,13 @@ void App::Render() {
         m_showExportDialog = false;
     }
 
-    if (ImGui::BeginPopupModal("Export", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    bool popupVisibleThisFrame = ImGui::BeginPopupModal("Export", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // Capture the prior-frame state before updating: the in-modal Cmd+E
+    // close handler must NOT consume the same Cmd+E that just opened the
+    // modal this frame, otherwise the modal opens and immediately closes.
+    bool exportDialogWasOpenPriorFrame = m_exportDialogOpen;
+    m_exportDialogOpen = popupVisibleThisFrame;
+    if (popupVisibleThisFrame) {
         const auto& progress = m_exporter.GetProgress();
         const auto& segs = m_segments.GetSegments();
         const auto& frames = m_segments.GetFrames();
@@ -2332,15 +2369,24 @@ void App::Render() {
                         }
                     }
 
-                    // Duration (effective, after speed)
+                    // Duration (effective, after speed) — editable for segments.
                     ImGui::TableNextColumn();
                     if (row.isFrame) {
                         ImGui::TextDisabled("-");
                     } else {
                         const TimeRange& s = segs[row.index];
                         double srcDur = s.endSec - s.startSec;
-                        double effDur = (s.speed > 0.0) ? srcDur / s.speed : srcDur;
-                        ImGui::Text("%.1fs", effDur);
+                        double effSpeed = (s.speed > 0.0) ? s.speed : 1.0;
+                        double effDur = srcDur / effSpeed;
+                        float effDurF = static_cast<float>(effDur);
+                        ImGui::SetNextItemWidth(-FLT_MIN);  // fill table cell
+                        if (ImGui::InputFloat("##dur", &effDurF, 0.0f, 0.0f, "%.1fs")) {
+                            if (effDurF < 0.05f) effDurF = 0.05f;
+                            double newEnd = s.startSec + effDurF * effSpeed;
+                            double maxEnd = m_player.GetDuration();
+                            if (newEnd > maxEnd) newEnd = maxEnd;
+                            m_segments.UpdateSegment(row.index, s.startSec, newEnd);
+                        }
                     }
 
                     // Audio toggle column. Frames have no audio anyway, so
@@ -2459,11 +2505,38 @@ void App::Render() {
                 ImGui::CloseCurrentPopup();
             }
 
-            // Enter → Export when the popup is focused (and no sub-modal is open)
-            if (canExport && !m_showOverwriteConfirm &&
-                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-                ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
-                triggerExport();
+            bool anyItemActive = ImGui::IsAnyItemActive();
+            bool inputWasFocused = anyItemActive || m_exportDialogItemActiveLast;
+            m_exportDialogItemActiveLast = anyItemActive;
+
+            // Suppress the dialog's own shortcuts while the overwrite-confirm
+            // child popup is showing — Esc / Cmd+E in that state should act
+            // on the child, not close the whole export dialog. (The bare
+            // m_showOverwriteConfirm flag is only true for the single frame
+            // OpenPopup is requested, so we read the actual popup state.)
+            bool overwriteOpen = ImGui::IsPopupOpen("Overwrite Files?");
+            bool popupFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
+                                && !overwriteOpen;
+            if (popupFocused) {
+                // ImGuiMod_Ctrl maps to Ctrl on Win/Linux and Cmd on macOS
+                // (ImGui internally swaps Ctrl/Super on Mac). IsKeyChordPressed
+                // handles the platform difference so we don't have to.
+                // Cmd/Ctrl + Enter → Export. The modifier prevents accidental
+                // exports while typing in name / duration / dir fields.
+                if (canExport && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Enter)) {
+                    triggerExport();
+                }
+                // Cmd/Ctrl + E → close. Guarded on "was open last frame" so
+                // the Cmd+E that just opened the modal isn't consumed here
+                // to immediately close it.
+                if (exportDialogWasOpenPriorFrame && ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_E)) {
+                    ImGui::CloseCurrentPopup();
+                }
+                // Esc → close, but only when no input is being edited (so the
+                // user can press Esc to cancel an in-progress edit first).
+                if (!inputWasFocused && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+                    ImGui::CloseCurrentPopup();
+                }
             }
         } else if (progress.running) {
             // --- Progress display ---
@@ -2567,6 +2640,11 @@ void App::Render() {
             }
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(btnW, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            // Esc closes just this child popup (the parent's Esc handler is
+            // gated by IsPopupOpen("Overwrite Files?") so it stays put).
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
