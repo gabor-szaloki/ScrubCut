@@ -15,3 +15,18 @@ inline const std::filesystem::path& GetAppDataDir() {
     }();
     return dir;
 }
+
+// Returns the directory containing bundled read-only resources.
+// Windows: install dir (where ScrubCut.exe lives).
+// macOS:   ScrubCut.app/Contents/Resources/ when bundled, exe dir otherwise.
+// During dev runs from the build tree, this is the build/bin dir; CMake
+// copies resource files (e.g. eng.traineddata) next to the binary so the
+// same path works in both bundled and dev contexts.
+inline const std::filesystem::path& GetResourceDir() {
+    static std::filesystem::path dir = []() -> std::filesystem::path {
+        const char* basePath = SDL_GetBasePath();
+        if (basePath) return basePath;
+        return ".";
+    }();
+    return dir;
+}

@@ -54,6 +54,7 @@ public:
     void SetBool(const std::string& key, bool val) { m_data[key] = val ? "1" : "0"; }
     void SetFloat(const std::string& key, float val) { m_data[key] = std::to_string(val); }
     void SetString(const std::string& key, const std::string& val) { m_data[key] = val; }
+    void Erase(const std::string& key) { m_data.erase(key); }
 
 private:
     std::filesystem::path m_path;

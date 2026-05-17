@@ -1,4 +1,6 @@
 #include "App.h"
+#include "core/OcrIndexer.h"
+#include "util/Levenshtein.h"
 #include "util/Log.h"
 #include "util/Trace.h"
 #include "util/CommandLine.h"
@@ -310,6 +312,11 @@ bool App::Init() {
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
+    // Search panel visibility + query are intentionally NOT persisted: it's
+    // a transient finder, like Cmd+F in an editor — should start closed
+    // each session, not auto-reopen with a stale query the user has long
+    // forgotten about.
+    m_searchPanelLayoutNeedsReset = !m_prefSettings.GetBool("search_panel_layout_v2", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
     m_player.SetMuted(m_prefSettings.GetBool("muted", false));
     m_exportDirMode = static_cast<ExportDirMode>(
@@ -356,6 +363,26 @@ bool App::Init() {
     LOG_INFO("ScrubCut initialized");
     m_running = true;
 
+    // M1 link-and-load check: verify Tesseract + eng.traineddata are wired up.
+    // Cheap (no per-pixel work), failure is just a warning — the rest of the
+    // app stays functional even if OCR can't init.
+    OcrIndexer::SelfTest();
+
+    // -test-search: scripted M3 verification. Activated here so OpenFile()
+    // (called below for the cmdline file arg) sees the test phase and
+    // starts the indexer automatically. -test-query "..." sets the filter
+    // injected at the second screenshot phase.
+    if (CommandLine::Get().HasFlag("-test-search")) {
+        m_testSearchPhase = TestSearchPhase::WaitingForIndex;
+        m_testSearchQuery = CommandLine::Get().GetValue("-test-query", "alpha");
+        // Wipe prior screenshots so the harness always produces _001 / _002.
+        auto shotDir = GetAppDataDir() / "screenshots";
+        std::error_code ec;
+        std::filesystem::remove_all(shotDir, ec);
+        std::filesystem::create_directories(shotDir, ec);
+        LOG_INFO("test-search mode armed (query=\"%s\")", m_testSearchQuery.c_str());
+    }
+
     // Open file passed on the command line (e.g. via file association on Windows)
     std::string fileArg = CommandLine::Get().GetFileArg();
     if (!fileArg.empty())
@@ -401,6 +428,149 @@ void App::Run() {
 
         // Pick up frames from seeks triggered during Render (timeline/slider drags)
         fetchFrame();
+
+        if (m_testSearchPhase != TestSearchPhase::Off)
+            TickTestSearch();
+    }
+}
+
+// Drives the -test-search harness one frame at a time. Each phase waits a
+// couple of frames after the state change so ImGui has a chance to render
+// the new state before we ask the framebuffer to be captured.
+std::vector<int> App::BuildSearchMatchIdx(const std::vector<TextOccurrence>& occs) const {
+    std::vector<int> out;
+    // Empty query intentionally returns nothing: matching everything makes
+    // the timeline a solid band of amber and the bbox cover every word on
+    // screen, which is just noise. The panel shows a placeholder instead.
+    if (m_searchQuery[0] == '\0') return out;
+    out.reserve(occs.size());
+    std::string q = m_searchQuery;
+    for (int i = 0; i < static_cast<int>(occs.size()); i++) {
+        for (const auto& w : occs[i].words) {
+            if (lev::ContainsFuzzy(w.text, q, 0.7)) {
+                out.push_back(i);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+void App::NavigateMatch(bool forward) {
+    if (!m_player.HasMedia()) return;
+    auto occs = m_ocrIndex.Snapshot();
+    auto matches = BuildSearchMatchIdx(occs);
+    if (matches.empty()) return;
+    int n = static_cast<int>(matches.size());
+    int next;
+    if (forward) {
+        next = (m_activeMatchIndex < 0 || m_activeMatchIndex >= n - 1) ? 0
+                                                                       : m_activeMatchIndex + 1;
+    } else {
+        next = (m_activeMatchIndex <= 0) ? n - 1 : m_activeMatchIndex - 1;
+    }
+    m_activeMatchIndex = next;
+    m_player.SeekTo(occs[matches[next]].startSec);
+    m_lastUIActivityNS = SDL_GetTicksNS();
+}
+
+void App::TickTestSearch() {
+    m_testSearchPhaseFrames++;
+    auto advance = [&](TestSearchPhase next) {
+        m_testSearchPhase = next;
+        m_testSearchPhaseFrames = 0;
+    };
+    switch (m_testSearchPhase) {
+    case TestSearchPhase::Off:
+    case TestSearchPhase::Done:
+        return;
+    case TestSearchPhase::WaitingForIndex:
+        if (!m_ocrIndex.IsRunning() && m_testSearchPhaseFrames > 2) {
+            auto occs = m_ocrIndex.Snapshot();
+            LOG_INFO("test-search: indexing done, %zu occurrences", occs.size());
+            for (size_t i = 0; i < occs.size(); i++) {
+                std::string text;
+                for (const auto& l : occs[i].words) {
+                    if (!text.empty()) text += " | ";
+                    text += l.text;
+                }
+                LOG_INFO("test-search: occ[%zu] %.2f-%.2f \"%s\"",
+                         i, occs[i].startSec, occs[i].endSec, text.c_str());
+            }
+            m_searchQuery[0] = '\0';
+            advance(TestSearchPhase::ShotEmptyQuery);
+        }
+        break;
+    case TestSearchPhase::ShotEmptyQuery:
+        // Frame 0: state set. Frame 1: ImGui draws. Frame 2: capture.
+        if (m_testSearchPhaseFrames == 2) m_screenshotPending = true;
+        if (m_testSearchPhaseFrames >= 3) {
+            LOG_INFO("test-search: shot 1 taken (empty query, all matches)");
+            advance(TestSearchPhase::InjectQuery);
+        }
+        break;
+    case TestSearchPhase::InjectQuery:
+        snprintf(m_searchQuery, sizeof(m_searchQuery), "%s", m_testSearchQuery.c_str());
+        // ImGui's focused InputText holds an internal scratch buffer that it
+        // writes back to m_searchQuery each frame — that would clobber our
+        // injection. Releasing the active widget forces InputText to reinit
+        // from m_searchQuery on the next render.
+        ImGui::ClearActiveID();
+        LOG_INFO("test-search: injected query=\"%s\"", m_searchQuery);
+        advance(TestSearchPhase::SeekToMatch);
+        break;
+    case TestSearchPhase::SeekToMatch: {
+        // Seek to the midpoint of the first occurrence whose lines match the
+        // query, so the on-video bbox overlay is visible in the screenshot.
+        auto occs = m_ocrIndex.Snapshot();
+        std::string q = m_searchQuery;
+        for (const auto& occ : occs) {
+            for (const auto& l : occ.words) {
+                if (q.empty() || lev::ContainsFuzzy(l.text, q, 0.7)) {
+                    double mid = (occ.startSec + occ.endSec) * 0.5;
+                    m_player.SeekTo(mid);
+                    LOG_INFO("test-search: seek to %.2fs (within \"%s\")", mid, l.text.c_str());
+                    goto seek_done;
+                }
+            }
+        }
+        seek_done:
+        advance(TestSearchPhase::WaitForSeek);
+        break;
+    }
+    case TestSearchPhase::WaitForSeek:
+        // Give the player a few frames to land on the seeked frame so the
+        // viewport actually shows the on-screen text before we capture.
+        if (m_testSearchPhaseFrames >= 30) advance(TestSearchPhase::ShotFilteredQuery);
+        break;
+    case TestSearchPhase::ShotFilteredQuery:
+        if (m_testSearchPhaseFrames == 2) m_screenshotPending = true;
+        if (m_testSearchPhaseFrames >= 3) {
+            LOG_INFO("test-search: shot 2 taken (filtered)");
+            advance(TestSearchPhase::ClearQuery);
+        }
+        break;
+    case TestSearchPhase::ClearQuery:
+        // Keep the query so F3 still has matches to navigate. The phase name
+        // is historical; this is now a no-op separator before the F3 step.
+        advance(TestSearchPhase::NavF3);
+        break;
+    case TestSearchPhase::NavF3:
+        NavigateMatch(true);
+        LOG_INFO("test-search: F3 -> activeMatch=%d", m_activeMatchIndex);
+        advance(TestSearchPhase::WaitForNavSeek);
+        break;
+    case TestSearchPhase::WaitForNavSeek:
+        if (m_testSearchPhaseFrames >= 30) advance(TestSearchPhase::ShotAfterNav);
+        break;
+    case TestSearchPhase::ShotAfterNav:
+        if (m_testSearchPhaseFrames == 2) m_screenshotPending = true;
+        if (m_testSearchPhaseFrames >= 3) {
+            LOG_INFO("test-search: shot 3 taken (after F3 nav to second match)");
+            m_running = false;
+            advance(TestSearchPhase::Done);
+        }
+        break;
     }
 }
 
@@ -432,6 +602,11 @@ void App::Shutdown() {
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
+        // Strip any previously-persisted search prefs from older builds so
+        // they don't linger as dead keys.
+        m_prefSettings.Erase("show_search_panel");
+        m_prefSettings.Erase("last_search_query");
+        m_prefSettings.SetBool("search_panel_layout_v2", true);
         m_prefSettings.SetFloat("volume", m_player.GetVolume());
         m_prefSettings.SetBool("muted", m_player.IsMuted());
         m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
@@ -488,6 +663,27 @@ void App::OpenFile(const std::string& path) {
     m_currentFilePath = path;
     m_segments.Clear();
     m_segmentsClosedManually = false;
+
+    // Drop any prior file's OCR results. Indexing is lazy — starts on the
+    // next Cmd+F for this file (see ProcessEvents).
+    m_ocrIndex.Reset();
+    m_lastIndexedFile.clear();
+    m_activeMatchIndex = -1;
+
+    // Headless search-test harness: opening a file in this mode auto-opens
+    // the search panel and kicks off the indexer immediately, so the rest
+    // of the harness can run without keyboard input. Auto-focus is left OFF
+    // here on purpose — focusing the InputText latches its internal scratch
+    // from m_searchQuery at activation time, after which subsequent direct
+    // writes to m_searchQuery get overwritten by the scratch each frame.
+    if (m_testSearchPhase != TestSearchPhase::Off) {
+        m_showSearchPanel = true;
+        m_searchPanelJustOpened = false;
+        m_ocrIndex.Start(path, m_player.GetDuration());
+        m_lastIndexedFile = path;
+        m_testSearchPhase = TestSearchPhase::WaitingForIndex;
+        m_testSearchPhaseFrames = 0;
+    }
 
     // Kick off the background waveform scan only when enabled. Otherwise
     // reset so stale peaks from the previously-open file don't show up if
@@ -579,6 +775,23 @@ void App::ProcessEvents() {
         // modal popup is open), so the shortcut stays useful for debugging.
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12) {
             m_screenshotPending = true;
+        }
+        // Cmd+F / Ctrl+F toggles the search panel. Handled here (before the
+        // WantCaptureKeyboard guard) so it also fires while the user is
+        // typing inside the panel's own InputText, matching editor convention.
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F &&
+            (event.key.mod & kKeys.cmdMod) &&
+            !(event.key.mod & (SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
+            m_showSearchPanel = !m_showSearchPanel;
+            if (m_showSearchPanel) {
+                m_searchPanelJustOpened = true;
+                if (m_player.HasMedia() && m_lastIndexedFile != m_currentFilePath) {
+                    m_ocrIndex.Start(m_currentFilePath, m_player.GetDuration());
+                    m_lastIndexedFile = m_currentFilePath;
+                    m_activeMatchIndex = -1;
+                }
+            }
+            continue;
         }
         if (event.type == SDL_EVENT_KEY_DOWN && !ImGui::GetIO().WantCaptureKeyboard) {
             SDL_Keymod mod = event.key.mod;
@@ -787,6 +1000,10 @@ void App::ProcessEvents() {
             case SDLK_F:
                 if (!noMod) break;
                 SetFullscreen(!m_fullscreen);
+                break;
+            case SDLK_F3:
+                if (cmd || (mod & SDL_KMOD_ALT) || (mod & SDL_KMOD_GUI)) break;
+                NavigateMatch(!shift);
                 break;
             case SDLK_ESCAPE:
                 if (!noMod) break;
@@ -1069,6 +1286,7 @@ void App::Render() {
                 m_showTimeline = true;
                 m_showSegments = true;
                 m_showHelpPanel = true;
+                m_showSearchPanel = true;
                 m_segmentsClosedManually = false;
                 m_hideFloatingWindowsAfterReset = true;
                 float scale = m_ui.GetDpiScale();
@@ -1129,6 +1347,46 @@ void App::Render() {
         ));
         ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_videoTexture)),
                       ImVec2(displayW, displayH));
+
+        // On-video bounding box overlay. Only matched words get boxes, and
+        // only while the playhead is inside the occurrence's time range.
+        // Gated on a non-empty query: with no query we'd box every word on
+        // screen, which is just visual noise.
+        if (m_searchQuery[0] != '\0') {
+            ImVec2 imgTL = ImGui::GetItemRectMin();
+            ImVec2 imgBR = ImGui::GetItemRectMax();
+            float dispW = imgBR.x - imgTL.x;
+            float dispH = imgBR.y - imgTL.y;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->PushClipRect(imgTL, imgBR, true);
+
+            double t = m_player.GetPlaybackTime();
+            auto occs = m_ocrIndex.Snapshot();
+            auto matchIdx = BuildSearchMatchIdx(occs);
+            int activeOcc = (m_activeMatchIndex >= 0 &&
+                             m_activeMatchIndex < static_cast<int>(matchIdx.size()))
+                            ? matchIdx[m_activeMatchIndex]
+                            : -1;
+            std::string q = m_searchQuery;
+            const double eps = 0.05;
+            for (int oi : matchIdx) {
+                const auto& occ = occs[oi];
+                if (t < occ.startSec - eps || t > occ.endSec + eps) continue;
+                bool active = (oi == activeOcc);
+                for (const auto& w : occ.words) {
+                    if (!lev::ContainsFuzzy(w.text, q, 0.7)) continue;
+                    ImVec2 a(imgTL.x + w.bx * dispW,
+                             imgTL.y + w.by * dispH);
+                    ImVec2 b(imgTL.x + (w.bx + w.bw) * dispW,
+                             imgTL.y + (w.by + w.bh) * dispH);
+                    int fillA = active ? 80 : 50;
+                    int outA  = active ? 240 : 200;
+                    dl->AddRectFilled(a, b, IM_COL32(255, 220, 0, fillA));
+                    dl->AddRect(a, b, IM_COL32(255, 220, 0, outA), 0.0f, 0, active ? 2.5f : 1.5f);
+                }
+            }
+            dl->PopClipRect();
+        }
     } else {
         std::string line1 = "Drag and drop a video file to open it";
         std::string line2 = "or press " + std::string(kKeys.cmdName) + "+O to browse";
@@ -1508,6 +1766,50 @@ void App::Render() {
                         lineCol, 2.0f);
                 }
                 drawList->PopClipRect();
+            }
+        }
+
+        // Text-search match overlays — drawn after segments so they sit on top
+        // of segment fills, and before frame marks so user marks remain the
+        // visually dominant cue. Only painted when a query is set: an empty
+        // query would otherwise stripe the whole bar wherever text exists.
+        bool searchActive = (m_searchQuery[0] != '\0') && duration > 0.0;
+        int hoveredSearchMatch = -1;
+        if (searchActive) {
+            auto searchOccs = m_ocrIndex.Snapshot();
+            auto searchMatchIdx = BuildSearchMatchIdx(searchOccs);
+            std::string q = m_searchQuery;
+            for (int mi = 0; mi < static_cast<int>(searchMatchIdx.size()); mi++) {
+                const auto& occ = searchOccs[searchMatchIdx[mi]];
+                float x0 = barPos.x + static_cast<float>(occ.startSec / duration) * barWidth;
+                float x1 = barPos.x + static_cast<float>(occ.endSec / duration) * barWidth;
+                if (x1 < x0 + 1.0f) x1 = x0 + 1.0f;
+                bool overBar = mousePos.x >= x0 && mousePos.x <= x1 &&
+                               mousePos.y >= barPos.y && mousePos.y <= barPos.y + barHeight;
+                if (overBar) hoveredSearchMatch = mi;
+                bool active = (mi == m_activeMatchIndex);
+                int fillA = active ? 110 : 60;
+                int outA  = active ? 240 : 170;
+                if (overBar) { fillA = 150; outA = 255; }
+                drawList->AddRectFilled(
+                    ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight),
+                    fadeCol(255, 200, 50, fillA));
+                drawList->AddRect(
+                    ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight),
+                    fadeCol(255, 200, 50, outA), 0.0f, 0, active ? 2.0f : 1.0f);
+            }
+            if (hoveredSearchMatch >= 0) {
+                const auto& occ = searchOccs[searchMatchIdx[hoveredSearchMatch]];
+                // Tooltip is the matched words only — joining every word on
+                // the frame produces a huge unreadable wall of OCR'd UI text.
+                std::string tip;
+                for (const auto& w : occ.words) {
+                    if (lev::ContainsFuzzy(w.text, q, 0.7)) {
+                        if (!tip.empty()) tip += " ";
+                        tip += w.text;
+                    }
+                }
+                if (!tip.empty()) ImGui::SetTooltip("%s", tip.c_str());
             }
         }
 
@@ -2142,13 +2444,117 @@ void App::Render() {
         ImGui::PopStyleVar();
     }
 
-    // Reset Layout briefly forced Marks/Help visible so their Begin blocks ran
-    // with layoutCond = Always (re-applying default Pos/Size). Now re-hide them
-    // so the user-visible end state matches the intended hidden defaults.
+    // Search panel (Cmd+F / Ctrl+F)
+    if (m_showSearchPanel && !m_uiHidden) {
+        ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
+        float dpi = m_ui.GetDpiScale();
+        // Top-left, offset down so it sits below the Help panel header.
+        // Marks lives in the top-right; the right side is busy. Help (when
+        // shown) also lives top-left and auto-resizes — partial overlap is
+        // intentional and acceptable per design.
+        ImGuiCond searchPosCond = (wasResetFrame || m_searchPanelLayoutNeedsReset)
+            ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+        m_searchPanelLayoutNeedsReset = false;
+        ImGui::SetNextWindowPos(
+            ImVec2(vp->WorkPos.x + 40 * dpi,
+                   vp->WorkPos.y + 120 * dpi),
+            searchPosCond);
+        ImGui::SetNextWindowSize(ImVec2(440 * dpi, 360 * dpi), searchPosCond);
+        ImGui::Begin("Search", &m_showSearchPanel);
+
+        if (m_searchPanelJustOpened) {
+            ImGui::SetKeyboardFocusHere();
+            m_searchPanelJustOpened = false;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##query", m_searchQuery, sizeof(m_searchQuery));
+
+        auto occs = m_ocrIndex.Snapshot();
+        std::string q = m_searchQuery;
+        auto matches = BuildSearchMatchIdx(occs);
+
+        bool indexing = m_ocrIndex.IsRunning();
+        int processed = m_ocrIndex.GetProcessedSeconds();
+        int total = m_ocrIndex.GetTotalSeconds();
+        if (!m_player.HasMedia()) {
+            ImGui::TextDisabled("Open a video to enable search.");
+        } else if (q.empty()) {
+            if (indexing && total > 0) {
+                int pct = (processed * 100) / total;
+                ImGui::TextDisabled("Indexing %d%%  -  type to search", pct);
+            } else {
+                ImGui::TextDisabled("Type to search OCR'd words");
+            }
+        } else if (indexing && total > 0) {
+            int pct = (processed * 100) / total;
+            ImGui::Text("Indexing %d%%  -  %zu matches", pct, matches.size());
+        } else {
+            ImGui::Text("%zu matches", matches.size());
+        }
+        ImGui::Separator();
+
+        // Reserve room at the bottom for the Prev / Next buttons so the
+        // results list scrolls within the panel and the buttons stay
+        // anchored. Negative-Y BeginChild = "fill except this much".
+        float btnRowH = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+        ImGui::BeginChild("##results", ImVec2(0, -btnRowH), ImGuiChildFlags_None);
+        for (int mi = 0; mi < static_cast<int>(matches.size()); mi++) {
+            int oi = matches[mi];
+            const auto& occ = occs[oi];
+            // Row text is just the matched words from this occurrence joined
+            // by space — quiet, scannable, and matches the bbox highlight.
+            std::string showText;
+            for (const auto& w : occ.words) {
+                if (lev::ContainsFuzzy(w.text, q, 0.7)) {
+                    if (!showText.empty()) showText += ' ';
+                    showText += w.text;
+                }
+            }
+            if (showText.empty()) continue;
+
+            auto fmtTime = [](char* out, int n, double t) {
+                int mn = static_cast<int>(t / 60.0);
+                double sec = t - mn * 60.0;
+                snprintf(out, n, "%02d:%06.3f", mn, sec);
+            };
+            char ts[32], te[32], label[320];
+            fmtTime(ts, sizeof(ts), occ.startSec);
+            fmtTime(te, sizeof(te), occ.endSec);
+            snprintf(label, sizeof(label), "%s - %s   %s##row%d",
+                     ts, te, showText.c_str(), oi);
+            bool selected = (mi == m_activeMatchIndex);
+            if (ImGui::Selectable(label, selected)) {
+                m_player.SeekTo(occ.startSec);
+                m_activeMatchIndex = mi;
+                m_lastUIActivityNS = SDL_GetTicksNS();
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::BeginDisabled(matches.empty());
+        if (ImGui::Button("Previous")) NavigateMatch(false);
+        ImGui::SetItemTooltip("Shift+F3");
+        ImGui::SameLine();
+        if (ImGui::Button("Next")) NavigateMatch(true);
+        ImGui::SetItemTooltip("F3");
+        ImGui::EndDisabled();
+
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
+    // Reset Layout briefly forced Marks/Help/Search visible so their Begin
+    // blocks ran with layoutCond = Always (re-applying default Pos/Size).
+    // Now re-hide them so the user-visible end state matches the intended
+    // hidden defaults. This runs after every floating panel's Begin so
+    // none of them get hidden before their reset Pos/Size is applied.
     if (wasResetFrame && m_hideFloatingWindowsAfterReset) {
         m_hideFloatingWindowsAfterReset = false;
         m_showSegments = false;
         m_showHelpPanel = false;
+        m_showSearchPanel = false;
     }
 
     // Export dialog

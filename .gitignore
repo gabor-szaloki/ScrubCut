@@ -4,6 +4,12 @@ out/
 cmake-build-*/
 _CPack_Packages/
 
+# Fetched at configure time (~22MB), not committed
+third_party/tesseract_data/
+
+# Test fixtures, generated on demand
+test_assets/
+
 
 # IDE
 .vs/

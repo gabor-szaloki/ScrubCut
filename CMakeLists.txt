@@ -26,6 +26,54 @@ find_package(OpenGL REQUIRED)
 # FFmpeg - vcpkg provides config-mode find modules
 find_package(FFMPEG REQUIRED)
 
+# Tesseract (OCR) — pulls Leptonica transitively via its vcpkg port
+find_package(Tesseract CONFIG REQUIRED)
+
+# --- Bundled OCR model (eng.traineddata) ---
+# Use the "fast" variant from tessdata_fast — an integer-quantized LSTM that
+# runs ~2-3x faster than the standard model at a small accuracy cost. Real
+# on-screen text still OCRs cleanly; combined with the indexer's confidence
+# filter the net accuracy ends up higher because fewer hallucinations make
+# it through. The marker file lets us re-download when we change variants.
+set(_TESSDATA_DIR "${CMAKE_SOURCE_DIR}/third_party/tesseract_data")
+set(_TESSDATA_FILE "${_TESSDATA_DIR}/eng.traineddata")
+set(_TESSDATA_MARKER "${_TESSDATA_DIR}/.variant")
+set(_TESSDATA_VARIANT "fast-v1")
+set(_TESSDATA_URL "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata")
+
+set(_TESSDATA_NEEDS_FETCH OFF)
+if(NOT EXISTS "${_TESSDATA_FILE}")
+    set(_TESSDATA_NEEDS_FETCH ON)
+elseif(NOT EXISTS "${_TESSDATA_MARKER}")
+    # File exists but pre-dates the marker → was the old "best" model.
+    set(_TESSDATA_NEEDS_FETCH ON)
+else()
+    file(READ "${_TESSDATA_MARKER}" _TESSDATA_HAVE_VARIANT)
+    string(STRIP "${_TESSDATA_HAVE_VARIANT}" _TESSDATA_HAVE_VARIANT)
+    if(NOT _TESSDATA_HAVE_VARIANT STREQUAL _TESSDATA_VARIANT)
+        set(_TESSDATA_NEEDS_FETCH ON)
+    endif()
+endif()
+
+if(_TESSDATA_NEEDS_FETCH)
+    message(STATUS "Downloading Tesseract eng.traineddata (fast variant, ~4 MB) ...")
+    file(MAKE_DIRECTORY "${_TESSDATA_DIR}")
+    file(REMOVE "${_TESSDATA_FILE}" "${_TESSDATA_MARKER}")
+    file(DOWNLOAD
+        "${_TESSDATA_URL}"
+        "${_TESSDATA_FILE}"
+        SHOW_PROGRESS
+        TLS_VERIFY ON
+        STATUS _TESSDATA_DOWNLOAD_STATUS
+    )
+    list(GET _TESSDATA_DOWNLOAD_STATUS 0 _TESSDATA_DL_RC)
+    if(NOT _TESSDATA_DL_RC EQUAL 0)
+        file(REMOVE "${_TESSDATA_FILE}")
+        message(FATAL_ERROR "Failed to download eng.traineddata: ${_TESSDATA_DOWNLOAD_STATUS}")
+    endif()
+    file(WRITE "${_TESSDATA_MARKER}" "${_TESSDATA_VARIANT}\n")
+endif()
+
 # --- Sources ---
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
@@ -65,6 +113,16 @@ target_link_libraries(ScrubCut PRIVATE
     imgui::imgui
     OpenGL::GL
     ${FFMPEG_LIBRARIES}
+    Tesseract::libtesseract
+)
+
+# Copy eng.traineddata next to the binary so SDL_GetBasePath() finds it
+# during dev runs from the build tree (mirrors the bundled install layout).
+add_custom_command(TARGET ScrubCut POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${_TESSDATA_FILE}"
+        "$<TARGET_FILE_DIR:ScrubCut>/eng.traineddata"
+    VERBATIM
 )
 
 # Link ws2_32 and friends on Windows (needed by FFmpeg)
@@ -91,6 +149,9 @@ if(WIN32)
     # License and icon
     install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico" DESTINATION ".")
+
+    # OCR model
+    install(FILES "${_TESSDATA_FILE}" DESTINATION ".")
 
     # --- CPack / NSIS installer ---
     set(CPACK_GENERATOR "NSIS")
@@ -145,6 +206,7 @@ elseif(APPLE)
     install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
     install(FILES "${CMAKE_BINARY_DIR}/Info.plist" DESTINATION "ScrubCut.app/Contents")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
+    install(FILES "${_TESSDATA_FILE}" DESTINATION "ScrubCut.app/Contents/Resources")
     install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
 
     # --- CPack / DragNDrop DMG ---

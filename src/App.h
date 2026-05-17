@@ -4,6 +4,7 @@
 #include "core/Player.h"
 #include "core/SegmentManager.h"
 #include "core/WaveformExtractor.h"
+#include "core/OcrIndexer.h"
 #include "export/Exporter.h"
 #include "util/Settings.h"
 
@@ -55,6 +56,54 @@ private:
     SegmentManager m_segments;
     Exporter m_exporter;
     WaveformExtractor m_waveform;
+    OcrIndexer m_ocrIndex;
+
+    // Text-search state. Indexer is started lazily on the first Cmd+F for a
+    // given file (`m_lastIndexedFile` tracks which file the current index
+    // corresponds to). m_activeMatchIndex is the result index navigated by
+    // F3 / Shift+F3 and rendered with a brighter overlay.
+    bool m_showSearchPanel = false;
+    bool m_searchPanelJustOpened = false;
+    char m_searchQuery[256] = "";
+    int  m_activeMatchIndex = -1;
+    std::string m_lastIndexedFile;
+    // One-shot: forces the Search panel to its current default pos/size on
+    // the first time it's rendered for a user upgrading from a build with a
+    // different default. Persists `search_panel_layout_v2=1` in prefs once
+    // applied so user-moved positions stick after that.
+    bool m_searchPanelLayoutNeedsReset = false;
+
+    // Build the list of indices into `occs` that match the current
+    // m_searchQuery (or every index when the query is empty). Used by F3
+    // nav and the panel/timeline/bbox renderers to stay in sync about
+    // which occurrences are "matches" and which one is active.
+    std::vector<int> BuildSearchMatchIdx(const std::vector<TextOccurrence>& occs) const;
+    // Advance m_activeMatchIndex by ±1 (wrapping) and seek the player to
+    // that match's startSec. No-op when there are no matches.
+    void NavigateMatch(bool forward);
+
+    // Headless harness for `-test-search`: walks through a scripted sequence
+    // (auto-open panel → wait for indexer → screenshot → inject query →
+    // screenshot → quit) so the search UI is exercised end-to-end from a
+    // shell command. Phase + frame counter advance each Run iteration.
+    enum class TestSearchPhase {
+        Off,
+        WaitingForIndex,
+        ShotEmptyQuery,
+        InjectQuery,
+        SeekToMatch,
+        WaitForSeek,
+        ShotFilteredQuery,
+        ClearQuery,
+        NavF3,
+        WaitForNavSeek,
+        ShotAfterNav,
+        Done
+    };
+    TestSearchPhase m_testSearchPhase = TestSearchPhase::Off;
+    std::string m_testSearchQuery;
+    int m_testSearchPhaseFrames = 0;
+    void TickTestSearch();
 
     // UI state — window visibility
     bool m_showTimeline = true;

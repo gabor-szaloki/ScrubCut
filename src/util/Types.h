@@ -53,6 +53,25 @@ struct Chapter {
     std::string title;
 };
 
+// One OCR'd token (word) of text on a video frame, with its bounding box in
+// normalized source-frame coordinates (0..1 along width / height). Normalized
+// so cached data survives display-size changes and renderers don't need
+// source dims. Per-word granularity lets the search filter and bbox overlay
+// pinpoint individual words instead of highlighting an entire menu bar.
+struct TextSpan {
+    std::string text;
+    float bx = 0.0f, by = 0.0f, bw = 0.0f, bh = 0.0f;
+};
+
+// A contiguous time range during which a particular set of TextSpans is on
+// screen. `words` is captured from the first sample that created the
+// occurrence — if content drifts later, boxes go stale (accepted v1 tradeoff).
+struct TextOccurrence {
+    double startSec = 0.0;
+    double endSec = 0.0;
+    std::vector<TextSpan> words;
+};
+
 struct ExportSettings {
     std::string outputPath;
     std::vector<TimeRange> segments;
