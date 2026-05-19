@@ -935,15 +935,15 @@ void App::Render() {
         m_uiAlpha = 1.0f;
     }
 
-    // Auto-hide mouse cursor
-    if (m_autoHideCursor && m_lastUIActivityNS > 0) {
+    // Auto-hide mouse cursor (same empty-state carve-out as UI auto-hide).
+    // Route through ImGui::SetMouseCursor instead of SDL_HideCursor directly:
+    // the ImGui SDL3 backend's NewFrame already calls SDL_ShowCursor every
+    // frame, so a late SDL_HideCursor fights it and causes per-frame flicker.
+    // Doing nothing in the "show" case lets ImGui's default Arrow cursor win.
+    if (m_autoHideCursor && m_lastUIActivityNS > 0 && m_player.HasMedia()) {
         uint64_t elapsed = SDL_GetTicksNS() - m_lastUIActivityNS;
         if (elapsed > 5000000000ULL && !hoveringUI)
-            SDL_HideCursor();
-        else
-            SDL_ShowCursor();
-    } else {
-        SDL_ShowCursor();
+            ImGui::SetMouseCursor(ImGuiMouseCursor_None);
     }
 
     // Menu bar — overlay on top of video with fade, subject to auto-hide
