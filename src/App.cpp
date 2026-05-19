@@ -344,11 +344,15 @@ bool App::Init() {
         m_showSegments = m_layoutSettings.GetBool("show_segments", false);
     }
 
+#if !defined(_WIN32) && !defined(__APPLE__)
     // Block until the windowing system commits the requested size/position.
     // Without this, on X11/Wayland SDL_GetWindowSize returns the creation
     // default for several frames, and the proportional-resize logic in
     // Render() sees a spurious viewport jump and inflates floating panels.
+    // On macOS, however, this considerably slows down startup, and the app
+    // works just fine without.
     SDL_SyncWindow(m_window);
+#endif
 
     SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
     SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
