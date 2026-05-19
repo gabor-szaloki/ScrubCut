@@ -309,7 +309,7 @@ bool App::Init() {
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
-    m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", true);
+    m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
     m_player.SetMuted(m_prefSettings.GetBool("muted", false));
     m_exportDirMode = static_cast<ExportDirMode>(
@@ -550,9 +550,7 @@ void App::ProcessEvents() {
             event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
             event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
             event.type == SDL_EVENT_MOUSE_WHEEL) {
-            m_lastUIActivityNS = SDL_GetTicksNS();
-            if (m_autoHideUI)
-                m_uiHidden = false;
+            BumpUIActivity();
         }
 
         if (!m_fullscreen && (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)) {
@@ -694,8 +692,7 @@ void App::ProcessEvents() {
                     m_segments.SetMarkIn(m_player.GetPlaybackTime());
                     if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
-                    m_lastUIActivityNS = SDL_GetTicksNS();
-                    if (m_autoHideUI) m_uiHidden = false;
+                    BumpUIActivity();
                 }
                 break;
             case SDLK_O:
@@ -725,8 +722,7 @@ void App::ProcessEvents() {
                         int last = m_segments.GetCount() - 1;
                         m_segments.UpdateSegment(last, m_segments.GetSegments()[last].startSec, now_t);
                     }
-                    m_lastUIActivityNS = SDL_GetTicksNS();
-                    if (m_autoHideUI) m_uiHidden = false;
+                    BumpUIActivity();
                 }
                 break;
             case SDLK_DELETE:
@@ -734,8 +730,7 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_segments.GetTotalCount() > 0) {
                     m_segments.RemoveLastMark();
-                    m_lastUIActivityNS = SDL_GetTicksNS();
-                    if (m_autoHideUI) m_uiHidden = false;
+                    BumpUIActivity();
                 }
                 break;
             case SDLK_P:
@@ -745,8 +740,7 @@ void App::ProcessEvents() {
                     m_segments.AddFrame(m_player.GetPlaybackTime());
                     if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
-                    m_lastUIActivityNS = SDL_GetTicksNS();
-                    if (m_autoHideUI) m_uiHidden = false;
+                    BumpUIActivity();
                 }
                 break;
             case SDLK_E:
@@ -756,12 +750,16 @@ void App::ProcessEvents() {
                 if (cmd) m_pendingExportToggle = true;
                 break;
             case SDLK_T:
-                if (winMod) m_showTimeline = !m_showTimeline;
+                if (winMod) {
+                    m_showTimeline = !m_showTimeline;
+                    BumpUIActivity();
+                }
                 break;
             case SDLK_M:
                 if (winMod) {
                     m_showSegments = !m_showSegments;
                     if (!m_showSegments) m_segmentsClosedManually = true;
+                    BumpUIActivity();
                 } else if (noMod) {
                     m_player.SetMuted(!m_player.IsMuted());
                 }
@@ -797,6 +795,7 @@ void App::ProcessEvents() {
             case SDLK_H:
                 if (winMod) {
                     m_showHelpPanel = !m_showHelpPanel;
+                    BumpUIActivity();
                 } else if (noMod) {
                     if (!m_autoHideUI) {
                         m_uiHidden = !m_uiHidden;
@@ -809,7 +808,10 @@ void App::ProcessEvents() {
                 break;
             case SDLK_SLASH:
                 // ? key (slash + shift)
-                if (shift) m_showHelpPanel = !m_showHelpPanel;
+                if (shift) {
+                    m_showHelpPanel = !m_showHelpPanel;
+                    BumpUIActivity();
+                }
                 break;
             }
         }
@@ -909,10 +911,16 @@ void App::Render() {
         hoveringUI = hovered && strcmp(hovered->Name, "Viewport") != 0;
     }
     if (hoveringUI || ImGui::IsAnyItemHovered())
-        m_lastUIActivityNS = SDL_GetTicksNS();
+        BumpUIActivity();
 
-    // Auto-hide UI after 5 seconds of no mouse activity (with 0.3s fade)
-    if (m_autoHideUI && m_lastUIActivityNS > 0) {
+    // Auto-hide UI after 5 seconds of no mouse activity (with 0.3s fade).
+    // Skip entirely until a video is loaded — the placeholder is the only
+    // thing on screen and hiding the menu/text just to fade to black is
+    // confusing in the empty state.
+    if (!m_player.HasMedia()) {
+        m_uiHidden = false;
+        m_uiAlpha = 1.0f;
+    } else if (m_autoHideUI && m_lastUIActivityNS > 0) {
         uint64_t elapsed = SDL_GetTicksNS() - m_lastUIActivityNS;
         if (elapsed > 5300000000ULL) {
             m_uiHidden = true;
@@ -1291,8 +1299,7 @@ void App::Render() {
             m_segments.SetMarkIn(m_player.GetPlaybackTime());
             if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                 m_showSegments = true;
-            m_lastUIActivityNS = SDL_GetTicksNS();
-            if (m_autoHideUI) m_uiHidden = false;
+            BumpUIActivity();
         }
         TooltipFor("Mark segment start for export", "I  or  [");
         ImGui::SameLine();
@@ -1309,8 +1316,7 @@ void App::Render() {
                 int last = m_segments.GetCount() - 1;
                 m_segments.UpdateSegment(last, m_segments.GetSegments()[last].startSec, now_t);
             }
-            m_lastUIActivityNS = SDL_GetTicksNS();
-            if (m_autoHideUI) m_uiHidden = false;
+            BumpUIActivity();
         }
         if (!canMarkOut) ImGui::EndDisabled();
         TooltipFor("Mark segment end for export", "O  or  ]");
@@ -1321,8 +1327,7 @@ void App::Render() {
                 m_segments.AddFrame(m_player.GetPlaybackTime());
                 if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
                     m_showSegments = true;
-                m_lastUIActivityNS = SDL_GetTicksNS();
-                if (m_autoHideUI) m_uiHidden = false;
+                BumpUIActivity();
             }
         }
         TooltipFor("Mark frame for PNG export", "P");
@@ -2689,6 +2694,11 @@ void App::Render() {
     }
 
     SDL_GL_SwapWindow(m_window);
+}
+
+void App::BumpUIActivity() {
+    m_lastUIActivityNS = SDL_GetTicksNS();
+    if (m_autoHideUI) m_uiHidden = false;
 }
 
 void App::CreateVideoTexture(int width, int height) {

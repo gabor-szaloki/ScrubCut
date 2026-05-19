@@ -33,6 +33,11 @@ private:
     void SaveRecentFiles();
     void AddToRecent(const std::string& path);
 
+    // Refresh the auto-hide UI timer (and unhide if currently hidden) —
+    // called whenever the user does something we consider UI activity:
+    // mouse movement, mark/seek shortcuts, window-toggle shortcuts, etc.
+    void BumpUIActivity();
+
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
@@ -72,7 +77,7 @@ private:
     bool m_showTooltips = true;
     bool m_useDpiScaling = false;
     bool m_autoHideCursor = true;
-    bool m_autoHideUI = true;
+    bool m_autoHideUI = false;
 
     // Returns the current DPI scale to apply to the UI. Wraps
     // SDL_GetWindowDisplayScale and returns 1.0 if DPI scaling is disabled
