@@ -595,7 +595,7 @@ void App::ProcessEvents() {
             switch (event.key.key) {
             case SDLK_SPACE:
                 if (!noMod) break;
-                m_player.TogglePlayPause();
+                TogglePlayPauseWithFlash();
                 break;
             case SDLK_LEFT:
                 if (jump)           m_player.SeekTo(0.0);
@@ -1138,6 +1138,68 @@ void App::Render() {
         ));
         ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_videoTexture)),
                       ImVec2(displayW, displayH));
+        ImVec2 imgMin = ImGui::GetItemRectMin();
+        ImVec2 imgMax = ImGui::GetItemRectMax();
+        // Click the video to toggle play/pause; double-click to toggle
+        // fullscreen. ImGui fires both single and double click on the second
+        // click of a double-click, so the play/pause toggles cancel out and
+        // the user sees only a fullscreen change (matches VLC / MPC-HC).
+        if (ImGui::IsItemHovered()) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                TogglePlayPauseWithFlash();
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                SetFullscreen(!m_fullscreen);
+        }
+
+        // Briefly flash a Play/Pause icon at the center of the video after a
+        // toggle — visual confirmation, the kind of thing every mainstream
+        // player does. Skipped when the UI is hidden (immersive mode) so it
+        // doesn't intrude on the clean video view. ~100ms hold + ~400ms fade.
+        if (m_playPauseFlashStartNS > 0 && !m_uiHidden) {
+            uint64_t elapsed = SDL_GetTicksNS() - m_playPauseFlashStartNS;
+            constexpr uint64_t kHoldNS = 100000000ULL;
+            constexpr uint64_t kFadeNS = 400000000ULL;
+            if (elapsed >= kHoldNS + kFadeNS) {
+                m_playPauseFlashStartNS = 0;
+            } else {
+                float alpha = (elapsed <= kHoldNS) ? 1.0f
+                    : 1.0f - static_cast<float>(elapsed - kHoldNS) / static_cast<float>(kFadeNS);
+                ImVec2 c((imgMin.x + imgMax.x) * 0.5f, (imgMin.y + imgMax.y) * 0.5f);
+                float dpi = m_ui.GetDpiScale();
+                float r = 48.0f * dpi;
+                float outline = 4.0f * dpi;
+                ImU32 bgCol = IM_COL32(0, 0, 0, static_cast<int>(200 * alpha));
+                ImU32 fgCol = IM_COL32(255, 255, 255, static_cast<int>(240 * alpha));
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                if (m_playPauseFlashIsPlaying) {
+                    // Just started playing → play triangle. Centered on
+                    // its geometric centroid (mean of the 3 vertices),
+                    // which sits at half the bbox width from the apex.
+                    float tri = r * 0.6f;
+                    float w   = tri * 1.5f;          // base-to-apex distance
+                    float leftX  = c.x - w / 3.0f;   // 2 verts here
+                    float rightX = c.x + 2.0f * w / 3.0f; // apex
+                    ImVec2 p1(leftX,  c.y - tri);
+                    ImVec2 p2(leftX,  c.y + tri);
+                    ImVec2 p3(rightX, c.y);
+                    dl->AddTriangleFilled(p1, p2, p3, fgCol);
+                    dl->AddTriangle(p1, p2, p3, bgCol, outline);
+                } else {
+                    // Just paused → two bars.
+                    float barW = r * 0.22f;
+                    float barH = r * 1.0f;
+                    float gap  = r * 0.18f;
+                    ImVec2 l1(c.x - gap - barW, c.y - barH * 0.5f);
+                    ImVec2 l2(c.x - gap,        c.y + barH * 0.5f);
+                    ImVec2 r1(c.x + gap,        c.y - barH * 0.5f);
+                    ImVec2 r2(c.x + gap + barW, c.y + barH * 0.5f);
+                    dl->AddRectFilled(l1, l2, fgCol);
+                    dl->AddRect(l1, l2, bgCol, 0.0f, 0, outline);
+                    dl->AddRectFilled(r1, r2, fgCol);
+                    dl->AddRect(r1, r2, bgCol, 0.0f, 0, outline);
+                }
+            }
+        }
     } else {
         std::string line1 = "Drag and drop a video file to open it";
         std::string line2 = "or press " + std::string(kKeys.cmdName) + "+O to browse";
@@ -1253,7 +1315,7 @@ void App::Render() {
         TooltipFor("Previous frame", prevFrameSc.c_str());
         ImGui::SameLine();
         if (ImGui::Button(playLabel, ImVec2(playBtnW, 0))) {
-            m_player.TogglePlayPause();
+            TogglePlayPauseWithFlash();
         }
         TooltipFor("Play / Pause", "Space");
         ImGui::SameLine();
@@ -2703,6 +2765,12 @@ void App::Render() {
 void App::BumpUIActivity() {
     m_lastUIActivityNS = SDL_GetTicksNS();
     if (m_autoHideUI) m_uiHidden = false;
+}
+
+void App::TogglePlayPauseWithFlash() {
+    m_player.TogglePlayPause();
+    m_playPauseFlashStartNS = SDL_GetTicksNS();
+    m_playPauseFlashIsPlaying = m_player.IsPlaying();
 }
 
 void App::CreateVideoTexture(int width, int height) {

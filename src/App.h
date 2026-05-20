@@ -38,6 +38,11 @@ private:
     // mouse movement, mark/seek shortcuts, window-toggle shortcuts, etc.
     void BumpUIActivity();
 
+    // Toggle playback and trigger the center-of-video Play/Pause flash —
+    // call this from any user-initiated toggle (Space, video click, the
+    // transport-bar Play button) so the flash fires consistently.
+    void TogglePlayPauseWithFlash();
+
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
@@ -92,6 +97,13 @@ private:
     // fullscreen, so it can be restored exactly on exit.
     struct FloatingWindowSnap { ImVec2 pos; ImVec2 size; bool valid = false; };
     FloatingWindowSnap m_snapTimeline, m_snapSegments, m_snapHelp;
+
+    // Center-of-video Play/Pause flash triggered by clicking the video.
+    // m_playPauseFlashStartNS is the SDL_GetTicksNS when the click happened;
+    // m_playPauseFlashIcon captures which icon to show (the new playback
+    // state at the moment of the click).
+    uint64_t m_playPauseFlashStartNS = 0;
+    bool m_playPauseFlashIsPlaying = false;
     float m_uiAlpha = 1.0f;
     uint64_t m_lastUIActivityNS = 0;
     ImVec2 m_prevViewportSize = {0, 0};
