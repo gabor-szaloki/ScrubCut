@@ -31,6 +31,15 @@
 #define NOMCX
 #define NOIME
 #include <windows.h>
+// We only need DwmSetWindowAttribute from dwmapi. Forward-declare instead of
+// including <dwmapi.h>, which transitively pulls in <rpcndr.h> and its
+// `small` macro that collides with our parameter names. Linker resolves the
+// symbol via dwmapi.lib (linked in CMakeLists.txt).
+extern "C" HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute,
+                                                LPCVOID pvAttribute, DWORD cbAttribute);
+#ifndef DWMWA_TRANSITIONS_FORCEDISABLED
+#define DWMWA_TRANSITIONS_FORCEDISABLED 3
+#endif
 #endif
 
 struct PlatformKeys {
@@ -259,10 +268,14 @@ bool App::Init() {
     windowTitle = "ScrubCut - Debug";
 #endif
 
+    // Create hidden so the user never sees the brief flash of the creation
+    // size / position before we apply the saved geometry (and optional
+    // maximize). SDL_ShowWindow is called once Init has settled the state.
     m_window = SDL_CreateWindow(
         windowTitle,
         1280, 720,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+        SDL_WINDOW_HIDDEN
     );
 
     if (!m_window) {
@@ -354,8 +367,21 @@ bool App::Init() {
     SDL_SyncWindow(m_window);
 #endif
 
+    // Capture the actual unmaximized geometry before any maximize call,
+    // so m_windowedX/Y/W/H holds the right "restore" position later.
     SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
     SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
+
+    // Restore maximized state if the previous session ended maximized.
+    // SDL_EVENT_WINDOW_MAXIMIZED will fire and our handler sets m_maximized.
+    // Applied while the window is still hidden so the user never sees the
+    // windowed-size intermediate state.
+    if (m_layoutSettings.GetBool("window_maximized", false)) {
+        SDL_MaximizeWindow(m_window);
+    }
+
+    // Now reveal the window — at the correct geometry and maximize state.
+    SDL_ShowWindow(m_window);
 
     LOG_INFO("ScrubCut initialized");
     m_running = true;
@@ -420,12 +446,16 @@ void App::Shutdown() {
 
     m_player.Close();
 
-    // Save windowed mode geometry (tracked while not fullscreen)
+    // Save windowed mode geometry (tracked while not fullscreen and not
+    // maximized — m_windowedX/Y/W/H holds the pre-maximize geometry).
+    // m_maximized is tracked separately so reopening returns to maximized
+    // state without losing the unmaximized fallback size.
     if (m_window) {
         m_layoutSettings.SetInt("window_x", m_windowedX);
         m_layoutSettings.SetInt("window_y", m_windowedY);
         m_layoutSettings.SetInt("window_width", m_windowedW);
         m_layoutSettings.SetInt("window_height", m_windowedH);
+        m_layoutSettings.SetBool("window_maximized", m_maximized);
         m_layoutSettings.SetBool("show_timeline", m_showTimeline);
         m_layoutSettings.SetBool("show_segments", m_showSegments);
         m_layoutSettings.Save();
@@ -557,7 +587,19 @@ void App::ProcessEvents() {
             BumpUIActivity();
         }
 
-        if (!m_fullscreen && (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)) {
+        // Track maximize / restore so we can preserve the unmaximized geometry
+        // across sessions even when closing the app while maximized.
+        if (event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
+            m_maximized = true;
+        } else if (event.type == SDL_EVENT_WINDOW_RESTORED) {
+            m_maximized = false;
+        }
+
+        // Capture the unmaximized windowed geometry. Skip when fullscreen
+        // (would store fullscreen bounds) or maximized (would store the
+        // maximized work-area bounds and lose the restore-size for next launch).
+        if (!m_fullscreen && !m_maximized &&
+            (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)) {
             SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
             SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
         }
@@ -894,14 +936,25 @@ void App::Render() {
         m_prevViewportSize = newSize;
     }
 
-    // After fullscreen exit on macOS, wait for the viewport to settle at
-    // windowed size, then restore snapshot positions and suppress the
-    // proportional repositioning that would have fired from the size change.
+    // After fullscreen exit, wait for the viewport to settle, then restore
+    // snapshot positions and suppress the proportional repositioning that
+    // would have fired from the size change. The viewport may settle at one
+    // of two sizes: m_windowedW/H if exiting to windowed, or the maximized
+    // work area if we re-maximized on exit. SDL_EVENT_WINDOW_MAXIMIZED fires
+    // before this check runs, so m_maximized is the cue for the latter case.
     if (m_waitingForFullscreenExit) {
         ImVec2 vpSize = ImGui::GetMainViewport()->Size;
-        float expectedW = static_cast<float>(m_windowedW);
-        float expectedH = static_cast<float>(m_windowedH);
-        if (std::abs(vpSize.x - expectedW) < 2.0f && std::abs(vpSize.y - expectedH) < 2.0f) {
+        bool settled = false;
+        if (m_maximized) {
+            settled = true;
+        } else {
+            float expectedW = static_cast<float>(m_windowedW);
+            float expectedH = static_cast<float>(m_windowedH);
+            if (std::abs(vpSize.x - expectedW) < 2.0f && std::abs(vpSize.y - expectedH) < 2.0f) {
+                settled = true;
+            }
+        }
+        if (settled && vpSize.x > 0 && vpSize.y > 0) {
             m_waitingForFullscreenExit = false;
             RestoreFloatingWindowSnapshots();
             m_prevViewportSize = vpSize;
@@ -1068,7 +1121,13 @@ void App::Render() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Reset Layout")) {
+                // Clear "re-maximize on fullscreen exit" so the upcoming
+                // SetFullscreen(false) doesn't undo our un-maximize below.
+                m_wasMaximizedBeforeFullscreen = false;
                 SetFullscreen(false);
+                if (m_maximized) {
+                    SDL_RestoreWindow(m_window);
+                }
                 m_ui.ResetLayout();
                 // Force all floating panels visible so their Begin blocks
                 // run on the next frame with layoutCond = Always and apply
@@ -2889,6 +2948,15 @@ void App::SetFullscreen(bool fullscreen) {
     if (fullscreen == m_fullscreen) return;
     m_fullscreen = fullscreen;
 
+    // Remember whether we were maximized before going fullscreen, so we can
+    // re-maximize on exit. Unlike the floating-window snapshots below, this
+    // is captured on every entry — m_maximized is just a bool tracking SDL's
+    // MAXIMIZED / RESTORED events, and by the time the user toggles F again
+    // it accurately reflects whether they're maximized or not.
+    if (fullscreen) {
+        m_wasMaximizedBeforeFullscreen = m_maximized;
+    }
+
     // Snapshot / restore floating windows so repeated fullscreen toggles don't
     // accumulate rounding drift from proportional repositioning.
     if (fullscreen) {
@@ -2908,9 +2976,12 @@ void App::SetFullscreen(bool fullscreen) {
         }
         m_waitingForFullscreenExit = false;
     } else {
-        // macOS animates the fullscreen exit — the viewport stays at
-        // fullscreen size during the animation, then snaps to windowed.
-        // Wait for that snap before restoring window positions.
+        // Wait for the viewport to settle at its post-exit size before
+        // restoring snapshot positions. Needed for macOS, which animates
+        // the fullscreen exit and leaves the viewport at fullscreen size
+        // for several frames; on Windows and Linux the wait completes on
+        // the next frame, which is harmless. See the Render-loop settle
+        // check for the matching consume.
         m_waitingForFullscreenExit = true;
     }
 
@@ -2926,8 +2997,33 @@ void App::SetFullscreen(bool fullscreen) {
     HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
 
     if (fullscreen) {
-        SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
-        SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
+        // Refresh windowed geometry from SDL only if we're NOT maximized —
+        // when maximized, m_windowedX/Y/W/H already holds the unmaximized
+        // values from before maximizing, and SDL would report the maximized
+        // bounds here (clobbering the restore size).
+        if (!m_maximized) {
+            SDL_GetWindowPosition(m_window, &m_windowedX, &m_windowedY);
+            SDL_GetWindowSize(m_window, &m_windowedW, &m_windowedH);
+        }
+
+        // Clear the Win32 maximize state before changing window styles.
+        // WINDOWPLACEMENT.showCmd persists across SetWindowLongPtr; without
+        // this, our SetWindowPos to display bounds fights Windows' tracked
+        // maximize-rect and the window ends up un-maximized at the work-area
+        // size instead of going fullscreen. m_wasMaximizedBeforeFullscreen
+        // already captured the bit we need on exit.
+        //
+        // Suppress the DWM maximize/restore animation just for this transition
+        // — without it the user sees the window animate out of maximize then
+        // pop to fullscreen, which feels janky. VLC achieves the "instant"
+        // maximized → fullscreen look the same way. The animation is re-enabled
+        // right after so the reverse (fullscreen → maximized) still animates.
+        if (IsZoomed(hwnd)) {
+            BOOL disable = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                                  &disable, sizeof(disable));
+            ShowWindow(hwnd, SW_RESTORE);
+        }
 
         SDL_DisplayID display = SDL_GetDisplayForWindow(m_window);
         SDL_Rect bounds;
@@ -2937,6 +3033,18 @@ void App::SetFullscreen(bool fullscreen) {
         SetWindowLongPtr(hwnd, GWL_EXSTYLE, WS_EX_APPWINDOW);
         SetWindowPos(hwnd, HWND_TOP, bounds.x, bounds.y, bounds.w, bounds.h,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+
+        // Re-enable DWM transitions so the next exit (fullscreen → windowed
+        // or → maximized) animates normally.
+        BOOL enable = FALSE;
+        DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                              &enable, sizeof(enable));
+
+        // Mirror flag — ShowWindow(SW_RESTORE) above already cleared this
+        // at the Win32 level (and fired SDL_EVENT_WINDOW_RESTORED), but the
+        // event hasn't been dispatched yet during this call. Make sure our
+        // state matches reality.
+        m_maximized = false;
     } else {
         LONG style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
         LONG exStyle = WS_EX_APPWINDOW;
@@ -2956,9 +3064,45 @@ void App::SetFullscreen(bool fullscreen) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, rc.left, rc.top,
                      rc.right - rc.left, rc.bottom - rc.top,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+
+        // Re-maximize if we entered fullscreen from a maximized window.
+        // Suppress the DWM maximize animation for the same reason as on
+        // entry — the user expects an instant transition back to maximized,
+        // not a window animating up from the windowed bounds we just set.
+        // SDL_EVENT_WINDOW_MAXIMIZED will still fire and update m_maximized.
+        if (m_wasMaximizedBeforeFullscreen) {
+            BOOL disable = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                                  &disable, sizeof(disable));
+            SDL_MaximizeWindow(m_window);
+            BOOL enable = FALSE;
+            DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+                                  &enable, sizeof(enable));
+            m_wasMaximizedBeforeFullscreen = false;
+        }
     }
-#else
-    // On macOS, SDL_SetWindowFullscreen works as expected.
+#elif defined(__APPLE__)
+    // On macOS, SDL_SetWindowFullscreen works as expected. Maximized is a
+    // non-concept on macOS (we treat fullscreen as the equivalent), so the
+    // m_wasMaximizedBeforeFullscreen path above won't fire in practice.
     SDL_SetWindowFullscreen(m_window, fullscreen);
+#else
+    // Linux (X11/Wayland): mirror the Windows behaviour using SDL primitives.
+    // SDL_SetWindowFullscreen doesn't reliably preserve maximize state across
+    // the transition, so we handle it explicitly — un-maximize before going
+    // fullscreen, re-maximize on exit if we came from maximized.
+    if (fullscreen) {
+        if (m_maximized) {
+            SDL_RestoreWindow(m_window);
+            m_maximized = false;
+        }
+        SDL_SetWindowFullscreen(m_window, true);
+    } else {
+        SDL_SetWindowFullscreen(m_window, false);
+        if (m_wasMaximizedBeforeFullscreen) {
+            SDL_MaximizeWindow(m_window);
+            m_wasMaximizedBeforeFullscreen = false;
+        }
+    }
 #endif
 }

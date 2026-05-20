@@ -69,7 +69,7 @@ target_link_libraries(ScrubCut PRIVATE
 
 # Link ws2_32 and friends on Windows (needed by FFmpeg)
 if(WIN32)
-    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi)
 endif()
 
 # --- Install ---

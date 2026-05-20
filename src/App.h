@@ -91,6 +91,8 @@ private:
     bool m_uiHidden = false;
     bool m_fullscreen = false;
     int m_windowedX = 0, m_windowedY = 0, m_windowedW = 1280, m_windowedH = 720;
+    bool m_maximized = false;
+    bool m_wasMaximizedBeforeFullscreen = false;
     bool m_waitingForFullscreenExit = false;
 
     // Floating window geometry snapshot (position + size) taken when entering
