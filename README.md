@@ -4,6 +4,10 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 
 <video src="https://github.com/user-attachments/assets/4800c503-a0df-4697-b780-9de4a54129db" controls width="720"></video>
 
+## Install
+
+Prebuilt Windows and macOS installers are available on the [Releases page](https://github.com/gabor-szaloki/ScrubCut/releases).
+
 ## Features
 
 - **Fast scrubbing** -- drag the timeline bar or use keyboard shortcuts to seek instantly
@@ -17,13 +21,9 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 - **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider
 
-## Prerequisites
-
-- **CMake** 3.21+
-- **C++17** compiler (MSVC, GCC, or Clang)
-- **Git** (for cloning and vcpkg submodule)
-
 ## Setup
+
+Requires **CMake** 3.21+, a **C++17** compiler (MSVC, GCC, or Clang), and **Git** (for cloning the repo and the vcpkg submodule).
 
 Clone the repository with the vcpkg submodule:
 
