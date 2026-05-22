@@ -741,7 +741,11 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_player.HasMedia()) {
                     int before = m_segments.GetCount();
-                    m_segments.SetMarkIn(m_player.GetPlaybackTime());
+                    // Use the seek target (what the playhead UI shows), not
+                    // the decoded position — they diverge during slow seeks
+                    // (e.g. GIF) and the user expects the mark at the visible
+                    // playhead, not wherever decode happens to be.
+                    m_segments.SetMarkIn(m_seekTarget);
                     if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
                     BumpUIActivity();
@@ -764,7 +768,7 @@ void App::ProcessEvents() {
             case SDLK_RIGHTBRACKET:
                 if (!noMod) break;
                 if (m_player.HasMedia()) {
-                    double now_t = m_player.GetPlaybackTime();
+                    double now_t = m_seekTarget;
                     if (m_segments.HasPendingMarkIn()) {
                         int before = m_segments.GetCount();
                         m_segments.SetMarkOut(now_t);
@@ -789,7 +793,7 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_player.HasMedia()) {
                     int before = m_segments.GetTotalCount();
-                    m_segments.AddFrame(m_player.GetPlaybackTime());
+                    m_segments.AddFrame(m_seekTarget);
                     if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
                     BumpUIActivity();
@@ -1435,7 +1439,7 @@ void App::Render() {
         }
         if (ImGui::Button("[")) {
             int before = m_segments.GetCount();
-            m_segments.SetMarkIn(m_player.GetPlaybackTime());
+            m_segments.SetMarkIn(m_seekTarget);
             if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                 m_showSegments = true;
             BumpUIActivity();
@@ -1445,7 +1449,7 @@ void App::Render() {
         bool canMarkOut = m_segments.HasPendingMarkIn() || m_segments.GetCount() > 0;
         if (!canMarkOut) ImGui::BeginDisabled();
         if (ImGui::Button("]")) {
-            double now_t = m_player.GetPlaybackTime();
+            double now_t = m_seekTarget;
             if (m_segments.HasPendingMarkIn()) {
                 int before = m_segments.GetCount();
                 m_segments.SetMarkOut(now_t);
@@ -1463,7 +1467,7 @@ void App::Render() {
         if (ImGui::Button("[]")) {
             if (m_player.HasMedia()) {
                 int before = m_segments.GetTotalCount();
-                m_segments.AddFrame(m_player.GetPlaybackTime());
+                m_segments.AddFrame(m_seekTarget);
                 if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
                     m_showSegments = true;
                 BumpUIActivity();
