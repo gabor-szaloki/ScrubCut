@@ -1038,9 +1038,17 @@ void App::Render() {
                     std::string label = std::filesystem::path(full).filename().string();
                     // Suffix index lets duplicate filenames have unique IDs.
                     std::string itemId = label + "##recent" + std::to_string(i);
-                    if (ImGui::MenuItem(itemId.c_str())) toReopen = full;
-                    if (ImGui::IsItemHovered() && g_tooltipsEnabled)
-                        ImGui::SetTooltip("%s", full.c_str());
+                    std::error_code ec;
+                    bool exists = std::filesystem::exists(full, ec) && !ec;
+                    if (ImGui::MenuItem(itemId.c_str(), nullptr, false, exists)) toReopen = full;
+                    // AllowWhenDisabled so the missing-file tooltip still fires.
+                    if (g_tooltipsEnabled &&
+                        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        if (exists)
+                            ImGui::SetTooltip("%s", full.c_str());
+                        else
+                            ImGui::SetTooltip("%s\n(file no longer exists)", full.c_str());
+                    }
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Clear Recent")) clearRequested = true;
