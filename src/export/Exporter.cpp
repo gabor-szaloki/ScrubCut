@@ -62,6 +62,10 @@ void Exporter::ExportThread() {
     std::string srcExtLower = srcExt;
     std::transform(srcExtLower.begin(), srcExtLower.end(), srcExtLower.begin(), ::tolower);
     bool remuxToMp4 = (srcExtLower == ".mkv" || srcExtLower == ".webm");
+    // GIF input has no muxer-level trim (no edit-list equivalent), and frames
+    // are inter-frame deltas, so stream-copy trim is unsafe. SourceFormat on a
+    // GIF source therefore re-encodes via the GIF path with source W/FPS.
+    bool srcIsGif = (srcExtLower == ".gif");
     std::string sourceFormatExt = remuxToMp4 ? ".mp4" : srcExt;
 
     for (int i = 0; i < static_cast<int>(m_settings.segments.size()); i++) {
@@ -71,7 +75,16 @@ void Exporter::ExportThread() {
         const auto& seg = m_settings.segments[i];
 
         bool ok = false;
-        if (seg.mode == ExportMode::SourceFormat) {
+        if (srcIsGif) {
+            // GIF source: output is always GIF at source W/FPS, regardless
+            // of seg.mode (the UI locks the toggle, but old segments may
+            // still carry mode==GIF; treat them as SourceFormat anyway).
+            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
+            LOG_INFO("Exporting segment %d/%d (GIF, source params) -> %s",
+                     itemsDone + 1, totalItems, outPath.c_str());
+            // 0/0.0 = "match source W/FPS" — see ExportSegmentGIF.
+            ok = ExportSegmentGIF(m_inputPath, seg, outPath, 0, 0.0);
+        } else if (seg.mode == ExportMode::SourceFormat) {
             std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, sourceFormatExt);
             LOG_INFO("Exporting segment %d/%d (stream copy) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
@@ -387,6 +400,13 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     AVPixelFormat srcFmt = decoder.GetPixelFormat();
     AVRational srcTimeBase = demuxer.GetVideoTimeBase();
     double srcFps = demuxer.GetVideoFrameRate();
+
+    // Sentinel: caller passes 0 / <= 0 to mean "match the source". Used when
+    // the source itself is a GIF and the user picked SourceFormat — we still
+    // have to re-encode (the GIF muxer has no edit-list trim), but we want
+    // dimensions and frame rate to match the input.
+    if (gifWidth <= 0) gifWidth = srcW;
+    if (gifFps <= 0.0) gifFps = (srcFps > 0.0) ? srcFps : 15.0;
 
     // Get color space info from codec params to avoid filter graph warnings
     AVCodecParameters* vpar = demuxer.GetVideoCodecParams();

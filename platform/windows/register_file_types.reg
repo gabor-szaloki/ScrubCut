@@ -46,3 +46,6 @@ Windows Registry Editor Version 5.00
 
 [HKEY_CURRENT_USER\Software\Classes\.m4v\OpenWithProgids]
 "ScrubCut.Video"=""
+
+[HKEY_CURRENT_USER\Software\Classes\.gif\OpenWithProgids]
+"ScrubCut.Video"=""

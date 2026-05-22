@@ -173,15 +173,18 @@ static bool FixedWidthButton(const char* label, float width, bool small) {
 
 // Audio toggle for a TimeRange — pairs with the Fmt/MP4-GIF toggle in look
 // and behaviour. The button shows the current effective state. When the
-// format / speed force audio off, the button is greyed out and the tooltip
-// explains why. Returns true and writes the new `keepAudio` value if the
-// user toggled.
+// format / speed / source forces audio off, the button is greyed out and the
+// tooltip explains why. Returns true and writes the new `keepAudio` value if
+// the user toggled.
 //
+// `sourceHasNoAudio=true` forces audio off regardless of mode/speed — used
+// when the opened file has no audio stream (e.g. an animated GIF).
 // `small=true` for SmallButton-height rows; `small=false` for the
 // export-dialog table cell variant.
 static bool KeepAudioToggle(const char* id, const TimeRange& range,
+                            bool sourceHasNoAudio,
                             bool& outKeepAudio, bool small) {
-    bool forced = AudioForciblyDropped(range);
+    bool forced = sourceHasNoAudio || AudioForciblyDropped(range);
     bool effective = !forced && range.keepAudio;
     const char* label = effective ? "Audio" : "No audio";
     char btnLabel[24];
@@ -197,9 +200,12 @@ static bool KeepAudioToggle(const char* id, const TimeRange& range,
         // bypass flag.
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::BeginTooltip();
-            ImGui::TextUnformatted((range.mode == ExportMode::GIF)
-                ? "GIF has no audio track."
-                : "Audio export is not supported with non-1x playback speeds.");
+            const char* reason = sourceHasNoAudio
+                ? "Source has no audio track."
+                : (range.mode == ExportMode::GIF)
+                    ? "GIF has no audio track."
+                    : "Audio export is not supported with non-1x playback speeds.";
+            ImGui::TextUnformatted(reason);
             ImGui::EndTooltip();
         }
         return false;
@@ -744,7 +750,7 @@ void App::ProcessEvents() {
             case SDLK_O:
                 if (cmd) {
                     static const SDL_DialogFileFilter videoFilters[] = {
-                        {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v"},
+                        {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v;gif"},
                         {"All files", "*"},
                     };
                     SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {
@@ -1016,7 +1022,7 @@ void App::Render() {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open...", (std::string(kKeys.cmdName) + "+O").c_str())) {
                 static const SDL_DialogFileFilter videoFilters[] = {
-                    {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v"},
+                    {"Video files", "mp4;mkv;avi;mov;wmv;flv;webm;mpg;mpeg;3gp;ts;m4v;gif"},
                     {"All files", "*"},
                 };
                 SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {
@@ -2022,14 +2028,15 @@ void App::Render() {
                 // Measure widths so the format indicator and delete button can
                 // be right-aligned to the same column regardless of whether
                 // this row is a Frame (shows "PNG" text) or a Segment (shows
-                // a "MP4"/"GIF" SmallButton).
+                // a source-format / "GIF" SmallButton).
+                std::string srcLabel = SourceFormatLabel();
                 float framePadX = ImGui::GetStyle().FramePadding.x * 2;
                 float spacing = ImGui::GetStyle().ItemSpacing.x;
                 float xBtnW = ImGui::CalcTextSize("X").x + framePadX;
-                float mp4W = ImGui::CalcTextSize("MP4").x + framePadX;
+                float srcW = ImGui::CalcTextSize(srcLabel.c_str()).x + framePadX;
                 float gifW = ImGui::CalcTextSize("GIF").x + framePadX;
                 float pngW = ImGui::CalcTextSize("PNG").x;
-                float maxFmtW = std::max(std::max(mp4W, gifW), pngW);
+                float maxFmtW = std::max(std::max(srcW, gifW), pngW);
 
                 float nameStartX = ImGui::GetCursorPosX();
                 float rightEdge = nameStartX + ImGui::GetContentRegionAvail().x;
@@ -2050,16 +2057,28 @@ void App::Render() {
 
                 // Format indicator: right-aligned so its right edge sits just
                 // before the delete button, regardless of its intrinsic width.
+                bool gifSrc = IsGifSource();
                 float fmtActualW = row.isFrame ? pngW
-                    : ((segs[row.index].mode == ExportMode::GIF) ? gifW : mp4W);
+                    : ((!gifSrc && segs[row.index].mode == ExportMode::GIF) ? gifW : srcW);
                 ImGui::SameLine();
                 ImGui::SetCursorPosX(fmtRightX - fmtActualW);
                 if (row.isFrame) {
                     ImGui::TextDisabled("PNG");
+                } else if (gifSrc) {
+                    // GIF source: both modes produce identical GIF output, so
+                    // the toggle is meaningless. Show a disabled SmallButton.
+                    ImGui::BeginDisabled();
+                    ImGui::SmallButton("GIF##fmt");
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted("Only GIF export format is supported for GIF source");
+                        ImGui::EndTooltip();
+                    }
                 } else {
                     const TimeRange& s = segs[row.index];
-                    const char* fmtLabel = (s.mode == ExportMode::GIF) ? "GIF##fmt" : "MP4##fmt";
-                    if (ImGui::SmallButton(fmtLabel)) {
+                    std::string fmtLabel = (s.mode == ExportMode::GIF) ? "GIF##fmt" : (srcLabel + "##fmt");
+                    if (ImGui::SmallButton(fmtLabel.c_str())) {
                         ExportMode newMode = (s.mode == ExportMode::GIF)
                             ? ExportMode::SourceFormat : ExportMode::GIF;
                         m_segments.SetSegmentMode(row.index, newMode);
@@ -2150,13 +2169,14 @@ void App::Render() {
                     TooltipFor("Segment duration (after speed)");
 
                     // Audio toggle at the end of the row. Disabled with an
-                    // explanatory tooltip when format/speed forces audio off.
+                    // explanatory tooltip when format/speed/source forces audio off.
                     ImGui::SameLine();
                     bool newKeep;
-                    if (KeepAudioToggle("##segaudio", s, newKeep, /*small*/ true)) {
+                    bool srcNoAudio = !m_player.HasAudio();
+                    if (KeepAudioToggle("##segaudio", s, srcNoAudio, newKeep, /*small*/ true)) {
                         m_segments.SetSegmentKeepAudio(row.index, newKeep);
                     }
-                    if (!AudioForciblyDropped(s)) TooltipFor("Toggle audio in export");
+                    if (!srcNoAudio && !AudioForciblyDropped(s)) TooltipFor("Toggle audio in export");
                 } else {
                     // Row 2 (frames): seek button + set-to-current
                     const FrameMark& f = frames[row.index];
@@ -2473,13 +2493,25 @@ void App::Render() {
                         else             m_segments.SetSegmentName(row.index, nameBuf);
                     }
 
-                    // Format (toggle for segments, static PNG label for frames)
+                    // Format (toggle for segments, static PNG label for frames).
+                    // For GIF sources both modes produce identical GIF output;
+                    // lock the toggle to a disabled "GIF" button.
                     ImGui::TableNextColumn();
                     if (row.isFrame) {
                         ImGui::TextDisabled("PNG");
+                    } else if (IsGifSource()) {
+                        ImGui::BeginDisabled();
+                        ImGui::SmallButton("GIF");
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                            ImGui::BeginTooltip();
+                            ImGui::TextUnformatted("Only GIF export format is supported for GIF source");
+                            ImGui::EndTooltip();
+                        }
                     } else {
-                        const char* fmtLabel = (segs[row.index].mode == ExportMode::GIF) ? "GIF" : "MP4";
-                        if (ImGui::SmallButton(fmtLabel)) {
+                        std::string fmtLabel = (segs[row.index].mode == ExportMode::GIF)
+                            ? std::string("GIF") : SourceFormatLabel();
+                        if (ImGui::SmallButton(fmtLabel.c_str())) {
                             ExportMode newMode = (segs[row.index].mode == ExportMode::GIF)
                                 ? ExportMode::SourceFormat : ExportMode::GIF;
                             m_segments.SetSegmentMode(row.index, newMode);
@@ -2526,7 +2558,8 @@ void App::Render() {
                         ImGui::TextDisabled("-");
                     } else {
                         bool newKeep;
-                        if (KeepAudioToggle("##audio", segs[row.index], newKeep, /*small*/ true)) {
+                        bool srcNoAudio = !m_player.HasAudio();
+                        if (KeepAudioToggle("##audio", segs[row.index], srcNoAudio, newKeep, /*small*/ true)) {
                             m_segments.SetSegmentKeepAudio(row.index, newKeep);
                         }
                     }
@@ -2536,10 +2569,14 @@ void App::Render() {
                 ImGui::EndTable();
             }
 
-            // GIF settings (shown if any segment is set to GIF)
+            // GIF settings (shown if any segment is set to GIF). Hidden for
+            // GIF sources — output matches source W/FPS, the width/fps inputs
+            // would have no effect.
             bool hasGif = false;
-            for (const auto& s : segs)
-                if (s.mode == ExportMode::GIF) { hasGif = true; break; }
+            if (!IsGifSource()) {
+                for (const auto& s : segs)
+                    if (s.mode == ExportMode::GIF) { hasGif = true; break; }
+            }
             if (hasGif) {
                 ImGui::Spacing();
                 if (ImGui::CollapsingHeader("GIF Settings")) {
@@ -2885,6 +2922,26 @@ double App::ComputeScrubTarget(float mouseX, float barWidth, double duration,
     double scale = altNow ? 0.1 : 1.0;
     return m_scrubAnchorTime +
         static_cast<double>(mouseX - m_scrubAnchorX) / barWidth * duration * scale;
+}
+
+std::string App::SourceFormatLabel() const {
+    std::string ext = std::filesystem::path(m_currentFilePath).extension().string();
+    if (ext.empty() || ext[0] != '.') return "MP4";
+    std::string lower(ext.begin() + 1, ext.end());
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    // MKV/WebM are remuxed to MP4 — must match Exporter::ExportThread.
+    if (lower == "mkv" || lower == "webm") return "MP4";
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::toupper(c); });
+    return lower;
+}
+
+bool App::IsGifSource() const {
+    std::string ext = std::filesystem::path(m_currentFilePath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return ext == ".gif";
 }
 
 void App::InitExportDir() {

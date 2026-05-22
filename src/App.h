@@ -54,6 +54,15 @@ private:
     //   Custom      → m_exportCustomDir, defaulting to the video's parent if empty
     void InitExportDir();
 
+    // Uppercased label for SourceFormat exports of the currently-open file.
+    // MKV/WebM are remuxed to MP4, so they label as "MP4"; everything else
+    // labels as its source extension (e.g. "MOV", "GIF").
+    std::string SourceFormatLabel() const;
+
+    // True when the opened file is a GIF — the format toggle is locked to
+    // GIF (both modes produce identical output) and GIF Settings are hidden.
+    bool IsGifSource() const;
+
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
     UIManager m_ui;

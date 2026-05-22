@@ -10,8 +10,9 @@ A lightweight video player for fast frame-accurate scrubbing, trimming, and expo
 - **Frame stepping** -- step forward/backward one frame at a time
 - **Trimming** -- mark multiple in/out segments, export them as separate files
 - **Frame grabbing** -- mark individual frames, export them as PNG stills
+- **Input formats** -- MP4, MKV, MOV, AVI, WebM, WMV, FLV, MPG/MPEG, 3GP, TS, M4V, and animated GIF
 - **Export formats**
-  - Segments: original format (stream copy, no re-encoding) or GIF. MKV/WebM sources are remuxed into MP4 so the cuts are frame-accurate at both ends — the bitstream is bit-identical, just a different container.
+  - Segments: original format (stream copy, no re-encoding) or GIF. MKV/WebM sources are remuxed into MP4 so the cuts are frame-accurate at both ends — the bitstream is bit-identical, just a different container. GIF sources only support GIF exports.
   - Frames: PNG stills.
 - **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider

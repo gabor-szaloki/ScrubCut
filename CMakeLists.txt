@@ -31,9 +31,16 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
 
-# --- App icon ---
+# --- App icon + Win32 version resource ---
+# The configured .rc carries both the icon and VS_VERSION_INFO (FileDescription
+# etc.) — Windows uses FileDescription as the "Open With" display name.
 if(WIN32)
-    set(APP_ICON_RC "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.rc")
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.rc.in"
+        "${CMAKE_BINARY_DIR}/ScrubCut.rc"
+        @ONLY
+    )
+    set(APP_ICON_RC "${CMAKE_BINARY_DIR}/ScrubCut.rc")
 endif()
 
 add_executable(ScrubCut WIN32 ${SOURCES} ${APP_ICON_RC})
@@ -113,7 +120,7 @@ if(WIN32)
         "Delete '$SMPROGRAMS\\\\$STARTMENU_FOLDER\\\\ScrubCut.lnk'")
 
     # File associations: register ScrubCut as an Open With option for video files
-    set(_ASSOC_EXTS .mp4 .mkv .avi .mov .wmv .flv .webm .mpg .mpeg .3gp .ts .m4v)
+    set(_ASSOC_EXTS .mp4 .mkv .avi .mov .wmv .flv .webm .mpg .mpeg .3gp .ts .m4v .gif)
     set(_NSIS_REG_INSTALL
         "WriteRegStr HKCU 'Software\\\\Classes\\\\ScrubCut.Video' '' 'Video File - ScrubCut'")
     set(_NSIS_REG_INSTALL "${_NSIS_REG_INSTALL}\n    WriteRegStr HKCU 'Software\\\\Classes\\\\ScrubCut.Video\\\\shell\\\\open\\\\command' '' '\\\"$INSTDIR\\\\ScrubCut.exe\\\" \\\"%1\\\"'")

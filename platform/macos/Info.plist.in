@@ -41,6 +41,7 @@
                 <string>public.3gpp</string>
                 <string>com.microsoft.windows-media-wmv</string>
                 <string>public.flv</string>
+                <string>com.compuserve.gif</string>
             </array>
         </dict>
     </array>
