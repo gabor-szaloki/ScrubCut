@@ -30,4 +30,10 @@ private:
     // Original (1.0x) style, used as a base when rescaling for DPI.
     ImGuiStyle m_baseStyle;
     float m_dpiScale = 1.0f;
+
+    // Two default faces, swapped by SetDpiScale: the bitmap ProggyClean stays
+    // pixel-perfect at integer scales, the scalable ProggyForever stays smooth
+    // at fractional scales.
+    ImFont* m_fontBitmap = nullptr;
+    ImFont* m_fontVector = nullptr;
 };

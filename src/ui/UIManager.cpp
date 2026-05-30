@@ -1,5 +1,7 @@
 #include "ui/UIManager.h"
 
+#include <cmath>
+
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
@@ -14,6 +16,15 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    // Load both embedded default faces and let SetDpiScale pick between them by
+    // scale: the bitmap ProggyClean is pixel-perfect at integer scales (1x, 2x);
+    // the scalable ProggyForever stays smooth at fractional scales (1.25x, 1.5x),
+    // where the bitmap would blur. style.FontScaleDpi re-rasterizes whichever face
+    // is active. The first-added face is the initial default (m_dpiScale = 1.0).
+    m_fontBitmap = io.Fonts->AddFontDefaultBitmap();
+    m_fontVector = io.Fonts->AddFontDefaultVector();
+    io.FontDefault = m_fontBitmap;
 
     m_iniPath = (GetAppDataDir() / "imgui.ini").string();
     io.IniFilename = m_iniPath.c_str();
@@ -60,6 +71,14 @@ void UIManager::SetDpiScale(float scale) {
     style = m_baseStyle;
     style.ScaleAllSizes(scale);
     style.FontScaleDpi = scale;
+
+    // Pick the face that stays sharp at this scale: the bitmap ProggyClean is
+    // pixel-perfect only at integer scales; otherwise use the scalable
+    // ProggyForever, which the dynamic rasterizer keeps smooth.
+    bool integerScale = std::fabs(scale - std::round(scale)) < 0.01f;
+    ImFont* desired = integerScale ? m_fontBitmap : m_fontVector;
+    if (desired)
+        ImGui::GetIO().FontDefault = desired;
 
     // Rescale open floating windows' sizes by the DPI ratio so they keep the
     // same visual footprint. Keep each window centered on its previous center
