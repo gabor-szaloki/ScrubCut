@@ -1127,7 +1127,12 @@ void App::Render() {
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
                 m_showTooltips = !m_showTooltips;
 #ifndef __APPLE__
-            if (ImGui::MenuItem("Use DPI scaling", nullptr, m_useDpiScaling)) {
+            // Show the display's scale in the hotkey-hint slot, e.g. "125%",
+            // so it's visible what the toggle would apply even while disabled.
+            char dpiHint[16];
+            snprintf(dpiHint, sizeof(dpiHint), "%d%%",
+                     static_cast<int>(std::round(SDL_GetWindowDisplayScale(m_window) * 100.0f)));
+            if (ImGui::MenuItem("Use DPI scaling", dpiHint, m_useDpiScaling)) {
                 m_useDpiScaling = !m_useDpiScaling;
                 float scale = GetEffectiveDpiScale();
                 m_ui.SetDpiScale(scale);
