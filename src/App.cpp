@@ -326,7 +326,7 @@ bool App::Init() {
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
     m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
-    m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", false);
+    m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));

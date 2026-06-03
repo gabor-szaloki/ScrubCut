@@ -89,7 +89,7 @@ private:
     bool m_showChapters = true;
     bool m_showWaveform = false;
     bool m_showTooltips = true;
-    bool m_useDpiScaling = false;
+    bool m_useDpiScaling = true;
     bool m_autoHideCursor = true;
     bool m_autoHideUI = false;
 
