@@ -104,6 +104,12 @@ private:
     bool m_wasMaximizedBeforeFullscreen = false;
     bool m_waitingForFullscreenExit = false;
 
+    // Set when toggling DPI scaling also resizes the window. The next
+    // proportional-resize pass skips Timeline width scaling for that viewport
+    // change, since UIManager::SetDpiScale already rescaled it by the DPI
+    // ratio — scaling both ways would compound.
+    bool m_dpiResizePending = false;
+
     // Floating window geometry snapshot (position + size) taken when entering
     // fullscreen, so it can be restored exactly on exit.
     struct FloatingWindowSnap { ImVec2 pos; ImVec2 size; bool valid = false; };

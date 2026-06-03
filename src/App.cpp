@@ -916,7 +916,9 @@ void App::Render() {
 
                 // Timeline scales its width with the viewport — the wider it
                 // is the more scrubbing resolution you get. Height stays.
-                bool scaleWidth = (strcmp(name, "Timeline") == 0);
+                // Skip when this viewport change comes from the DPI-toggle
+                // window resize: SetDpiScale already scaled the width.
+                bool scaleWidth = (strcmp(name, "Timeline") == 0) && !m_dpiResizePending;
                 float newW = scaleWidth
                     ? win->SizeFull.x * (newSize.x / m_prevViewportSize.x)
                     : win->SizeFull.x;
@@ -942,6 +944,7 @@ void App::Render() {
                     win->Size.x = newW;
                 }
             }
+            m_dpiResizePending = false;
         }
         m_prevViewportSize = newSize;
     }
@@ -1126,7 +1129,41 @@ void App::Render() {
 #ifndef __APPLE__
             if (ImGui::MenuItem("Use DPI scaling", nullptr, m_useDpiScaling)) {
                 m_useDpiScaling = !m_useDpiScaling;
-                m_ui.SetDpiScale(GetEffectiveDpiScale());
+                float scale = GetEffectiveDpiScale();
+                m_ui.SetDpiScale(scale);
+                if (m_useDpiScaling && scale > 1.0f && !m_fullscreen && !m_maximized) {
+                    // Grow the window by the DPI multiplier if it's smaller
+                    // than the now-scaled default size, so the scaled-up UI
+                    // doesn't get cramped in a window sized for 1.0x.
+                    int ww = 0, wh = 0;
+                    SDL_GetWindowSize(m_window, &ww, &wh);
+                    if (ww < static_cast<int>(1280 * scale) ||
+                        wh < static_cast<int>(720 * scale)) {
+                        int newW = static_cast<int>(ww * scale);
+                        int newH = static_cast<int>(wh * scale);
+                        SDL_SetWindowSize(m_window, newW, newH);
+                        // Keep the window center in place, clamped so the
+                        // grown window stays within the display work area.
+                        // Position/size are client-area coordinates, so pad
+                        // the clamp with the decoration border sizes (title
+                        // bar etc.) to keep those on-screen too.
+                        int wx = 0, wy = 0;
+                        SDL_GetWindowPosition(m_window, &wx, &wy);
+                        int newX = wx + (ww - newW) / 2;
+                        int newY = wy + (wh - newH) / 2;
+                        SDL_Rect usable{};
+                        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(m_window), &usable)) {
+                            int bTop = 0, bLeft = 0, bBottom = 0, bRight = 0;
+                            SDL_GetWindowBordersSize(m_window, &bTop, &bLeft, &bBottom, &bRight);
+                            newX = std::max(usable.x + bLeft,
+                                   std::min(newX, usable.x + usable.w - newW - bRight));
+                            newY = std::max(usable.y + bTop,
+                                   std::min(newY, usable.y + usable.h - newH - bBottom));
+                        }
+                        SDL_SetWindowPosition(m_window, newX, newY);
+                        m_dpiResizePending = true;
+                    }
+                }
             }
 #endif
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
