@@ -9,7 +9,7 @@
     "sdl3",
     {
       "name": "imgui",
-      "features": ["docking-experimental", "sdl3-binding", "opengl3-binding"]
+      "features": ["docking-experimental", "sdl3-binding", "opengl3-binding", "freetype"]
     }
   ]
 }
