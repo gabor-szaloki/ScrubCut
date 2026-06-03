@@ -2646,8 +2646,7 @@ void App::Render() {
             // Output file preview
             ImGui::Spacing();
             if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
-                std::string stem = std::filesystem::path(m_exportName).stem().string();
-                if (stem.empty()) stem = m_exportName;
+                std::string stem = m_exportName;
                 ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetDpiScale()),
                                   ImGuiChildFlags_Borders);
                 bool anyForPreview = false;
@@ -2695,9 +2694,11 @@ void App::Render() {
                 }
                 m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
 
-                // Check for existing files
+                // Check for existing files. outputPath is dir + extension-less
+                // base name, so filename() (not stem()) — base names may
+                // contain dots.
                 std::filesystem::path base(m_pendingExport.outputPath);
-                std::string stem = base.stem().string();
+                std::string stem = base.filename().string();
                 std::string dir = base.parent_path().string();
                 m_conflictingFiles.clear();
                 for (const auto& seg : m_pendingExport.segments) {
@@ -2780,7 +2781,7 @@ void App::Render() {
             std::filesystem::path basePath(m_pendingExport.outputPath);
             std::filesystem::path dirPath = basePath.parent_path();
             std::string dir = dirPath.string();
-            std::string stem = basePath.stem().string();
+            std::string stem = basePath.filename().string();
             ImGui::Text("Output folder:");
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  %s", dir.c_str());
             ImGui::SameLine();
@@ -2790,8 +2791,7 @@ void App::Render() {
             ImGui::Spacing();
             ImGui::Text("Exported files:");
             for (const auto& seg : m_pendingExport.segments) {
-                std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : basePath.extension().string();
-                if (ext.empty()) ext = ".mp4";
+                std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
                 ImGui::BulletText("%s_%s%s", stem.c_str(), seg.name.c_str(), ext.c_str());
             }
             for (const auto& fm : m_pendingExport.frames) {
@@ -2841,7 +2841,7 @@ void App::Render() {
             ImGui::SameLine();
             if (ImGui::Button("Skip Existing", ImVec2(btnW, 0))) {
                 std::filesystem::path base(m_pendingExport.outputPath);
-                std::string stem = base.stem().string();
+                std::string stem = base.filename().string();
                 std::string dir = base.parent_path().string();
                 std::vector<TimeRange> filteredSegs;
                 for (const auto& seg : m_pendingExport.segments) {

@@ -143,8 +143,10 @@ void Exporter::ExportThread() {
 
 std::string Exporter::BuildOutputPath(const std::string& basePath, const std::string& markName,
                                        int fallbackIndex, const std::string& extension) const {
+    // basePath is "output dir + extension-less base name" — use filename(),
+    // not stem(), so base names containing dots aren't truncated.
     std::filesystem::path base(basePath);
-    std::string stem = base.stem().string();
+    std::string stem = base.filename().string();
     std::string dir = base.parent_path().string();
 
     std::string suffix;
