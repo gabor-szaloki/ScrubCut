@@ -1467,7 +1467,7 @@ void App::Render() {
         {
             float afterTransport = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x;
             float muteW_ = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
-            float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f;
+            float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f * dpi;
             float bracketW = ImGui::CalcTextSize("[").x + ImGui::GetStyle().FramePadding.x * 2;
             float frameBtnW = ImGui::CalcTextSize("[]").x + ImGui::GetStyle().FramePadding.x * 2;
             float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x + markGroupGap + frameBtnW;
@@ -1517,7 +1517,7 @@ void App::Render() {
             bool muted = m_player.IsMuted();
             bool noAudio = hasMedia && !m_player.HasAudio();
             float muteW = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
-            float sliderW = 80.0f;
+            float sliderW = 80.0f * dpi;
             float spacing = ImGui::GetStyle().ItemSpacing.x;
             float volumeAreaWidth = muteW + spacing + sliderW;
             ImGui::SameLine(panelWidth - volumeAreaWidth);
@@ -1542,7 +1542,7 @@ void App::Render() {
         // --- Row 2: Timeline bar ---
         ImVec2 barPos = ImGui::GetCursorScreenPos();
         float barWidth = ImGui::GetContentRegionAvail().x;
-        float barHeight = 32.0f;
+        float barHeight = 32.0f * dpi;
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         auto fadeCol = [this](int r, int g, int b, int a) -> ImU32 {
             return IM_COL32(r, g, b, static_cast<int>(a * m_uiAlpha));
@@ -1560,7 +1560,7 @@ void App::Render() {
         int hoveredChapter = -1;
         bool hoveredChapterOverflows = false;
         if (duration > 0.0 && !chapters.empty() && m_showChapters) {
-            const float kChapGap = 2.0f;
+            const float kChapGap = 2.0f * dpi;
             bool overBar = mousePos.y >= barPos.y && mousePos.y <= barPos.y + barHeight;
             for (int i = 0; i < static_cast<int>(chapters.size()); i++) {
                 float x0 = barPos.x + static_cast<float>(chapters[i].startSec / duration) * barWidth;
@@ -1582,16 +1582,17 @@ void App::Render() {
                 const char* label = chapters[i].title.empty()
                     ? (snprintf(fallback, sizeof(fallback), "Chapter %d", i + 1), fallback)
                     : chapters[i].title.c_str();
-                const float labelPadX = 6.0f;
+                const float labelPadX = 6.0f * dpi;
+                const float clipPadX = 2.0f * dpi;
                 ImVec2 textSize = ImGui::CalcTextSize(label);
                 float textY = barPos.y + (barHeight - textSize.y) * 0.5f;
                 int textAlpha = static_cast<int>((hovered ? 230 : 160) * m_uiAlpha);
                 ImU32 textCol = IM_COL32(255, 255, 255, textAlpha);
-                float availTextW = (x1 - 2.0f) - (x0 + labelPadX);
+                float availTextW = (x1 - clipPadX) - (x0 + labelPadX);
                 if (hovered && textSize.x > availTextW)
                     hoveredChapterOverflows = true;
-                drawList->PushClipRect(ImVec2(x0 + 2.0f, barPos.y),
-                                       ImVec2(x1 - 2.0f, barPos.y + barHeight), true);
+                drawList->PushClipRect(ImVec2(x0 + clipPadX, barPos.y),
+                                       ImVec2(x1 - clipPadX, barPos.y + barHeight), true);
                 drawList->AddText(ImVec2(x0 + labelPadX, textY), textCol, label);
                 drawList->PopClipRect();
             }
@@ -1676,18 +1677,18 @@ void App::Render() {
             ImU32 borderCol = GetSegmentColor(segs[i].colorIndex, borderAlpha * m_uiAlpha);
             drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
             drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol,
-                              0.0f, 0, highlighted ? 3.0f : 1.0f);
+                              0.0f, 0, (highlighted ? 3.0f : 1.0f) * dpi);
 
             // Diagonal line pattern on highlighted segments
             if (highlighted) {
                 ImU32 lineCol = GetSegmentColor(segs[i].colorIndex, 0.6f * m_uiAlpha);
-                float spacing = 8.0f;
+                float spacing = 8.0f * dpi;
                 drawList->PushClipRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), true);
                 for (float offset = -barHeight; offset < (x1 - x0) + barHeight; offset += spacing) {
                     drawList->AddLine(
                         ImVec2(x0 + offset, barPos.y + barHeight),
                         ImVec2(x0 + offset + barHeight, barPos.y),
-                        lineCol, 2.0f);
+                        lineCol, 2.0f * dpi);
                 }
                 drawList->PopClipRect();
             }
@@ -1748,11 +1749,11 @@ void App::Render() {
         // Pending mark-in indicator
         if (m_segments.HasPendingMarkIn() && duration > 0.0) {
             float mx = barPos.x + static_cast<float>(m_segments.GetPendingMarkIn() / duration) * barWidth;
-            for (float y = barPos.y; y < barPos.y + barHeight; y += 6.0f) {
-                float yEnd = y + 3.0f;
+            for (float y = barPos.y; y < barPos.y + barHeight; y += 6.0f * dpi) {
+                float yEnd = y + 3.0f * dpi;
                 if (yEnd > barPos.y + barHeight) yEnd = barPos.y + barHeight;
                 drawList->AddLine(ImVec2(mx, y), ImVec2(mx, yEnd),
-                                  fadeCol(255, 200, 50, 180), 2.0f);
+                                  fadeCol(255, 200, 50, 180), 2.0f * dpi);
             }
         }
 
@@ -1760,7 +1761,7 @@ void App::Render() {
         if (duration > 0.0) {
             float px = barPos.x + static_cast<float>(currentTime / duration) * barWidth;
             drawList->AddLine(ImVec2(px, barPos.y), ImVec2(px, barPos.y + barHeight),
-                              fadeCol(255, 255, 255, 220), 2.0f);
+                              fadeCol(255, 255, 255, 220), 2.0f * dpi);
         }
 
         // --- Interaction: segment edge handles first, then bar click-to-seek ---
@@ -1769,7 +1770,7 @@ void App::Render() {
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
             float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
-            float handleW = 8.0f;
+            float handleW = 8.0f * dpi;
 
             // Left handle
             ImGui::SetCursorScreenPos(ImVec2(x0 - handleW * 0.5f, barPos.y));
