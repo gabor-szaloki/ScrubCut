@@ -91,15 +91,15 @@ private:
     bool m_showTooltips = true;
     bool m_useDpiScaling = true;
     // Explicit user-set UI scale (0.5x–2.0x), applied as a multiplier on top of
-    // the automatic DPI scale in GetEffectiveDpiScale.
-    float m_uiScale = 1.0f;
+    // the automatic DPI scale in GetEffectiveUiScale.
+    float m_userUiScale = 1.0f;
     bool m_autoHideCursor = true;
     bool m_autoHideUI = false;
 
-    // Returns the current DPI scale to apply to the UI. Wraps
-    // SDL_GetWindowDisplayScale and returns 1.0 if DPI scaling is disabled
-    // or on platforms where we don't support it.
-    float GetEffectiveDpiScale() const;
+    // Returns the effective UI scale to apply: the SDL display (DPI) scale when
+    // DPI scaling is enabled (1.0 otherwise, and on platforms we don't support),
+    // multiplied by the user's explicit m_userUiScale.
+    float GetEffectiveUiScale() const;
 
     // Grow the window by `ratio` (>1) about its center, clamped to the display's
     // usable bounds, so an enlarged UI isn't cramped. No-op for ratio <= 1 or

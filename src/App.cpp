@@ -327,7 +327,7 @@ bool App::Init() {
     m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
-    m_uiScale = std::clamp(m_prefSettings.GetFloat("ui_scale", 1.0f), 0.5f, 2.0f);
+    m_userUiScale = std::clamp(m_prefSettings.GetFloat("ui_scale", 1.0f), 0.5f, 2.0f);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
@@ -341,16 +341,16 @@ bool App::Init() {
 
     LoadRecentFiles();
 
-    // Apply initial DPI scale to the UI (1.0 unless DPI scaling is enabled on Windows).
-    m_ui.SetDpiScale(GetEffectiveDpiScale());
+    // Apply the initial UI scale (1.0 unless DPI scaling is enabled on Windows).
+    m_ui.SetUiScale(GetEffectiveUiScale());
 
     if (resetLayout) {
-        // Default window size is scaled by the effective DPI so UI elements
+        // Default window size is scaled by the effective UI scale so UI elements
         // are readable on high-DPI displays.
-        float dpiScale = m_ui.GetDpiScale();
+        float uiScale = m_ui.GetUiScale();
         SDL_SetWindowSize(m_window,
-                          static_cast<int>(1280 * dpiScale),
-                          static_cast<int>(720 * dpiScale));
+                          static_cast<int>(1280 * uiScale),
+                          static_cast<int>(720 * uiScale));
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     } else {
         int ww = m_layoutSettings.GetInt("window_width", 1280);
@@ -471,7 +471,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("show_waveform", m_showWaveform);
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
-        m_prefSettings.SetFloat("ui_scale", m_uiScale);
+        m_prefSettings.SetFloat("ui_scale", m_userUiScale);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
         m_prefSettings.SetFloat("volume", m_player.GetVolume());
@@ -615,7 +615,7 @@ void App::ProcessEvents() {
         // Rescale ImGui when the window moves to a display with different DPI.
         if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
             event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) {
-            m_ui.SetDpiScale(GetEffectiveDpiScale());
+            m_ui.SetUiScale(GetEffectiveUiScale());
         }
 
         if (event.type == SDL_EVENT_QUIT) {
@@ -918,7 +918,7 @@ void App::Render() {
 
                 // Timeline scales its width with the viewport — the wider it
                 // is the more scrubbing resolution you get. Height stays. This
-                // is the sole owner of the Timeline's width (SetDpiScale leaves
+                // is the sole owner of the Timeline's width (SetUiScale leaves
                 // it alone), so DPI/UI-scale grows track it here too.
                 bool scaleWidth = (strcmp(name, "Timeline") == 0);
                 float newW = scaleWidth
@@ -1135,9 +1135,9 @@ void App::Render() {
                      static_cast<int>(std::round(SDL_GetWindowDisplayScale(m_window) * 100.0f)));
             if (ImGui::MenuItem("Use DPI scaling", dpiHint, m_useDpiScaling)) {
                 m_useDpiScaling = !m_useDpiScaling;
-                float scale = GetEffectiveDpiScale();
-                m_ui.SetDpiScale(scale);
-                // Grow the window by the DPI multiplier if it's smaller than the
+                float scale = GetEffectiveUiScale();
+                m_ui.SetUiScale(scale);
+                // Grow the window by the UI scale if it's smaller than the
                 // now-scaled default size, so the scaled-up UI doesn't get
                 // cramped in a window sized for 1.0x.
                 if (m_useDpiScaling && scale > 1.0f) {
@@ -1151,7 +1151,7 @@ void App::Render() {
             }
 #endif
             // Explicit UI scale, applied as a multiplier on top of the automatic
-            // DPI scale (see GetEffectiveDpiScale). Shown on all platforms; on
+            // DPI scale (see GetEffectiveUiScale). Shown on all platforms; on
             // macOS it's the only UI-scaling control since DPI is OS-handled.
             // A stepped +/- input rather than a slider, so it doesn't
             // continuously resize the very menu being interacted with. Laid out
@@ -1168,21 +1168,21 @@ void App::Render() {
                 if (avail > totalW)
                     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - totalW));
                 ImGui::SetNextItemWidth(totalW);
-                float prevUiScale = m_uiScale;
-                if (ImGui::InputFloat("##uiscale", &m_uiScale, 0.25f, 0.25f, "%.2fx")) {
-                    m_uiScale = std::clamp(m_uiScale, 0.5f, 2.0f);
-                    if (m_uiScale != prevUiScale) {
-                        float scale = GetEffectiveDpiScale();
-                        m_ui.SetDpiScale(scale);
+                float prevUserUiScale = m_userUiScale;
+                if (ImGui::InputFloat("##uiscale", &m_userUiScale, 0.25f, 0.25f, "%.2fx")) {
+                    m_userUiScale = std::clamp(m_userUiScale, 0.5f, 2.0f);
+                    if (m_userUiScale != prevUserUiScale) {
+                        float scale = GetEffectiveUiScale();
+                        m_ui.SetUiScale(scale);
                         // Grow the window to match, just like enabling DPI
                         // scaling does — but only on an increase and only while
                         // it's smaller than the scaled default.
-                        if (m_uiScale > prevUiScale && scale > 1.0f) {
+                        if (m_userUiScale > prevUserUiScale && scale > 1.0f) {
                             int ww = 0, wh = 0;
                             SDL_GetWindowSize(m_window, &ww, &wh);
                             if (ww < static_cast<int>(1280 * scale) ||
                                 wh < static_cast<int>(720 * scale)) {
-                                GrowWindowForUiScale(m_uiScale / prevUiScale);
+                                GrowWindowForUiScale(m_userUiScale / prevUserUiScale);
                             }
                         }
                     }
@@ -1216,7 +1216,7 @@ void App::Render() {
                 m_showHelpPanel = true;
                 m_segmentsClosedManually = false;
                 m_hideFloatingWindowsAfterReset = true;
-                float scale = m_ui.GetDpiScale();
+                float scale = m_ui.GetUiScale();
                 SDL_SetWindowSize(m_window, static_cast<int>(1280 * scale), static_cast<int>(720 * scale));
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                 std::filesystem::remove(GetAppDataDir() / "layout.ini");
@@ -1301,9 +1301,9 @@ void App::Render() {
                 float alpha = (elapsed <= kHoldNS) ? 1.0f
                     : 1.0f - static_cast<float>(elapsed - kHoldNS) / static_cast<float>(kFadeNS);
                 ImVec2 c((imgMin.x + imgMax.x) * 0.5f, (imgMin.y + imgMax.y) * 0.5f);
-                float dpi = m_ui.GetDpiScale();
-                float r = 48.0f * dpi;
-                float outline = 4.0f * dpi;
+                float uiScale = m_ui.GetUiScale();
+                float r = 48.0f * uiScale;
+                float outline = 4.0f * uiScale;
                 ImU32 bgCol = IM_COL32(0, 0, 0, static_cast<int>(200 * alpha));
                 ImU32 fgCol = IM_COL32(255, 255, 255, static_cast<int>(240 * alpha));
                 ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1363,10 +1363,10 @@ void App::Render() {
     if (m_showTimeline && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    float dpi = m_ui.GetDpiScale();
-    float tlPad = 40.0f * dpi;
-    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1100.0f * dpi);
-    float tlHeight = 110.0f * dpi;
+    float uiScale = m_ui.GetUiScale();
+    float tlPad = 40.0f * uiScale;
+    float tlWidth = std::min(vp->WorkSize.x - tlPad * 2, 1100.0f * uiScale);
+    float tlHeight = 110.0f * uiScale;
     ImGui::SetNextWindowPos(
         ImVec2(vp->WorkPos.x + (vp->WorkSize.x - tlWidth) * 0.5f, vp->WorkPos.y + vp->WorkSize.y - tlHeight - tlPad),
         layoutCond);
@@ -1485,11 +1485,11 @@ void App::Render() {
         TooltipFor("Jump to end", "End");
 
         // Mark buttons — centered between transport and audio controls
-        float markGroupGap = 12.0f * dpi;  // extra gap between segment buttons and the frame button
+        float markGroupGap = 12.0f * uiScale;  // extra gap between segment buttons and the frame button
         {
             float afterTransport = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x + ImGui::GetStyle().ItemSpacing.x;
             float muteW_ = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
-            float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f * dpi;
+            float audioStart = panelWidth - muteW_ - ImGui::GetStyle().ItemSpacing.x - 80.0f * uiScale;
             float bracketW = ImGui::CalcTextSize("[").x + ImGui::GetStyle().FramePadding.x * 2;
             float frameBtnW = ImGui::CalcTextSize("[]").x + ImGui::GetStyle().FramePadding.x * 2;
             float segBtnsW = bracketW * 2 + ImGui::GetStyle().ItemSpacing.x + markGroupGap + frameBtnW;
@@ -1539,7 +1539,7 @@ void App::Render() {
             bool muted = m_player.IsMuted();
             bool noAudio = hasMedia && !m_player.HasAudio();
             float muteW = std::max(ImGui::CalcTextSize("Mute").x, ImGui::CalcTextSize("Unmute").x) + ImGui::GetStyle().FramePadding.x * 2;
-            float sliderW = 80.0f * dpi;
+            float sliderW = 80.0f * uiScale;
             float spacing = ImGui::GetStyle().ItemSpacing.x;
             float volumeAreaWidth = muteW + spacing + sliderW;
             ImGui::SameLine(panelWidth - volumeAreaWidth);
@@ -1564,7 +1564,7 @@ void App::Render() {
         // --- Row 2: Timeline bar ---
         ImVec2 barPos = ImGui::GetCursorScreenPos();
         float barWidth = ImGui::GetContentRegionAvail().x;
-        float barHeight = 32.0f * dpi;
+        float barHeight = 32.0f * uiScale;
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         auto fadeCol = [this](int r, int g, int b, int a) -> ImU32 {
             return IM_COL32(r, g, b, static_cast<int>(a * m_uiAlpha));
@@ -1582,7 +1582,7 @@ void App::Render() {
         int hoveredChapter = -1;
         bool hoveredChapterOverflows = false;
         if (duration > 0.0 && !chapters.empty() && m_showChapters) {
-            const float kChapGap = 2.0f * dpi;
+            const float kChapGap = 2.0f * uiScale;
             bool overBar = mousePos.y >= barPos.y && mousePos.y <= barPos.y + barHeight;
             for (int i = 0; i < static_cast<int>(chapters.size()); i++) {
                 float x0 = barPos.x + static_cast<float>(chapters[i].startSec / duration) * barWidth;
@@ -1604,8 +1604,8 @@ void App::Render() {
                 const char* label = chapters[i].title.empty()
                     ? (snprintf(fallback, sizeof(fallback), "Chapter %d", i + 1), fallback)
                     : chapters[i].title.c_str();
-                const float labelPadX = 6.0f * dpi;
-                const float clipPadX = 2.0f * dpi;
+                const float labelPadX = 6.0f * uiScale;
+                const float clipPadX = 2.0f * uiScale;
                 ImVec2 textSize = ImGui::CalcTextSize(label);
                 float textY = barPos.y + (barHeight - textSize.y) * 0.5f;
                 int textAlpha = static_cast<int>((hovered ? 230 : 160) * m_uiAlpha);
@@ -1699,18 +1699,18 @@ void App::Render() {
             ImU32 borderCol = GetSegmentColor(segs[i].colorIndex, borderAlpha * m_uiAlpha);
             drawList->AddRectFilled(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), fillCol);
             drawList->AddRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), borderCol,
-                              0.0f, 0, (highlighted ? 3.0f : 1.0f) * dpi);
+                              0.0f, 0, (highlighted ? 3.0f : 1.0f) * uiScale);
 
             // Diagonal line pattern on highlighted segments
             if (highlighted) {
                 ImU32 lineCol = GetSegmentColor(segs[i].colorIndex, 0.6f * m_uiAlpha);
-                float spacing = 8.0f * dpi;
+                float spacing = 8.0f * uiScale;
                 drawList->PushClipRect(ImVec2(x0, barPos.y), ImVec2(x1, barPos.y + barHeight), true);
                 for (float offset = -barHeight; offset < (x1 - x0) + barHeight; offset += spacing) {
                     drawList->AddLine(
                         ImVec2(x0 + offset, barPos.y + barHeight),
                         ImVec2(x0 + offset + barHeight, barPos.y),
-                        lineCol, 2.0f * dpi);
+                        lineCol, 2.0f * uiScale);
                 }
                 drawList->PopClipRect();
             }
@@ -1730,7 +1730,7 @@ void App::Render() {
             // (apex and line both 3 pixels wide). ImGui's AddLine was being
             // centered between pixels for thickness=2 which left a 1-pixel
             // misalignment vs. integer-positioned triangle apexes.
-            int triHalf = static_cast<int>(std::round(4.0f * dpi));
+            int triHalf = static_cast<int>(std::round(4.0f * uiScale));
             int topY = static_cast<int>(std::round(barPos.y));
             int botY = static_cast<int>(std::round(barPos.y + barHeight));
             drawList->PushClipRect(ImVec2(barPos.x, static_cast<float>(topY)),
@@ -1771,11 +1771,11 @@ void App::Render() {
         // Pending mark-in indicator
         if (m_segments.HasPendingMarkIn() && duration > 0.0) {
             float mx = barPos.x + static_cast<float>(m_segments.GetPendingMarkIn() / duration) * barWidth;
-            for (float y = barPos.y; y < barPos.y + barHeight; y += 6.0f * dpi) {
-                float yEnd = y + 3.0f * dpi;
+            for (float y = barPos.y; y < barPos.y + barHeight; y += 6.0f * uiScale) {
+                float yEnd = y + 3.0f * uiScale;
                 if (yEnd > barPos.y + barHeight) yEnd = barPos.y + barHeight;
                 drawList->AddLine(ImVec2(mx, y), ImVec2(mx, yEnd),
-                                  fadeCol(255, 200, 50, 180), 2.0f * dpi);
+                                  fadeCol(255, 200, 50, 180), 2.0f * uiScale);
             }
         }
 
@@ -1783,7 +1783,7 @@ void App::Render() {
         if (duration > 0.0) {
             float px = barPos.x + static_cast<float>(currentTime / duration) * barWidth;
             drawList->AddLine(ImVec2(px, barPos.y), ImVec2(px, barPos.y + barHeight),
-                              fadeCol(255, 255, 255, 220), 2.0f * dpi);
+                              fadeCol(255, 255, 255, 220), 2.0f * uiScale);
         }
 
         // --- Interaction: segment edge handles first, then bar click-to-seek ---
@@ -1792,7 +1792,7 @@ void App::Render() {
         for (int i = 0; i < static_cast<int>(segs.size()); i++) {
             float x0 = barPos.x + static_cast<float>(segs[i].startSec / duration) * barWidth;
             float x1 = barPos.x + static_cast<float>(segs[i].endSec / duration) * barWidth;
-            float handleW = 8.0f * dpi;
+            float handleW = 8.0f * uiScale;
 
             // Left handle
             ImGui::SetCursorScreenPos(ImVec2(x0 - handleW * 0.5f, barPos.y));
@@ -2036,10 +2036,10 @@ void App::Render() {
     if (m_showSegments && !m_uiHidden) {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
-    float dpi = m_ui.GetDpiScale();
-    float marksW = 450.0f * dpi;
-    float marksH = 250.0f * dpi;
-    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * dpi, vp->WorkPos.y + 40 * dpi), layoutCond);
+    float uiScale = m_ui.GetUiScale();
+    float marksW = 450.0f * uiScale;
+    float marksH = 250.0f * uiScale;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * uiScale, vp->WorkPos.y + 40 * uiScale), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(marksW, marksH), layoutCond);
     bool segmentsWasOpen = m_showSegments;
     ImGui::Begin("Marks", &m_showSegments);
@@ -2228,7 +2228,7 @@ void App::Render() {
                     ImGuiStyle& smallStyle = ImGui::GetStyle();
                     float backupPadY = smallStyle.FramePadding.y;
                     smallStyle.FramePadding.y = 0;
-                    ImGui::SetNextItemWidth(56.0f * dpi);
+                    ImGui::SetNextItemWidth(56.0f * uiScale);
                     bool durChanged = ImGui::InputFloat("##segdur", &effDurF, 0.0f, 0.0f, "%.1fs");
                     smallStyle.FramePadding.y = backupPadY;
                     if (durChanged) {
@@ -2332,9 +2332,9 @@ void App::Render() {
         // frame we also pass AlwaysAutoResize so the size snaps to the
         // shortcuts table's content size — that's the single source of
         // truth, not a hardcoded number duplicated in the reset path.
-        float dpi = m_ui.GetDpiScale();
+        float uiScale = m_ui.GetUiScale();
         ImGui::SetNextWindowPos(
-            ImVec2(vp->WorkPos.x + 40 * dpi, vp->WorkPos.y + 40 * dpi),
+            ImVec2(vp->WorkPos.x + 40 * uiScale, vp->WorkPos.y + 40 * uiScale),
             layoutCond);
         ImGuiWindowFlags helpFlags =
             wasResetFrame ? ImGuiWindowFlags_AlwaysAutoResize : 0;
@@ -2664,7 +2664,7 @@ void App::Render() {
             ImGui::Spacing();
             if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
                 std::string stem = m_exportName;
-                ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetDpiScale()),
+                ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetUiScale()),
                                   ImGuiChildFlags_Borders);
                 bool anyForPreview = false;
                 for (const Row& row : rows) {
@@ -2964,7 +2964,7 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-float App::GetEffectiveDpiScale() const {
+float App::GetEffectiveUiScale() const {
 #ifdef __APPLE__
     // On macOS the OS already handles scaling via the window's point/pixel
     // separation, so the automatic DPI component stays at 1.0.
@@ -2972,9 +2972,9 @@ float App::GetEffectiveDpiScale() const {
 #else
     float dpi = m_useDpiScaling ? SDL_GetWindowDisplayScale(m_window) : 1.0f;
 #endif
-    // m_uiScale is the user's explicit multiplier layered on top of the
+    // m_userUiScale is the user's explicit multiplier layered on top of the
     // automatic DPI scale (input in the View menu, 0.5x–2.0x).
-    return dpi * m_uiScale;
+    return dpi * m_userUiScale;
 }
 
 void App::GrowWindowForUiScale(float ratio) {
@@ -3218,8 +3218,8 @@ void App::SetFullscreen(bool fullscreen) {
         // uses the process DPI and drifts across mixed-DPI multi-monitor setups.
         RECT rc = { m_windowedX, m_windowedY,
                     m_windowedX + m_windowedW, m_windowedY + m_windowedH };
-        UINT dpi = GetDpiForWindow(hwnd);
-        AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpi);
+        UINT winDpi = GetDpiForWindow(hwnd);
+        AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, winDpi);
 
         SetWindowPos(hwnd, HWND_NOTOPMOST, rc.left, rc.top,
                      rc.right - rc.left, rc.bottom - rc.top,

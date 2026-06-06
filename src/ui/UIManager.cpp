@@ -18,11 +18,11 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
-    // Load both embedded default faces and let SetDpiScale pick between them by
+    // Load both embedded default faces and let SetUiScale pick between them by
     // scale: the bitmap ProggyClean is pixel-perfect at integer scales (1x, 2x);
     // the scalable ProggyForever stays smooth at fractional scales (1.25x, 1.5x),
     // where the bitmap would blur. style.FontScaleDpi re-rasterizes whichever face
-    // is active. The first-added face is the initial default (m_dpiScale = 1.0).
+    // is active. The first-added face is the initial default (m_uiScale = 1.0).
     m_fontBitmap = io.Fonts->AddFontDefaultBitmap();
     m_fontVector = io.Fonts->AddFontDefaultVector();
     io.FontDefault = m_fontBitmap;
@@ -44,7 +44,7 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     style.HoverFlagsForTooltipMouse =
         (style.HoverFlagsForTooltipMouse & ~ImGuiHoveredFlags_DelayShort) | ImGuiHoveredFlags_DelayNormal;
 
-    // Snapshot the unscaled style so SetDpiScale can re-apply it cleanly.
+    // Snapshot the unscaled style so SetUiScale can re-apply it cleanly.
     m_baseStyle = style;
 
     if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
@@ -55,12 +55,12 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     return true;
 }
 
-void UIManager::SetDpiScale(float scale) {
+void UIManager::SetUiScale(float scale) {
     if (scale <= 0.0f) scale = 1.0f;
-    if (scale == m_dpiScale) return;
+    if (scale == m_uiScale) return;
 
-    float prevScale = m_dpiScale;
-    m_dpiScale = scale;
+    float prevScale = m_uiScale;
+    m_uiScale = scale;
 
     // ImGui 1.92+ uses dynamic font rasterization. Final font size is
     //   FontSizeBase * FontScaleMain * FontScaleDpi * ...
@@ -81,8 +81,8 @@ void UIManager::SetDpiScale(float scale) {
     if (desired)
         ImGui::GetIO().FontDefault = desired;
 
-    // Rescale open floating windows' sizes by the DPI ratio so they keep the
-    // same visual footprint. Keep each window centered on its previous center
+    // Rescale open floating windows' sizes by the UI-scale ratio so they keep
+    // the same visual footprint. Keep each window centered on its previous center
     // so it grows/shrinks in place rather than off to one corner.
     float ratio = scale / prevScale;
     if (ratio != 1.0f) {
@@ -93,7 +93,7 @@ void UIManager::SetDpiScale(float scale) {
             ImVec2 center(w->Pos.x + w->SizeFull.x * 0.5f,
                           w->Pos.y + w->SizeFull.y * 0.5f);
             // The Timeline's width tracks the viewport (App's proportional
-            // repositioning owns it), so only its height scales with DPI here.
+            // repositioning owns it), so only its height scales with the UI here.
             // Scaling its width too would fight that and shrink its relative
             // width whenever the scale drops without a matching window resize.
             bool scaleWidth = (strcmp(name, "Timeline") != 0);
