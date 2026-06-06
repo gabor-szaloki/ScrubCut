@@ -327,6 +327,7 @@ bool App::Init() {
     m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
+    m_uiScale = std::clamp(m_prefSettings.GetFloat("ui_scale", 1.0f), 0.5f, 2.0f);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
@@ -470,6 +471,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("show_waveform", m_showWaveform);
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
+        m_prefSettings.SetFloat("ui_scale", m_uiScale);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
         m_prefSettings.SetFloat("volume", m_player.GetVolume());
@@ -915,10 +917,10 @@ void App::Render() {
                 if (!win || win->DockId != 0) continue;
 
                 // Timeline scales its width with the viewport — the wider it
-                // is the more scrubbing resolution you get. Height stays.
-                // Skip when this viewport change comes from the DPI-toggle
-                // window resize: SetDpiScale already scaled the width.
-                bool scaleWidth = (strcmp(name, "Timeline") == 0) && !m_dpiResizePending;
+                // is the more scrubbing resolution you get. Height stays. This
+                // is the sole owner of the Timeline's width (SetDpiScale leaves
+                // it alone), so DPI/UI-scale grows track it here too.
+                bool scaleWidth = (strcmp(name, "Timeline") == 0);
                 float newW = scaleWidth
                     ? win->SizeFull.x * (newSize.x / m_prevViewportSize.x)
                     : win->SizeFull.x;
@@ -944,7 +946,6 @@ void App::Render() {
                     win->Size.x = newW;
                 }
             }
-            m_dpiResizePending = false;
         }
         m_prevViewportSize = newSize;
     }
@@ -1136,41 +1137,57 @@ void App::Render() {
                 m_useDpiScaling = !m_useDpiScaling;
                 float scale = GetEffectiveDpiScale();
                 m_ui.SetDpiScale(scale);
-                if (m_useDpiScaling && scale > 1.0f && !m_fullscreen && !m_maximized) {
-                    // Grow the window by the DPI multiplier if it's smaller
-                    // than the now-scaled default size, so the scaled-up UI
-                    // doesn't get cramped in a window sized for 1.0x.
+                // Grow the window by the DPI multiplier if it's smaller than the
+                // now-scaled default size, so the scaled-up UI doesn't get
+                // cramped in a window sized for 1.0x.
+                if (m_useDpiScaling && scale > 1.0f) {
                     int ww = 0, wh = 0;
                     SDL_GetWindowSize(m_window, &ww, &wh);
                     if (ww < static_cast<int>(1280 * scale) ||
                         wh < static_cast<int>(720 * scale)) {
-                        int newW = static_cast<int>(ww * scale);
-                        int newH = static_cast<int>(wh * scale);
-                        SDL_SetWindowSize(m_window, newW, newH);
-                        // Keep the window center in place, clamped so the
-                        // grown window stays within the display work area.
-                        // Position/size are client-area coordinates, so pad
-                        // the clamp with the decoration border sizes (title
-                        // bar etc.) to keep those on-screen too.
-                        int wx = 0, wy = 0;
-                        SDL_GetWindowPosition(m_window, &wx, &wy);
-                        int newX = wx + (ww - newW) / 2;
-                        int newY = wy + (wh - newH) / 2;
-                        SDL_Rect usable{};
-                        if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(m_window), &usable)) {
-                            int bTop = 0, bLeft = 0, bBottom = 0, bRight = 0;
-                            SDL_GetWindowBordersSize(m_window, &bTop, &bLeft, &bBottom, &bRight);
-                            newX = std::max(usable.x + bLeft,
-                                   std::min(newX, usable.x + usable.w - newW - bRight));
-                            newY = std::max(usable.y + bTop,
-                                   std::min(newY, usable.y + usable.h - newH - bBottom));
-                        }
-                        SDL_SetWindowPosition(m_window, newX, newY);
-                        m_dpiResizePending = true;
+                        GrowWindowForUiScale(scale);
                     }
                 }
             }
 #endif
+            // Explicit UI scale, applied as a multiplier on top of the automatic
+            // DPI scale (see GetEffectiveDpiScale). Shown on all platforms; on
+            // macOS it's the only UI-scaling control since DPI is OS-handled.
+            // A stepped +/- input rather than a slider, so it doesn't
+            // continuously resize the very menu being interacted with. Laid out
+            // label-left / input-right to match the other rows.
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("UI Scale");
+                ImGui::SameLine();
+                const ImGuiStyle& st = ImGui::GetStyle();
+                float btn = ImGui::GetFrameHeight();
+                float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
+                float totalW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > totalW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - totalW));
+                ImGui::SetNextItemWidth(totalW);
+                float prevUiScale = m_uiScale;
+                if (ImGui::InputFloat("##uiscale", &m_uiScale, 0.25f, 0.25f, "%.2fx")) {
+                    m_uiScale = std::clamp(m_uiScale, 0.5f, 2.0f);
+                    if (m_uiScale != prevUiScale) {
+                        float scale = GetEffectiveDpiScale();
+                        m_ui.SetDpiScale(scale);
+                        // Grow the window to match, just like enabling DPI
+                        // scaling does — but only on an increase and only while
+                        // it's smaller than the scaled default.
+                        if (m_uiScale > prevUiScale && scale > 1.0f) {
+                            int ww = 0, wh = 0;
+                            SDL_GetWindowSize(m_window, &ww, &wh);
+                            if (ww < static_cast<int>(1280 * scale) ||
+                                wh < static_cast<int>(720 * scale)) {
+                                GrowWindowForUiScale(m_uiScale / prevUiScale);
+                            }
+                        }
+                    }
+                }
+            }
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
@@ -2950,12 +2967,43 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
 float App::GetEffectiveDpiScale() const {
 #ifdef __APPLE__
     // On macOS the OS already handles scaling via the window's point/pixel
-    // separation, so we leave UI at 1.0.
-    return 1.0f;
+    // separation, so the automatic DPI component stays at 1.0.
+    float dpi = 1.0f;
 #else
-    if (!m_useDpiScaling) return 1.0f;
-    return SDL_GetWindowDisplayScale(m_window);
+    float dpi = m_useDpiScaling ? SDL_GetWindowDisplayScale(m_window) : 1.0f;
 #endif
+    // m_uiScale is the user's explicit multiplier layered on top of the
+    // automatic DPI scale (input in the View menu, 0.5x–2.0x).
+    return dpi * m_uiScale;
+}
+
+void App::GrowWindowForUiScale(float ratio) {
+    if (ratio <= 1.0f || m_fullscreen || m_maximized) return;
+
+    int ww = 0, wh = 0;
+    SDL_GetWindowSize(m_window, &ww, &wh);
+    int newW = static_cast<int>(ww * ratio);
+    int newH = static_cast<int>(wh * ratio);
+    SDL_SetWindowSize(m_window, newW, newH);
+
+    // Keep the window center in place, clamped so the grown window stays within
+    // the display work area. Position/size are client-area coordinates, so pad
+    // the clamp with the decoration border sizes (title bar etc.) to keep those
+    // on-screen too.
+    int wx = 0, wy = 0;
+    SDL_GetWindowPosition(m_window, &wx, &wy);
+    int newX = wx + (ww - newW) / 2;
+    int newY = wy + (wh - newH) / 2;
+    SDL_Rect usable{};
+    if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(m_window), &usable)) {
+        int bTop = 0, bLeft = 0, bBottom = 0, bRight = 0;
+        SDL_GetWindowBordersSize(m_window, &bTop, &bLeft, &bBottom, &bRight);
+        newX = std::max(usable.x + bLeft,
+               std::min(newX, usable.x + usable.w - newW - bRight));
+        newY = std::max(usable.y + bTop,
+               std::min(newY, usable.y + usable.h - newH - bBottom));
+    }
+    SDL_SetWindowPosition(m_window, newX, newY);
 }
 
 double App::ComputeScrubTarget(float mouseX, float barWidth, double duration,

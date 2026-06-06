@@ -90,6 +90,9 @@ private:
     bool m_showWaveform = false;
     bool m_showTooltips = true;
     bool m_useDpiScaling = true;
+    // Explicit user-set UI scale (0.5x–2.0x), applied as a multiplier on top of
+    // the automatic DPI scale in GetEffectiveDpiScale.
+    float m_uiScale = 1.0f;
     bool m_autoHideCursor = true;
     bool m_autoHideUI = false;
 
@@ -97,18 +100,18 @@ private:
     // SDL_GetWindowDisplayScale and returns 1.0 if DPI scaling is disabled
     // or on platforms where we don't support it.
     float GetEffectiveDpiScale() const;
+
+    // Grow the window by `ratio` (>1) about its center, clamped to the display's
+    // usable bounds, so an enlarged UI isn't cramped. No-op for ratio <= 1 or
+    // when fullscreen/maximized. The resulting viewport resize lets the
+    // proportional-repositioning pass scale the Timeline width to match.
+    void GrowWindowForUiScale(float ratio);
     bool m_uiHidden = false;
     bool m_fullscreen = false;
     int m_windowedX = 0, m_windowedY = 0, m_windowedW = 1280, m_windowedH = 720;
     bool m_maximized = false;
     bool m_wasMaximizedBeforeFullscreen = false;
     bool m_waitingForFullscreenExit = false;
-
-    // Set when toggling DPI scaling also resizes the window. The next
-    // proportional-resize pass skips Timeline width scaling for that viewport
-    // change, since UIManager::SetDpiScale already rescaled it by the DPI
-    // ratio — scaling both ways would compound.
-    bool m_dpiResizePending = false;
 
     // Floating window geometry snapshot (position + size) taken when entering
     // fullscreen, so it can be restored exactly on exit.

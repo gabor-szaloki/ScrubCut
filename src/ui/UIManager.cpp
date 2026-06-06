@@ -1,6 +1,7 @@
 #include "ui/UIManager.h"
 
 #include <cmath>
+#include <cstring>
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -91,7 +92,13 @@ void UIManager::SetDpiScale(float scale) {
             if (!w || w->DockId != 0) continue;
             ImVec2 center(w->Pos.x + w->SizeFull.x * 0.5f,
                           w->Pos.y + w->SizeFull.y * 0.5f);
-            w->SizeFull.x *= ratio;
+            // The Timeline's width tracks the viewport (App's proportional
+            // repositioning owns it), so only its height scales with DPI here.
+            // Scaling its width too would fight that and shrink its relative
+            // width whenever the scale drops without a matching window resize.
+            bool scaleWidth = (strcmp(name, "Timeline") != 0);
+            if (scaleWidth)
+                w->SizeFull.x *= ratio;
             w->SizeFull.y *= ratio;
             w->Size = w->SizeFull;
             w->Pos = ImVec2(center.x - w->SizeFull.x * 0.5f,
