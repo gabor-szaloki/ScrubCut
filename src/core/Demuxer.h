@@ -24,6 +24,12 @@ public:
     int GetVideoStreamIndex() const { return m_videoStreamIdx; }
     int GetAudioStreamIndex() const { return m_audioStreamIdx; }
 
+    // Switch which audio stream is active. The DemuxThread packet filter and
+    // GetAudioCodecParams()/GetAudioTimeBase() all key off this index, so the
+    // caller must park the pipeline + reopen the audio decoder around this.
+    // Ignores out-of-range indices and indices that aren't audio streams.
+    void SetAudioStreamIndex(int idx);
+
     AVCodecParameters* GetVideoCodecParams() const;
     AVCodecParameters* GetAudioCodecParams() const;
 

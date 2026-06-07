@@ -2,12 +2,15 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_opengl3.h>
 #include "util/AppPaths.h"
+#include "util/Log.h"
 
 bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     (void)glContext;
@@ -26,6 +29,33 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     m_fontBitmap = io.Fonts->AddFontDefaultBitmap();
     m_fontVector = io.Fonts->AddFontDefaultVector();
     io.FontDefault = m_fontBitmap;
+
+    // Subtitle overlay fonts, loaded from files bundled next to the executable
+    // (see CMakeLists). The monospace UI fonts above are poor for prose; Roboto
+    // (Apache-2.0) covers Latin/Cyrillic/Greek and a merged DroidSansFallback
+    // (Apache-2.0) adds Chinese/Japanese/Korean. Rendered at an explicit pixel
+    // size via ImDrawList::AddText; ImGui 1.92 + FreeType rasterizes glyphs on
+    // demand, so no glyph-range table is needed. If a file is missing,
+    // GetSubtitleFont() falls back to the default UI font.
+    {
+        constexpr float kSubtitleBaseSize = 32.0f;
+        const char* base = SDL_GetBasePath();
+        std::filesystem::path dir(base ? base : "");
+        auto loadFont = [&](const char* file, bool merge) -> ImFont* {
+            std::filesystem::path p = dir / file;
+            std::error_code ec;
+            if (!std::filesystem::exists(p, ec)) {
+                LOG_WARN("Subtitle font missing: %s", p.string().c_str());
+                return nullptr;
+            }
+            ImFontConfig cfg;
+            cfg.MergeMode = merge;
+            return io.Fonts->AddFontFromFileTTF(p.string().c_str(), kSubtitleBaseSize, &cfg);
+        };
+        m_fontSubtitle = loadFont("Roboto-Medium.ttf", /*merge=*/false);
+        if (m_fontSubtitle)
+            loadFont("DroidSansFallback.ttf", /*merge=*/true); // CJK fallback
+    }
 
     m_iniPath = (GetAppDataDir() / "imgui.ini").string();
     io.IniFilename = m_iniPath.c_str();

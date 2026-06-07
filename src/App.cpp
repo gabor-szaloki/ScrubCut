@@ -16,6 +16,7 @@
 #endif
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -328,6 +329,7 @@ bool App::Init() {
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
     m_userUiScale = std::clamp(m_prefSettings.GetFloat("ui_scale", 1.0f), 0.5f, 2.0f);
+    m_subtitleScale = std::clamp(m_prefSettings.GetFloat("subtitle_scale", 1.0f), 0.5f, 3.0f);
     m_autoHideCursor = m_prefSettings.GetBool("auto_hide_cursor", true);
     m_autoHideUI = m_prefSettings.GetBool("auto_hide_ui", false);
     m_player.SetVolume(std::clamp(m_prefSettings.GetFloat("volume", 1.0f), 0.0f, 1.0f));
@@ -413,6 +415,12 @@ void App::Run() {
             OpenFile(m_pendingOpenFilePath);
             m_pendingOpenFilePath.clear();
         }
+        // Deferred subtitle-file open (dialog callback, possibly off-thread).
+        if (!m_pendingSubtitlePath.empty()) {
+            std::string p = m_pendingSubtitlePath;
+            m_pendingSubtitlePath.clear();
+            OpenSubtitleFile(p);
+        }
 
         // Fetch frame before render (for async playback)
         // and after render (for sync seeks triggered by UI during Render)
@@ -472,6 +480,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetFloat("ui_scale", m_userUiScale);
+        m_prefSettings.SetFloat("subtitle_scale", m_subtitleScale);
         m_prefSettings.SetBool("auto_hide_cursor", m_autoHideCursor);
         m_prefSettings.SetBool("auto_hide_ui", m_autoHideUI);
         m_prefSettings.SetFloat("volume", m_player.GetVolume());
@@ -531,6 +540,10 @@ void App::OpenFile(const std::string& path) {
     m_segments.Clear();
     m_segmentsClosedManually = false;
 
+    // Reset subtitles to "off" and rebuild the track list from the new file's
+    // embedded subtitle streams (session-only — no persistence across opens).
+    ResetSubtitleState();
+
     // Kick off the background waveform scan only when enabled. Otherwise
     // reset so stale peaks from the previously-open file don't show up if
     // the user enables the waveform later (we Start it then).
@@ -553,6 +566,225 @@ void App::OpenFile(const std::string& path) {
     AddToRecent(path);
 
     m_player.Play();
+}
+
+// --- Media: audio / subtitle track selection ---
+
+bool App::IsSubtitlePath(const std::string& path) {
+    auto dot = path.find_last_of('.');
+    if (dot == std::string::npos) return false;
+    std::string ext = path.substr(dot + 1);
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == "srt" || ext == "ass" || ext == "ssa" || ext == "vtt" || ext == "sub";
+}
+
+void App::ResetSubtitleState() {
+    m_subtitleExtractor.Reset();
+    m_activeSubtitle = -1;
+    m_subtitleDelaySec = 0.0;
+    m_subtitleTracks = m_player.GetSubtitleTracks(); // embedded tracks; externals appended later
+}
+
+void App::SelectAudioTrack(int streamIndex) {
+    const auto& tracks = m_player.GetAudioTracks();
+    m_player.SetAudioTrack(streamIndex);
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        if (tracks[i].streamIndex == streamIndex) {
+            ShowStatus("Audio " + std::to_string(i + 1) + "/" +
+                       std::to_string(tracks.size()) + ": " + tracks[i].title);
+            break;
+        }
+    }
+}
+
+void App::SelectSubtitleTrack(int index) {
+    if (index < -1 || index >= static_cast<int>(m_subtitleTracks.size())) return;
+    m_activeSubtitle = index;
+    if (index < 0) {
+        m_subtitleExtractor.Reset();
+        ShowStatus("Subtitles: Off");
+        return;
+    }
+    const SubtitleTrackInfo& t = m_subtitleTracks[index];
+    ShowStatus("Subtitle " + std::to_string(index + 1) + "/" +
+               std::to_string(m_subtitleTracks.size()) + ": " + t.title +
+               (t.external ? " (file)" : ""));
+    if (!t.textBased) { m_subtitleExtractor.Reset(); return; } // bitmap — nothing to render
+    if (t.external) m_subtitleExtractor.Start(t.path, -1);
+    else            m_subtitleExtractor.Start(m_currentFilePath, t.streamIndex);
+}
+
+void App::OpenSubtitleFile(const std::string& path) {
+    if (!m_player.HasMedia()) return;
+    SubtitleTrackInfo t;
+    t.external = true;
+    t.textBased = true;
+    t.path = path;
+    t.title = std::filesystem::path(path).filename().string();
+    m_subtitleTracks.push_back(std::move(t));
+    SelectSubtitleTrack(static_cast<int>(m_subtitleTracks.size()) - 1);
+}
+
+void App::CycleAudioTrack(int dir) {
+    const auto& tracks = m_player.GetAudioTracks();
+    if (tracks.size() < 2) return;
+    int active = m_player.GetActiveAudioStreamIndex();
+    int cur = 0;
+    for (int i = 0; i < static_cast<int>(tracks.size()); i++)
+        if (tracks[i].streamIndex == active) { cur = i; break; }
+    int n = static_cast<int>(tracks.size());
+    int next = ((cur + dir) % n + n) % n;
+    SelectAudioTrack(tracks[next].streamIndex);
+    BumpUIActivity();
+}
+
+void App::CycleSubtitleTrack(int dir) {
+    // Cycle through n+1 states: off (-1) then each track 0..n-1.
+    int n = static_cast<int>(m_subtitleTracks.size());
+    if (n == 0) return;
+    int states = n + 1;
+    int cur = m_activeSubtitle + 1; // 0 = off
+    int next = ((cur + dir) % states + states) % states;
+    SelectSubtitleTrack(next - 1);
+    BumpUIActivity();
+}
+
+void App::NudgeSubtitleDelay(double deltaSec) {
+    m_subtitleDelaySec += deltaSec;
+    char buf[48];
+    // lround avoids "-0 ms" (a tiny negative or -0.0 printed via %+.0f).
+    snprintf(buf, sizeof(buf), "Subtitle delay: %+ld ms",
+             std::lround(m_subtitleDelaySec * 1000.0));
+    ShowStatus(buf);
+    BumpUIActivity();
+}
+
+void App::ShowStatus(const std::string& msg) {
+    m_statusMsg = msg;
+    m_statusMsgStartNS = SDL_GetTicksNS();
+}
+
+void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
+    if (m_activeSubtitle < 0) return;
+    ImFont* font = m_ui.GetSubtitleFont();
+    if (!font) return;
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float videoH = imgMax.y - imgMin.y;
+    float centerX = (imgMin.x + imgMax.x) * 0.5f;
+
+    float margin = videoH * 0.035f;
+
+    // Bottom anchor for a subtitle block of height blockH: hug the video bottom,
+    // but lift above the Timeline panel only when that panel's rectangle actually
+    // overlaps where the block would sit. (A timeline docked elsewhere — e.g. at
+    // the top — leaves the subtitle at the bottom.)
+    auto liftedBottom = [&](float blockH) -> float {
+        float subBottom = imgMax.y - margin;
+        float subTop = subBottom - blockH;
+        if (m_showTimeline && !m_uiHidden) {
+            // WasActive: the Viewport draws before the Timeline's Begin() this frame.
+            if (ImGuiWindow* tw = ImGui::FindWindowByName("Timeline")) {
+                if (tw->WasActive) {
+                    float twTop = tw->Pos.y;
+                    float twBot = tw->Pos.y + tw->Size.y;
+                    if (twTop > imgMin.y && twTop < subBottom && twBot > subTop)
+                        return twTop; // timeline overlaps the block — sit above it
+                }
+            }
+        }
+        return imgMax.y;
+    };
+
+    // Bitmap (unsupported) track that the user explicitly selected: show a note.
+    if (m_activeSubtitle < static_cast<int>(m_subtitleTracks.size()) &&
+        !m_subtitleTracks[m_activeSubtitle].textBased) {
+        const char* msg = "Subtitle format not supported";
+        float sz = std::clamp(videoH * 0.035f, 12.0f, 40.0f);
+        ImVec2 ts = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, msg);
+        float bottom = liftedBottom(ts.y);
+        ImVec2 pos(centerX - ts.x * 0.5f, bottom - ts.y - margin);
+        dl->AddText(font, sz, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, 220), msg);
+        dl->AddText(font, sz, pos, IM_COL32(255, 220, 120, 235), msg);
+        return;
+    }
+
+    double t = m_player.GetPlaybackTime() - m_subtitleDelaySec;
+    std::string text = m_subtitleExtractor.ActiveText(t);
+    if (text.empty()) return;
+
+    float fontSize = std::clamp(videoH * 0.05f * m_subtitleScale, 8.0f, 200.0f);
+    float lineH = fontSize * 1.15f;
+
+    std::vector<std::string> lines;
+    for (size_t start = 0; start <= text.size();) {
+        size_t nl = text.find('\n', start);
+        if (nl == std::string::npos) { lines.push_back(text.substr(start)); break; }
+        lines.push_back(text.substr(start, nl - start));
+        start = nl + 1;
+    }
+
+    float totalH = lineH * static_cast<float>(lines.size());
+    float bottom = liftedBottom(totalH);
+    float baseY = bottom - margin - totalH;
+
+    // Outline: sample the black copies evenly around a circle of uniform radius
+    // (rather than 8 cardinal/diagonal offsets, which give a bumpy, star-shaped
+    // edge), then lay the white fill on top. Smooth and even at any size.
+    float r = std::max(1.5f, fontSize * 0.045f);
+    constexpr int kOutlineSamples = 12;
+    ImVec2 offs[kOutlineSamples];
+    for (int k = 0; k < kOutlineSamples; k++) {
+        float a = (static_cast<float>(k) / kOutlineSamples) * 6.28318531f;
+        offs[k] = ImVec2(std::cos(a) * r, std::sin(a) * r);
+    }
+    ImU32 white = IM_COL32(255, 255, 255, 255);
+    ImU32 black = IM_COL32(0, 0, 0, 235);
+
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (lines[i].empty()) continue;
+        const char* s = lines[i].c_str();
+        ImVec2 ts = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, s);
+        float x = centerX - ts.x * 0.5f;
+        float y = baseY + static_cast<float>(i) * lineH;
+        for (const ImVec2& d : offs)
+            dl->AddText(font, fontSize, ImVec2(x + d.x, y + d.y), black, s);
+        dl->AddText(font, fontSize, ImVec2(x, y), white, s);
+    }
+}
+
+void App::RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
+    if (m_statusMsgStartNS == 0 || m_statusMsg.empty()) return;
+    ImFont* font = m_ui.GetSubtitleFont();
+    if (!font) return;
+
+    // ~1.2s hold + ~0.5s fade, mirroring the centre play/pause flash.
+    uint64_t elapsed = SDL_GetTicksNS() - m_statusMsgStartNS;
+    constexpr uint64_t kHoldNS = 1200000000ULL;
+    constexpr uint64_t kFadeNS = 500000000ULL;
+    if (elapsed >= kHoldNS + kFadeNS) { m_statusMsgStartNS = 0; return; }
+    float alpha = (elapsed <= kHoldNS) ? 1.0f
+        : 1.0f - static_cast<float>(elapsed - kHoldNS) / static_cast<float>(kFadeNS);
+
+    float videoH = imgMax.y - imgMin.y;
+    float sz = std::clamp(videoH * 0.032f, 13.0f, 40.0f);
+    const char* s = m_statusMsg.c_str();
+    ImVec2 ts = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, s);
+    float pad = sz * 0.45f;
+    // Anchor in the top-right corner, clearing the menu bar (when shown) at the
+    // top and leaving a comfortable margin on the right so it doesn't collide
+    // with the menu bar's version text / window controls.
+    float menuH = m_uiHidden ? 0.0f : ImGui::GetFrameHeight();
+    float marginRight = sz * 0.9f;
+    float marginTop = menuH + sz * 0.55f;
+    ImVec2 textPos(imgMax.x - marginRight - ts.x, imgMin.y + marginTop);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(textPos.x - pad, textPos.y - pad * 0.6f),
+                      ImVec2(textPos.x + ts.x + pad, textPos.y + ts.y + pad * 0.6f),
+                      IM_COL32(0, 0, 0, static_cast<int>(170 * alpha)), pad * 0.5f);
+    dl->AddText(font, sz, ImVec2(textPos.x + 1, textPos.y + 1),
+                IM_COL32(0, 0, 0, static_cast<int>(210 * alpha)), s);
+    dl->AddText(font, sz, textPos, IM_COL32(255, 255, 255, static_cast<int>(240 * alpha)), s);
 }
 
 void App::LoadRecentFiles() {
@@ -625,7 +857,15 @@ void App::ProcessEvents() {
             m_running = false;
         }
         if (event.type == SDL_EVENT_DROP_FILE) {
-            RequestOpenFile(event.drop.data);
+            // A dropped subtitle file loads over the open video; anything else
+            // is treated as a media file to open. (If no video is open yet, a
+            // subtitle has nothing to attach to, so fall through to open it as
+            // media and let the demuxer reject it.)
+            std::string dropped = event.drop.data;
+            if (IsSubtitlePath(dropped) && m_player.HasMedia())
+                OpenSubtitleFile(dropped);
+            else
+                RequestOpenFile(dropped);
         }
         // F12 screenshots work even when ImGui has keyboard capture (e.g. a
         // modal popup is open), so the shortcut stays useful for debugging.
@@ -870,6 +1110,26 @@ void App::ProcessEvents() {
                     m_showHelpPanel = !m_showHelpPanel;
                     BumpUIActivity();
                 }
+                break;
+            case SDLK_A:
+                // Cycle audio track (Shift = previous).
+                if (cmd || winMod) break;
+                CycleAudioTrack(shift ? -1 : +1);
+                break;
+            case SDLK_S:
+                // Cycle subtitle track, including "off" (Shift = previous).
+                if (cmd || winMod) break;
+                CycleSubtitleTrack(shift ? -1 : +1);
+                break;
+            case SDLK_SEMICOLON:
+                // Subtitle delay −50ms.
+                if (cmd || winMod) break;
+                NudgeSubtitleDelay(-0.05);
+                break;
+            case SDLK_APOSTROPHE:
+                // Subtitle delay +50ms.
+                if (cmd || winMod) break;
+                NudgeSubtitleDelay(+0.05);
                 break;
             }
         }
@@ -1223,6 +1483,97 @@ void App::Render() {
             }
             ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Media", m_player.HasMedia())) {
+            const auto& atracks = m_player.GetAudioTracks();
+            if (ImGui::BeginMenu("Audio Track", !atracks.empty())) {
+                int n = static_cast<int>(atracks.size());
+                int active = m_player.GetActiveAudioStreamIndex();
+                int cur = 0;
+                for (int i = 0; i < n; i++)
+                    if (atracks[i].streamIndex == active) { cur = i; break; }
+                // Hints mark the tracks A / Shift+A would switch to (next / prev).
+                int nextIdx = (n > 1) ? (cur + 1) % n : -1;
+                int prevIdx = (n > 1) ? (cur - 1 + n) % n : -1;
+                for (int i = 0; i < n; i++) {
+                    std::string label = std::to_string(i + 1) + ": " + atracks[i].title +
+                                        "##atrk" + std::to_string(i);
+                    const char* sc = (i == nextIdx && i == prevIdx) ? "A / Shift+A"
+                                   : (i == nextIdx) ? "A"
+                                   : (i == prevIdx) ? "Shift+A" : nullptr;
+                    bool sel = atracks[i].streamIndex == active;
+                    if (ImGui::MenuItem(label.c_str(), sc, sel))
+                        SelectAudioTrack(atracks[i].streamIndex);
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Subtitles")) {
+                // Hints mark the track (or Off) that S / Shift+S would switch to
+                // (next / prev); the cycle is Off → track 0 → … → last → Off.
+                int sn = static_cast<int>(m_subtitleTracks.size());
+                int states = sn + 1;
+                int curState = m_activeSubtitle + 1; // 0 == Off
+                int nextSub = (curState + 1) % states - 1;          // -1 == Off
+                int prevSub = (curState - 1 + states) % states - 1; // -1 == Off
+                auto subHint = [&](int idx) -> const char* {
+                    if (nextSub == idx && prevSub == idx) return "S / Shift+S";
+                    if (nextSub == idx) return "S";
+                    if (prevSub == idx) return "Shift+S";
+                    return nullptr;
+                };
+                if (ImGui::MenuItem("Off", subHint(-1), m_activeSubtitle < 0))
+                    SelectSubtitleTrack(-1);
+                for (int i = 0; i < sn; i++) {
+                    const SubtitleTrackInfo& s = m_subtitleTracks[i];
+                    std::string label = s.title;
+                    if (s.external) label += " (file)";
+                    label += "##strk" + std::to_string(i);
+                    if (ImGui::MenuItem(label.c_str(), subHint(i), m_activeSubtitle == i))
+                        SelectSubtitleTrack(i);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Open File...")) {
+                    static const SDL_DialogFileFilter subFilters[] = {
+                        {"Subtitle files", "srt;ass;ssa;vtt;sub"},
+                        {"All files", "*"},
+                    };
+                    SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {
+                        if (filelist && filelist[0])
+                            static_cast<App*>(userdata)->m_pendingSubtitlePath = filelist[0];
+                    }, this, m_window, subFilters, 2, nullptr, false);
+                }
+                ImGui::EndMenu();
+            }
+            // Subtitle size: stepped +/- input mirroring the View ▸ UI Scale
+            // widget. Laid out label-left / input-right.
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Subtitle Size");
+                ImGui::SameLine();
+                const ImGuiStyle& st = ImGui::GetStyle();
+                float btn = ImGui::GetFrameHeight();
+                float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
+                float totalW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > totalW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - totalW));
+                ImGui::SetNextItemWidth(totalW);
+                if (ImGui::InputFloat("##subsize", &m_subtitleScale, 0.1f, 0.25f, "%.2fx"))
+                    m_subtitleScale = std::clamp(m_subtitleScale, 0.5f, 3.0f);
+            }
+            if (ImGui::BeginMenu("Subtitle Delay")) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Current: %+ld ms",
+                         std::lround(m_subtitleDelaySec * 1000.0));
+                ImGui::MenuItem(buf, nullptr, false, false);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Earlier (-50 ms)", ";")) NudgeSubtitleDelay(-0.05);
+                if (ImGui::MenuItem("Later (+50 ms)", "'"))   NudgeSubtitleDelay(+0.05);
+                if (ImGui::MenuItem("Reset")) { m_subtitleDelaySec = 0.0; ShowStatus("Subtitle delay: +0 ms"); }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str())) {
                 m_showHelpPanel = !m_showHelpPanel;
@@ -1336,6 +1687,12 @@ void App::Render() {
                 }
             }
         }
+
+        // Subtitle overlay sits on top of the video (and above the flash), and
+        // shows even when the UI chrome is hidden — subtitles are content, not UI.
+        RenderSubtitleOverlay(imgMin, imgMax);
+        // Top-right flash for track/delay/size changes — explicit user feedback.
+        RenderStatusOverlay(imgMin, imgMax);
     } else {
         std::string line1 = "Drag and drop a video file to open it";
         std::string line2 = "or press " + std::string(kKeys.cmdName) + "+O to browse";
@@ -2358,6 +2715,9 @@ void App::Render() {
             row("Speed up / down",      "+ / -");
             row("Volume up / down",     "Up / Down");
             row("Mute / unmute",        "M");
+            row("Next / prev audio track",    "A / Shift + A");
+            row("Next / prev subtitle track", "S / Shift + S");
+            row("Subtitle delay -/+",         "; / '");
             row("Jump to start / end",  kKeys.jumpName);
             row("Prev / next chapter",  "J / K");
             row("Mark In",              "I  or  [");

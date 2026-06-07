@@ -72,6 +72,17 @@ public:
 
     const std::vector<Chapter>& GetChapters() const { return m_chapters; }
 
+    // Read-only track lists extracted from the source file at Open().
+    const std::vector<AudioTrackInfo>& GetAudioTracks() const { return m_audioTracks; }
+    const std::vector<SubtitleTrackInfo>& GetSubtitleTracks() const { return m_subtitleTracks; }
+    int GetActiveAudioStreamIndex() const { return m_demuxer.GetAudioStreamIndex(); }
+
+    // Switch the active audio stream mid-playback. Parks the pipeline, reopens
+    // the audio decoder/output/resampler for the new stream, then re-seeks to
+    // the current position to refill. No-op if streamIndex is already active or
+    // isn't a valid audio stream. Safe to call from the main thread.
+    void SetAudioTrack(int streamIndex);
+
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
 
@@ -185,8 +196,10 @@ private:
     VideoDecoder m_cacheDecoder;
     FrameConverter m_cacheConverter;
 
-    // Read-only chapter metadata extracted from the source file at Open().
+    // Read-only metadata extracted from the source file at Open().
     std::vector<Chapter> m_chapters;
+    std::vector<AudioTrackInfo> m_audioTracks;
+    std::vector<SubtitleTrackInfo> m_subtitleTracks;
 
     PacketQueue m_videoPacketQueue{64};
     PacketQueue m_audioPacketQueue{64};

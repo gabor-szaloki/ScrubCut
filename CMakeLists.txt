@@ -79,6 +79,21 @@ if(WIN32)
     target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi)
 endif()
 
+# Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are
+# loaded at runtime from next to the executable via SDL_GetBasePath(). They're
+# loose files rather than embedded to keep the binary and compile times small.
+# Copy them next to the binary for dev builds; the install rules below stage
+# them (and their licenses) for packaging.
+set(_FONT_DIR "${CMAKE_SOURCE_DIR}/third_party/fonts")
+set(_FONT_FILES "Roboto-Medium.ttf" "DroidSansFallback.ttf")
+set(_FONT_LICENSES "LICENSE-Roboto.txt" "LICENSE-DroidSansFallback.txt")
+foreach(_f ${_FONT_FILES})
+    add_custom_command(TARGET ScrubCut POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_FONT_DIR}/${_f}" "$<TARGET_FILE_DIR:ScrubCut>/${_f}"
+        VERBATIM)
+endforeach()
+
 # --- Install ---
 
 # Common CPack metadata
@@ -98,6 +113,11 @@ if(WIN32)
     # License and icon
     install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/windows/ScrubCut.ico" DESTINATION ".")
+
+    # Subtitle fonts (loaded at runtime from the exe directory) + their licenses.
+    foreach(_f ${_FONT_FILES} ${_FONT_LICENSES})
+        install(FILES "${_FONT_DIR}/${_f}" DESTINATION ".")
+    endforeach()
 
     # --- CPack / NSIS installer ---
     set(CPACK_GENERATOR "NSIS")
@@ -152,6 +172,10 @@ elseif(APPLE)
     install(TARGETS ScrubCut RUNTIME DESTINATION "ScrubCut.app/Contents/MacOS")
     install(FILES "${CMAKE_BINARY_DIR}/Info.plist" DESTINATION "ScrubCut.app/Contents")
     install(FILES "${CMAKE_SOURCE_DIR}/platform/macos/ScrubCut.icns" DESTINATION "ScrubCut.app/Contents/Resources")
+    # Subtitle fonts + licenses. SDL_GetBasePath() resolves to Resources/ in a bundle.
+    foreach(_f ${_FONT_FILES} ${_FONT_LICENSES})
+        install(FILES "${_FONT_DIR}/${_f}" DESTINATION "ScrubCut.app/Contents/Resources")
+    endforeach()
     install(CODE "execute_process(COMMAND codesign --force --deep --sign - \"\${CMAKE_INSTALL_PREFIX}/ScrubCut.app\")")
 
     # --- CPack / DragNDrop DMG ---

@@ -1,0 +1,19 @@
+DroidSansFallback.ttf
+
+Droid Sans Fallback is part of the Droid font family, Copyright (C) 2008 The
+Android Open Source Project, and is licensed under the Apache License, Version
+2.0 (the "License"); you may not use this font except in compliance with the
+License. You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+This font provides broad CJK coverage (Chinese Han ideographs, Japanese kana,
+Korean Hangul). It is shipped unmodified alongside the ScrubCut executable and
+loaded at runtime, then merged with Roboto (which covers Latin/Cyrillic/Greek)
+to render subtitle text. It is bundled as a separate file rather than embedded
+to keep the executable and build times small.

@@ -53,6 +53,36 @@ struct Chapter {
     std::string title;
 };
 
+// Read-only description of an audio stream in the open file. Populated in
+// Player::Open the same way chapters are, and used to drive the Media menu.
+struct AudioTrackInfo {
+    int streamIndex = -1;
+    std::string title;     // friendly label: metadata title, else "<lang> (codec, Nch)", else "Track N"
+    std::string language;  // metadata "language" tag, e.g. "eng" ("" if absent)
+    std::string codecName;
+    int channels = 0;
+};
+
+// Read-only description of a subtitle track. Covers both embedded streams
+// (external == false, streamIndex valid) and externally-opened subtitle files
+// (external == true, path valid, streamIndex == -1).
+struct SubtitleTrackInfo {
+    int streamIndex = -1;
+    std::string title;
+    std::string language;
+    bool external = false;
+    bool textBased = true; // false for bitmap formats (PGS/VOBSUB/DVB) — shown but not rendered
+    std::string path;      // external file path (external only)
+};
+
+// A single decoded subtitle cue. SubtitleExtractor produces a time-sorted
+// list of these; rendering is a simple time lookup.
+struct SubtitleEvent {
+    double startSec = 0.0;
+    double endSec   = 0.0;
+    std::string text; // plain text, '\n'-separated lines, formatting tags stripped
+};
+
 struct ExportSettings {
     std::string outputPath;
     std::vector<TimeRange> segments;

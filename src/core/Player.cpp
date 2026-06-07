@@ -30,6 +30,8 @@ bool Player::Open(const std::string& path) {
         return false;
 
     m_chapters.clear();
+    m_audioTracks.clear();
+    m_subtitleTracks.clear();
     if (AVFormatContext* fmt = m_demuxer.GetFormatContext()) {
         m_chapters.reserve(fmt->nb_chapters);
         for (unsigned i = 0; i < fmt->nb_chapters; ++i) {
@@ -41,6 +43,64 @@ bool Player::Open(const std::string& path) {
             AVDictionaryEntry* t = av_dict_get(c->metadata, "title", nullptr, 0);
             if (t && t->value) ch.title = t->value;
             m_chapters.push_back(std::move(ch));
+        }
+
+        // Enumerate audio + subtitle streams for the Media menu. Same read-only
+        // metadata pattern as chapters: built once here, cleared in Close().
+        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+            AVStream* st = fmt->streams[i];
+            AVCodecParameters* par = st->codecpar;
+            auto getTag = [&](const char* key) -> std::string {
+                AVDictionaryEntry* e = av_dict_get(st->metadata, key, nullptr, 0);
+                return (e && e->value) ? e->value : std::string();
+            };
+
+            if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+                AudioTrackInfo a;
+                a.streamIndex = static_cast<int>(i);
+                a.language = getTag("language");
+                a.codecName = avcodec_get_name(par->codec_id);
+                a.channels = par->ch_layout.nb_channels;
+                std::string title = getTag("title");
+                // Technical info (codec + channels) is always shown; language is
+                // included when tagged. With a title, append it parenthetically;
+                // without, use the language (or "Audio") as the name.
+                std::string info = a.codecName;
+                if (a.channels > 0) info += ", " + std::to_string(a.channels) + "ch";
+                if (!title.empty()) {
+                    std::string detail = a.language.empty() ? info : (a.language + ", " + info);
+                    a.title = title + " (" + detail + ")";
+                } else {
+                    a.title = (a.language.empty() ? std::string("Audio") : a.language)
+                              + " (" + info + ")";
+                }
+                m_audioTracks.push_back(std::move(a));
+            } else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                SubtitleTrackInfo s;
+                s.streamIndex = static_cast<int>(i);
+                s.language = getTag("language");
+                switch (par->codec_id) {
+                    case AV_CODEC_ID_DVD_SUBTITLE:
+                    case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+                    case AV_CODEC_ID_DVB_SUBTITLE:
+                    case AV_CODEC_ID_XSUB:
+                        s.textBased = false;
+                        break;
+                    default:
+                        s.textBased = true;
+                        break;
+                }
+                std::string title = getTag("title");
+                if (!title.empty()) {
+                    s.title = title;
+                } else {
+                    s.title = s.language.empty()
+                        ? ("Track " + std::to_string(m_subtitleTracks.size() + 1))
+                        : s.language;
+                }
+                if (!s.textBased) s.title += " [bitmap]";
+                m_subtitleTracks.push_back(std::move(s));
+            }
         }
     }
 
@@ -133,6 +193,8 @@ void Player::Close() {
     m_lastDisplayedPts = AV_NOPTS_VALUE;
     m_hasCachedFrame = false;
     m_chapters.clear();
+    m_audioTracks.clear();
+    m_subtitleTracks.clear();
 }
 
 void Player::Play() {
@@ -597,6 +659,52 @@ void Player::SetMuted(bool muted) {
     m_muted = muted;
     if (m_hasAudio)
         m_audioOutput.SetVolume(muted ? 0.0f : VolumeToGain(m_volume));
+}
+
+void Player::SetAudioTrack(int streamIndex) {
+    if (!m_hasMedia) return;
+    if (streamIndex == m_demuxer.GetAudioStreamIndex()) return;
+
+    AVFormatContext* fmt = m_demuxer.GetFormatContext();
+    if (!fmt || streamIndex < 0 || streamIndex >= static_cast<int>(fmt->nb_streams))
+        return;
+    if (fmt->streams[streamIndex]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+        return;
+
+    bool wasPlaying = m_playing.load(std::memory_order_relaxed) ||
+                      m_wantsToPlay.load(std::memory_order_relaxed);
+    double curTime = m_clock.GetTime();
+
+    // Pause() parks the pipeline (workers halt at top-of-loop, queues
+    // interrupted) and pauses the audio output — the safe point to swap the
+    // audio decoder/output without racing the decode threads.
+    Pause();
+
+    m_demuxer.SetAudioStreamIndex(streamIndex);
+    m_audioDecoder.Close();
+    if (m_audioDecoder.Open(m_demuxer.GetAudioCodecParams())) {
+        int sr = m_audioDecoder.GetSampleRate();
+        int ch = m_audioDecoder.GetChannels();
+        if (sr != m_audioOutput.GetSampleRate() || ch != m_audioOutput.GetChannels()) {
+            m_audioOutput.Close();
+            m_audioOutput.Open(sr, ch);
+        } else {
+            m_audioOutput.Flush();
+        }
+        SetupResampler();
+        m_hasAudio = true;
+        m_clock.SetAudioOutput(&m_audioOutput);
+        SetMuted(m_muted);
+        m_audioOutput.SetSpeed(static_cast<float>(m_clock.GetSpeed()));
+    } else {
+        m_hasAudio = false;
+        m_clock.SetAudioOutput(nullptr);
+        LOG_WARN("SetAudioTrack: failed to open decoder for stream %d", streamIndex);
+    }
+
+    // Re-seek to where we were to flush stale packets/frames and refill from
+    // the newly-selected audio stream (the DemuxThread filter now routes it).
+    SeekTo(curTime, /*resumeAfter=*/wasPlaying);
 }
 
 // --- Synchronous decode (used when paused) ---

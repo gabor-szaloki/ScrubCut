@@ -4,6 +4,8 @@
 #include "core/Player.h"
 #include "core/SegmentManager.h"
 #include "core/WaveformExtractor.h"
+#include "core/SubtitleExtractor.h"
+#include "util/Types.h"
 #include "export/Exporter.h"
 #include "util/Settings.h"
 
@@ -22,9 +24,53 @@ public:
     void OpenFile(const std::string& path);
     void RequestOpenFile(const std::string& path);
 
+    // True if `path` has a subtitle-file extension (.srt/.ass/.ssa/.vtt/.sub).
+    static bool IsSubtitlePath(const std::string& path);
+
 private:
     void ProcessEvents();
     void Render();
+
+    // --- Media: audio / subtitle track selection ---
+    // Switch the active audio track and flash a status overlay. Used by both
+    // the menu and the cycle hotkey.
+    void SelectAudioTrack(int streamIndex);
+    // Load an external subtitle file over the open video, append it to the
+    // track list, and make it active.
+    void OpenSubtitleFile(const std::string& path);
+    // Select a subtitle track by index into m_subtitleTracks, or -1 for off.
+    void SelectSubtitleTrack(int index);
+    // Cycle the active audio / subtitle track by +1 or -1 (subtitles wrap
+    // through "off"). No-op when there's nothing to cycle.
+    void CycleAudioTrack(int dir);
+    void CycleSubtitleTrack(int dir);
+    // Adjust the subtitle delay by `deltaSec`.
+    void NudgeSubtitleDelay(double deltaSec);
+    // Reset per-file subtitle state and rebuild the track list from the player
+    // (embedded tracks only); called from OpenFile.
+    void ResetSubtitleState();
+    // Draw the active subtitle cue over the video rect, if any.
+    void RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
+
+    // Flash a short, fading status message in the top-right of the video
+    // (track switches, delay/size nudges) — the counterpart to the centre
+    // play/pause flash.
+    void ShowStatus(const std::string& msg);
+    void RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
+
+    // Combined subtitle track list: embedded tracks (copied from the Player on
+    // open) followed by any externally-opened files. -1 = subtitles off.
+    std::vector<SubtitleTrackInfo> m_subtitleTracks;
+    int m_activeSubtitle = -1;
+    double m_subtitleDelaySec = 0.0;
+    // Subtitle text size multiplier (on top of the video-relative base size).
+    // Persisted in preferences.ini.
+    float m_subtitleScale = 1.0f;
+    SubtitleExtractor m_subtitleExtractor;
+
+    // Top-right status flash.
+    std::string m_statusMsg;
+    uint64_t m_statusMsgStartNS = 0;
 
     // Recent files: persisted list, MRU on top, capped at kRecentMax entries.
     static constexpr int kRecentMax = 10;
@@ -146,6 +192,10 @@ private:
     bool m_exportDialogItemActiveLast = false;
     bool m_pendingOpenImmediate = false;
     std::string m_pendingOpenFilePath;
+    // Subtitle file chosen via the Open dialog. The dialog callback can fire on
+    // a non-main thread, so it stashes the path here and Run() applies it on the
+    // main thread (same pattern as m_pendingOpenFilePath).
+    std::string m_pendingSubtitlePath;
     std::vector<std::string> m_conflictingFiles;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";

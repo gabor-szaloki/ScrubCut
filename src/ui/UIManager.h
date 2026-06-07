@@ -21,6 +21,14 @@ public:
     void SetUiScale(float scale);
     float GetUiScale() const { return m_uiScale; }
 
+    // Sans-serif face (Roboto + merged CJK) used for the subtitle overlay,
+    // rendered at an explicit pixel size via ImDrawList::AddText so it's
+    // independent of the monospace UI font. Falls back to the default UI font if
+    // the bundled font files were missing at load time.
+    ImFont* GetSubtitleFont() const {
+        return m_fontSubtitle ? m_fontSubtitle : ImGui::GetIO().FontDefault;
+    }
+
 private:
     void SetupDockspace();
     bool m_layoutInitialized = false;
@@ -37,4 +45,7 @@ private:
     // at fractional scales.
     ImFont* m_fontBitmap = nullptr;
     ImFont* m_fontVector = nullptr;
+
+    // Sans-serif subtitle face, see GetSubtitleFont().
+    ImFont* m_fontSubtitle = nullptr;
 };

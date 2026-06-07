@@ -67,6 +67,13 @@ bool Demuxer::Seek(double seconds) {
     return true;
 }
 
+void Demuxer::SetAudioStreamIndex(int idx) {
+    if (!m_fmtCtx) return;
+    if (idx < 0 || idx >= static_cast<int>(m_fmtCtx->nb_streams)) return;
+    if (m_fmtCtx->streams[idx]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) return;
+    m_audioStreamIdx = idx;
+}
+
 AVCodecParameters* Demuxer::GetVideoCodecParams() const {
     if (m_fmtCtx && m_videoStreamIdx >= 0)
         return m_fmtCtx->streams[m_videoStreamIdx]->codecpar;
