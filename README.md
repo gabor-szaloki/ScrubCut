@@ -10,16 +10,28 @@ Prebuilt Windows and macOS installers are available on the [Releases page](https
 
 ## Features
 
+### Scrub
+
 - **Fast scrubbing** -- drag the timeline bar or use keyboard shortcuts to seek instantly
 - **Frame stepping** -- step forward/backward one frame at a time
+
+### Cut
+
 - **Trimming** -- mark multiple in/out segments, export them as separate files
 - **Frame grabbing** -- mark individual frames, export them as PNG stills
-- **Input formats** -- MP4, MKV, MOV, AVI, WebM, WMV, FLV, MPG/MPEG, 3GP, TS, M4V, and animated GIF
 - **Export formats**
   - Segments: original format (stream copy, no re-encoding) or GIF. MKV/WebM sources are remuxed into MP4 so the cuts are frame-accurate at both ends — the bitstream is bit-identical, just a different container. GIF sources only support GIF exports.
   - Frames: PNG stills.
+
+### Generic video player features
+
+ScrubCut can serve as your basic go-to video player app — you can find most basic features, like:
+
 - **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider
+- **Audio tracks** -- switch between multiple embedded audio tracks
+- **Subtitles** -- show embedded subtitle tracks, or load an external subtitle file (SRT, ASS/SSA, WebVTT, SUB) via the menu or drag-and-drop; adjustable text size and timing offset
+- **Input formats** -- MP4, MKV, MOV, AVI, WebM, WMV, FLV, MPG/MPEG, 3GP, TS, M4V, and animated GIF
 
 ## Setup
 
@@ -83,33 +95,55 @@ Launch the app and drag-and-drop a video file onto the window, or press **Ctrl/C
 
 ### Keyboard shortcuts
 
+Shortcuts are grouped the same way as the in-app help panel (press **?**).
+
+#### General
+
+| Action                      | Windows                              | macOS                                       |
+|-----------------------------|--------------------------------------|---------------------------------------------|
+| Open video                  | Ctrl + O                             | Cmd + O                                     |
+| Fullscreen                  | F                                    | F                                           |
+| Show / hide UI              | H                                    | H                                           |
+| Exit fullscreen / show UI   | Esc                                  | Esc                                         |
+| Toggle timeline             | Ctrl + T                             | Ctrl + T                                    |
+| Toggle marks                | Ctrl + M                             | Ctrl + M                                    |
+| Toggle help                 | Ctrl + H  or  ?                      | Ctrl + H  or  ?                             |
+| Quit                        | Alt + F4                             | Cmd + Q                                     |
+
+#### Scrub
+
 | Action                      | Windows                              | macOS                                       |
 |-----------------------------|--------------------------------------|---------------------------------------------|
 | Play / Pause                | Space                                | Space                                       |
-| Seek +/- 5s                 | Left / Right                         | Left / Right                                |
 | Seek +/- 1s                 | Ctrl + Left / Right                  | Option + Left / Right                       |
+| Seek +/- 5s                 | Left / Right                         | Left / Right                                |
 | Seek +/- 30s                | Shift + Left / Right                 | Shift + Left / Right                        |
 | Frame step                  | Alt + Left / Right  or  , / .        | Cmd + Option + Left / Right  or  , / .      |
-| Speed up / down             | + / -                                | + / -                                       |
-| Volume up / down            | Up / Down                            | Up / Down                                   |
-| Mute / unmute               | M                                    | M                                           |
 | Jump to start / end         | Home / End                           | Cmd + Left / Right  or  Home / End          |
 | Prev / next chapter         | J / K                                | J / K                                       |
+| Speed up / down             | + / -                                | + / -                                       |
+| Precision scrub             | Alt + drag timeline (0.1× sensitivity) | Option + drag timeline (0.1× sensitivity) |
+
+#### Cut
+
+| Action                      | Windows                              | macOS                                       |
+|-----------------------------|--------------------------------------|---------------------------------------------|
 | Mark In                     | I  or  [                             | I  or  [                                    |
 | Mark Out                    | O  or  ]                             | O  or  ]                                    |
 | Mark Frame                  | P                                    | P                                           |
 | Remove last mark            | Delete  or  Backspace                | Delete  or  Backspace                       |
-| Open file                   | Ctrl + O                             | Cmd + O                                     |
-| Export                      | Ctrl + E                             | Cmd + E                                     |
-| Toggle timeline panel       | Ctrl + T                             | Ctrl + T                                    |
-| Toggle marks panel          | Ctrl + M                             | Ctrl + M                                    |
-| Toggle fullscreen           | F                                    | F                                           |
-| Toggle UI visibility        | H                                    | H                                           |
-| Exit fullscreen / show UI   | Esc                                  | Esc                                         |
-| Quit                        | Alt + F4                             | Cmd + Q                                     |
-| Toggle help                 | Ctrl + H  or  ?                      | Ctrl + H  or  ?                             |
-| Precision scrub             | Alt + drag timeline (0.1× sensitivity) | Option + drag timeline (0.1× sensitivity) |
 | Add mark on timeline        | Ctrl + click (frame) / drag (segment) | Ctrl + click (frame) / drag (segment)      |
+| Export                      | Ctrl + E                             | Cmd + E                                     |
+
+#### Media
+
+| Action                      | Windows                              | macOS                                       |
+|-----------------------------|--------------------------------------|---------------------------------------------|
+| Volume up / down            | Up / Down                            | Up / Down                                   |
+| Mute / unmute               | M                                    | M                                           |
+| Next / prev audio track     | A / Shift + A                        | A / Shift + A                               |
+| Next / prev subtitle track  | S / Shift + S                        | S / Shift + S                               |
+| Subtitle delay -/+          | ; / '                                | ; / '                                       |
 
 ### Command-line flags
 

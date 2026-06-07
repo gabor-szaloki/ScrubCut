@@ -2687,8 +2687,8 @@ void App::Render() {
         // Default position: top-left of the workspace. layoutCond is
         // FirstUseEver normally and Always on Reset Layout. On the reset
         // frame we also pass AlwaysAutoResize so the size snaps to the
-        // shortcuts table's content size — that's the single source of
-        // truth, not a hardcoded number duplicated in the reset path.
+        // shortcuts' content size — that's the single source of truth, not a
+        // hardcoded number duplicated in the reset path.
         float uiScale = m_ui.GetUiScale();
         ImGui::SetNextWindowPos(
             ImVec2(vp->WorkPos.x + 40 * uiScale, vp->WorkPos.y + 40 * uiScale),
@@ -2696,44 +2696,71 @@ void App::Render() {
         ImGuiWindowFlags helpFlags =
             wasResetFrame ? ImGuiWindowFlags_AlwaysAutoResize : 0;
         ImGui::Begin("Help", &m_showHelpPanel, helpFlags);
-        if (ImGui::BeginTable("##shortcuts", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableHeadersRow();
+        using ScRow = std::pair<const char*, std::string>;
+        const std::vector<std::pair<const char*, std::vector<ScRow>>> scCategories = {
+            {"General", {
+                {"Open video",      std::string(kKeys.cmdName) + " + O"},
+                {"Fullscreen",      "F"},
+                {"Show / hide UI",  "H"},
+                {"Toggle timeline", std::string(kKeys.winModName) + " + T"},
+                {"Toggle marks",    std::string(kKeys.winModName) + " + M"},
+                {"Toggle help",     std::string(kKeys.winModName) + " + H  or  ?"},
+                {"Quit",            kKeys.quitShortcut},
+            }},
+            {"Scrub", {
+                {"Play / Pause",        "Space"},
+                {"Seek +/- 1s",         std::string(kKeys.seekFineName) + " + Left / Right"},
+                {"Seek +/- 5s",         "Left / Right"},
+                {"Seek +/- 30s",        "Shift + Left / Right"},
+                {"Frame step",          std::string(kKeys.frameStepName) + " + Left / Right  or  , / ."},
+                {"Jump to start / end", kKeys.jumpName},
+                {"Prev / next chapter", "J / K"},
+                {"Speed up / down",     "+ / -"},
+                {"Precision scrub",     std::string(kKeys.altKeyName) + " + drag timeline"},
+            }},
+            {"Cut", {
+                {"Mark In",              "I  or  ["},
+                {"Mark Out",             "O  or  ]"},
+                {"Mark Frame",           "P"},
+                {"Remove last mark",     kKeys.deleteName},
+                {"Add mark on timeline", std::string(kKeys.cmdName) + " + click (frame) / drag (segment)"},
+                {"Export",               std::string(kKeys.cmdName) + " + E"},
+            }},
+            {"Media", {
+                {"Volume up / down",           "Up / Down"},
+                {"Mute / unmute",              "M"},
+                {"Next / prev audio track",    "A / Shift + A"},
+                {"Next / prev subtitle track", "S / Shift + S"},
+                {"Subtitle delay -/+",         "; / '"},
+            }},
+        };
 
-            auto row = [](const char* action, const char* hotkey) {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn(); ImGui::Text("%s", action);
-                ImGui::TableNextColumn(); ImGui::Text("%s", hotkey);
-            };
+        // Size the action column to the widest action label (+ a margin) across
+        // all categories, so it's snug rather than 50/50 and stays aligned
+        // between the per-category tables. The hotkey column takes the rest.
+        const ImGuiStyle& scStyle = ImGui::GetStyle();
+        float actionColW = 0.0f;
+        for (const auto& cat : scCategories)
+            for (const auto& r : cat.second)
+                actionColW = std::max(actionColW, ImGui::CalcTextSize(r.first).x);
+        actionColW += scStyle.CellPadding.x * 2.0f + scStyle.ItemSpacing.x * 2.0f;
 
-            row("Play / Pause",         "Space");
-            row("Seek +/- 1s",          (std::string(kKeys.seekFineName) + " + Left / Right").c_str());
-            row("Seek +/- 5s",          "Left / Right");
-            row("Seek +/- 30s",         "Shift + Left / Right");
-            row("Frame step",           (std::string(kKeys.frameStepName) + " + Left / Right  or  , / .").c_str());
-            row("Speed up / down",      "+ / -");
-            row("Volume up / down",     "Up / Down");
-            row("Mute / unmute",        "M");
-            row("Next / prev audio track",    "A / Shift + A");
-            row("Next / prev subtitle track", "S / Shift + S");
-            row("Subtitle delay -/+",         "; / '");
-            row("Jump to start / end",  kKeys.jumpName);
-            row("Prev / next chapter",  "J / K");
-            row("Mark In",              "I  or  [");
-            row("Mark Out",             "O  or  ]");
-            row("Mark Frame",           "P");
-            row("Remove last mark",     kKeys.deleteName);
-            row("Export",               (std::string(kKeys.cmdName) + " + E").c_str());
-            row("Toggle timeline",     (std::string(kKeys.winModName) + " + T").c_str());
-            row("Toggle marks",        (std::string(kKeys.winModName) + " + M").c_str());
-            row("Quit",                 kKeys.quitShortcut);
-            row("Precision scrub",      (std::string(kKeys.altKeyName) + " + drag timeline").c_str());
-            row("Add mark on timeline",
-                (std::string(kKeys.cmdName) + " + click (frame) / drag (segment)").c_str());
-            row("Toggle help",         (std::string(kKeys.winModName) + " + H  or  ?").c_str());
-
-            ImGui::EndTable();
+        constexpr ImGuiTableFlags kScFlags =
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
+        for (const auto& cat : scCategories) {
+            if (!ImGui::CollapsingHeader(cat.first, ImGuiTreeNodeFlags_DefaultOpen))
+                continue;
+            std::string tableId = std::string("##sc_") + cat.first;
+            if (ImGui::BeginTable(tableId.c_str(), 2, kScFlags)) {
+                ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, actionColW);
+                ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch);
+                for (const auto& r : cat.second) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(r.first);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(r.second.c_str());
+                }
+                ImGui::EndTable();
+            }
         }
         ImGui::End();
         ImGui::PopStyleVar();
