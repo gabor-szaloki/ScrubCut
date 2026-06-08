@@ -586,32 +586,52 @@ void App::ResetSubtitleState() {
 }
 
 void App::SelectAudioTrack(int streamIndex) {
-    const auto& tracks = m_player.GetAudioTracks();
     m_player.SetAudioTrack(streamIndex);
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        if (tracks[i].streamIndex == streamIndex) {
-            ShowStatus("Audio " + std::to_string(i + 1) + "/" +
-                       std::to_string(tracks.size()) + ": " + tracks[i].title);
-            break;
-        }
-    }
 }
 
 void App::SelectSubtitleTrack(int index) {
     if (index < -1 || index >= static_cast<int>(m_subtitleTracks.size())) return;
     m_activeSubtitle = index;
-    if (index < 0) {
-        m_subtitleExtractor.Reset();
-        ShowStatus("Subtitles: Off");
-        return;
-    }
+    if (index < 0) { m_subtitleExtractor.Reset(); return; }
     const SubtitleTrackInfo& t = m_subtitleTracks[index];
-    ShowStatus("Subtitle " + std::to_string(index + 1) + "/" +
-               std::to_string(m_subtitleTracks.size()) + ": " + t.title +
-               (t.external ? " (file)" : ""));
     if (!t.textBased) { m_subtitleExtractor.Reset(); return; } // bitmap — nothing to render
     if (t.external) m_subtitleExtractor.Start(t.path, -1);
     else            m_subtitleExtractor.Start(m_currentFilePath, t.streamIndex);
+}
+
+void App::FlashAudioTrack() {
+    const auto& tracks = m_player.GetAudioTracks();
+    int active = m_player.GetActiveAudioStreamIndex();
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        if (tracks[i].streamIndex == active) {
+            ShowStatus("Audio " + std::to_string(i + 1) + "/" +
+                       std::to_string(tracks.size()) + ": " + tracks[i].title);
+            return;
+        }
+    }
+}
+
+void App::FlashSubtitleTrack() {
+    if (m_activeSubtitle < 0) { ShowStatus("Subtitles: Off"); return; }
+    const SubtitleTrackInfo& t = m_subtitleTracks[m_activeSubtitle];
+    ShowStatus("Subtitle " + std::to_string(m_activeSubtitle + 1) + "/" +
+               std::to_string(m_subtitleTracks.size()) + ": " + t.title +
+               (t.external ? " (file)" : ""));
+}
+
+void App::FlashSubtitleDelay() {
+    char buf[48];
+    // lround avoids "-0 ms" (a tiny negative or -0.0 printed via %+.0f).
+    snprintf(buf, sizeof(buf), "Subtitle delay: %+ld ms",
+             std::lround(m_subtitleDelaySec * 1000.0));
+    ShowStatus(buf);
+}
+
+std::string App::ChapterLabel(int index) const {
+    const auto& chs = m_player.GetChapters();
+    if (index < 0 || index >= static_cast<int>(chs.size())) return "Chapter";
+    const std::string& t = chs[index].title;
+    return t.empty() ? ("Chapter " + std::to_string(index + 1)) : t;
 }
 
 void App::OpenSubtitleFile(const std::string& path) {
@@ -635,6 +655,7 @@ void App::CycleAudioTrack(int dir) {
     int n = static_cast<int>(tracks.size());
     int next = ((cur + dir) % n + n) % n;
     SelectAudioTrack(tracks[next].streamIndex);
+    FlashAudioTrack();
     BumpUIActivity();
 }
 
@@ -646,22 +667,60 @@ void App::CycleSubtitleTrack(int dir) {
     int cur = m_activeSubtitle + 1; // 0 = off
     int next = ((cur + dir) % states + states) % states;
     SelectSubtitleTrack(next - 1);
+    FlashSubtitleTrack();
     BumpUIActivity();
 }
 
 void App::NudgeSubtitleDelay(double deltaSec) {
     m_subtitleDelaySec += deltaSec;
-    char buf[48];
-    // lround avoids "-0 ms" (a tiny negative or -0.0 printed via %+.0f).
-    snprintf(buf, sizeof(buf), "Subtitle delay: %+ld ms",
-             std::lround(m_subtitleDelaySec * 1000.0));
-    ShowStatus(buf);
     BumpUIActivity();
 }
 
 void App::ShowStatus(const std::string& msg) {
     m_statusMsg = msg;
     m_statusMsgStartNS = SDL_GetTicksNS();
+}
+
+void App::FlashLabeledTime(const std::string& label, double t) {
+    int m  = static_cast<int>(t) / 60;
+    int s  = static_cast<int>(t) % 60;
+    int ms = static_cast<int>(t * 1000) % 1000;
+    char buf[80];
+    // "\xe2\x80\x94" is an em dash (explicit UTF-8 so it's charset-independent).
+    snprintf(buf, sizeof(buf), "%s \xe2\x80\x94 %02d:%02d.%03d", label.c_str(), m, s, ms);
+    ShowStatus(buf);
+}
+
+void App::FlashTime(const std::string& label) {
+    FlashLabeledTime(label, m_player.GetSeekTargetTime());
+}
+
+void App::SeekRelativeWithFlash(double deltaSec) {
+    m_player.SeekRelative(deltaSec);
+    char lbl[24];
+    snprintf(lbl, sizeof(lbl), "%+gs", deltaSec);
+    FlashTime(lbl);
+}
+void App::SeekToWithFlash(double seconds, const std::string& label) {
+    m_player.SeekTo(seconds);
+    FlashTime(label);
+}
+void App::StepFrameWithFlash(int direction) {
+    m_player.StepFrame(direction);
+    FlashTime(direction < 0 ? "-1f" : "+1f");
+}
+
+void App::FlashSpeed() {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Speed: %gx", m_player.GetSpeed());
+    ShowStatus(buf);
+}
+
+void App::FlashVolume() {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Volume: %d%%",
+             static_cast<int>(std::round(m_player.GetVolume() * 100.0f)));
+    ShowStatus(buf);
 }
 
 void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
@@ -758,10 +817,10 @@ void App::RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
     ImFont* font = m_ui.GetSubtitleFont();
     if (!font) return;
 
-    // ~1.2s hold + ~0.5s fade, mirroring the centre play/pause flash.
+    // 0.6s hold + 0.4s fade.
     uint64_t elapsed = SDL_GetTicksNS() - m_statusMsgStartNS;
-    constexpr uint64_t kHoldNS = 1200000000ULL;
-    constexpr uint64_t kFadeNS = 500000000ULL;
+    constexpr uint64_t kHoldNS = 600000000ULL;
+    constexpr uint64_t kFadeNS = 400000000ULL;
     if (elapsed >= kHoldNS + kFadeNS) { m_statusMsgStartNS = 0; return; }
     float alpha = (elapsed <= kHoldNS) ? 1.0f
         : 1.0f - static_cast<float>(elapsed - kHoldNS) / static_cast<float>(kFadeNS);
@@ -888,50 +947,49 @@ void App::ProcessEvents() {
                 TogglePlayPauseWithFlash();
                 break;
             case SDLK_LEFT:
-                if (jump)           m_player.SeekTo(0.0);
-                else if (frameStep) m_player.StepFrame(-1);
-                else if (shift)     m_player.SeekRelative(-30.0);
-                else if (seekFine)  m_player.SeekRelative(-1.0);
-                else                m_player.SeekRelative(-5.0);
+                if (jump)           SeekToWithFlash(0.0, "Jump to start");
+                else if (frameStep) StepFrameWithFlash(-1);
+                else if (shift)     SeekRelativeWithFlash(-30.0);
+                else if (seekFine)  SeekRelativeWithFlash(-1.0);
+                else                SeekRelativeWithFlash(-5.0);
                 break;
             case SDLK_RIGHT:
-                if (jump)           m_player.SeekTo(m_player.GetDuration());
-                else if (frameStep) m_player.StepFrame(+1);
-                else if (shift)     m_player.SeekRelative(30.0);
-                else if (seekFine)  m_player.SeekRelative(1.0);
-                else                m_player.SeekRelative(5.0);
+                if (jump)           SeekToWithFlash(m_player.GetDuration(), "Jump to end");
+                else if (frameStep) StepFrameWithFlash(+1);
+                else if (shift)     SeekRelativeWithFlash(30.0);
+                else if (seekFine)  SeekRelativeWithFlash(1.0);
+                else                SeekRelativeWithFlash(5.0);
                 break;
             case SDLK_COMMA:
                 if (!noMod) break;
-                m_player.StepFrame(-1);
+                StepFrameWithFlash(-1);
                 break;
             case SDLK_PERIOD:
                 if (!noMod) break;
-                m_player.StepFrame(+1);
+                StepFrameWithFlash(+1);
                 break;
             case SDLK_HOME:
                 if (!noMod) break;
-                m_player.SeekTo(0.0);
+                SeekToWithFlash(0.0, "Jump to start");
                 break;
             case SDLK_END:
                 if (!noMod) break;
-                m_player.SeekTo(m_player.GetDuration());
+                SeekToWithFlash(m_player.GetDuration(), "Jump to end");
                 break;
             case SDLK_J: {
                 if (!noMod) break;
                 const auto& chs = m_player.GetChapters();
                 if (chs.empty()) break;
                 double now_t = m_player.GetPlaybackTime();
-                // Largest startSec strictly less than (now - epsilon) so a
-                // second press steps back even when slightly past a boundary.
+                // Nearest chapter whose start is strictly less than (now - eps),
+                // so a second press steps back even when slightly past a boundary.
                 const double eps = 0.25;
-                double target = -1.0;
-                for (const auto& c : chs) {
-                    if (c.startSec < now_t - eps && c.startSec > target)
-                        target = c.startSec;
-                }
-                if (target < 0.0) target = 0.0; // before first chapter → jump to start
-                m_player.SeekTo(target);
+                int idx = -1;
+                for (int i = 0; i < static_cast<int>(chs.size()); i++)
+                    if (chs[i].startSec < now_t - eps && (idx < 0 || chs[i].startSec > chs[idx].startSec))
+                        idx = i;
+                if (idx < 0) SeekToWithFlash(0.0, "Jump to start"); // before first chapter
+                else         SeekToWithFlash(chs[idx].startSec, ChapterLabel(idx));
                 break;
             }
             case SDLK_K: {
@@ -940,12 +998,11 @@ void App::ProcessEvents() {
                 if (chs.empty()) break;
                 double now_t = m_player.GetPlaybackTime();
                 const double eps = 0.05;
-                double target = -1.0;
-                for (const auto& c : chs) {
-                    if (c.startSec > now_t + eps && (target < 0.0 || c.startSec < target))
-                        target = c.startSec;
-                }
-                if (target >= 0.0) m_player.SeekTo(target);
+                int idx = -1;
+                for (int i = 0; i < static_cast<int>(chs.size()); i++)
+                    if (chs[i].startSec > now_t + eps && (idx < 0 || chs[i].startSec < chs[idx].startSec))
+                        idx = i;
+                if (idx >= 0) SeekToWithFlash(chs[idx].startSec, ChapterLabel(idx));
                 break;
             }
             case SDLK_EQUALS: // + key (= without shift, + with shift)
@@ -961,6 +1018,7 @@ void App::ProcessEvents() {
                 else if (spd < 8.0) spd = 8.0;
                 else spd = 8.0;
                 m_player.SetSpeed(spd);
+                FlashSpeed();
                 break;
             }
             case SDLK_MINUS:
@@ -976,6 +1034,7 @@ void App::ProcessEvents() {
                 else if (spd > 0.1) spd = 0.1;
                 else spd = 0.1;
                 m_player.SetSpeed(spd);
+                FlashSpeed();
                 break;
             }
             case SDLK_I:
@@ -990,6 +1049,7 @@ void App::ProcessEvents() {
                     m_segments.SetMarkIn(m_seekTarget);
                     if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
+                    FlashLabeledTime("Mark In", m_seekTarget);
                     BumpUIActivity();
                 }
                 break;
@@ -1011,15 +1071,19 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_player.HasMedia()) {
                     double now_t = m_seekTarget;
+                    bool acted = false;
                     if (m_segments.HasPendingMarkIn()) {
                         int before = m_segments.GetCount();
                         m_segments.SetMarkOut(now_t);
                         if (m_segments.GetCount() > before && !m_showSegments && !m_segmentsClosedManually)
                             m_showSegments = true;
+                        acted = true;
                     } else if (m_segments.GetCount() > 0) {
                         int last = m_segments.GetCount() - 1;
                         m_segments.UpdateSegment(last, m_segments.GetSegments()[last].startSec, now_t);
+                        acted = true;
                     }
+                    if (acted) FlashLabeledTime("Mark Out", now_t);
                     BumpUIActivity();
                 }
                 break;
@@ -1028,6 +1092,7 @@ void App::ProcessEvents() {
                 if (!noMod) break;
                 if (m_segments.GetTotalCount() > 0) {
                     m_segments.RemoveLastMark();
+                    ShowStatus("Mark removed");
                     BumpUIActivity();
                 }
                 break;
@@ -1038,6 +1103,7 @@ void App::ProcessEvents() {
                     m_segments.AddFrame(m_seekTarget);
                     if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
                         m_showSegments = true;
+                    FlashLabeledTime("Mark Frame", m_seekTarget);
                     BumpUIActivity();
                 }
                 break;
@@ -1060,6 +1126,7 @@ void App::ProcessEvents() {
                     BumpUIActivity();
                 } else if (noMod) {
                     m_player.SetMuted(!m_player.IsMuted());
+                    ShowStatus(m_player.IsMuted() ? "Muted" : "Unmuted");
                 }
                 break;
             case SDLK_UP:
@@ -1075,6 +1142,7 @@ void App::ProcessEvents() {
                 // existing behaviour. Down doesn't unmute.
                 if (event.key.key == SDLK_UP && m_player.IsMuted())
                     m_player.SetMuted(false);
+                FlashVolume();
                 break;
             }
             case SDLK_F:
@@ -1125,11 +1193,13 @@ void App::ProcessEvents() {
                 // Subtitle delay −50ms.
                 if (cmd || winMod) break;
                 NudgeSubtitleDelay(-0.05);
+                FlashSubtitleDelay();
                 break;
             case SDLK_APOSTROPHE:
                 // Subtitle delay +50ms.
                 if (cmd || winMod) break;
                 NudgeSubtitleDelay(+0.05);
+                FlashSubtitleDelay();
                 break;
             }
         }
@@ -1569,7 +1639,7 @@ void App::Render() {
                 ImGui::Separator();
                 if (ImGui::MenuItem("Earlier (-50 ms)", ";")) NudgeSubtitleDelay(-0.05);
                 if (ImGui::MenuItem("Later (+50 ms)", "'"))   NudgeSubtitleDelay(+0.05);
-                if (ImGui::MenuItem("Reset")) { m_subtitleDelaySec = 0.0; ShowStatus("Subtitle delay: +0 ms"); }
+                if (ImGui::MenuItem("Reset")) m_subtitleDelaySec = 0.0;
                 ImGui::EndMenu();
             }
             ImGui::EndMenu();

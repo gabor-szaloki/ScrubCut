@@ -89,6 +89,27 @@ private:
     // transport-bar Play button) so the flash fires consistently.
     void TogglePlayPauseWithFlash();
 
+    // Transport helpers that perform a discrete seek/step AND flash the
+    // resulting timecode in the top-right status overlay. Used only by keyboard
+    // shortcuts; the transport-bar buttons and timeline drag-scrub call the
+    // player directly so they don't flash.
+    void SeekRelativeWithFlash(double deltaSec);
+    void SeekToWithFlash(double seconds, const std::string& label);
+    void StepFrameWithFlash(int direction);
+    // Flash "<label> — MM:SS.mmm" in the status overlay (label describes the
+    // action, e.g. "+5s", "-1f", "Jump to end", a chapter name). FlashTime uses
+    // the current seek target; FlashLabeledTime takes an explicit time (used for
+    // marks, which flash the mark's own timecode).
+    void FlashTime(const std::string& label);
+    void FlashLabeledTime(const std::string& label, double timeSec);
+    void FlashSpeed();
+    void FlashVolume();
+    void FlashAudioTrack();
+    void FlashSubtitleTrack();
+    void FlashSubtitleDelay();
+    // Status label for chapter `index`: its title, or "Chapter N" if untitled.
+    std::string ChapterLabel(int index) const;
+
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
