@@ -1493,11 +1493,13 @@ void App::Render() {
                 const ImGuiStyle& st = ImGui::GetStyle();
                 float btn = ImGui::GetFrameHeight();
                 float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
-                float totalW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                float rowW = inputW + st.ItemInnerSpacing.x + resetW;
                 float avail = ImGui::GetContentRegionAvail().x;
-                if (avail > totalW)
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - totalW));
-                ImGui::SetNextItemWidth(totalW);
+                if (avail > rowW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+                ImGui::SetNextItemWidth(inputW);
                 float prevUserUiScale = m_userUiScale;
                 if (ImGui::InputFloat("##uiscale", &m_userUiScale, 0.25f, 0.25f, "%.2fx")) {
                     m_userUiScale = std::clamp(m_userUiScale, 0.5f, 2.0f);
@@ -1517,6 +1519,12 @@ void App::Render() {
                         }
                     }
                 }
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("R##uiscale") && m_userUiScale != 1.0f) {
+                    m_userUiScale = 1.0f;            // reset (a decrease — no window grow)
+                    m_ui.SetUiScale(GetEffectiveUiScale());
+                }
+                TooltipFor("Reset");
             }
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
@@ -1614,8 +1622,8 @@ void App::Render() {
                 }
                 ImGui::EndMenu();
             }
-            // Subtitle size: stepped +/- input mirroring the View ▸ UI Scale
-            // widget. Laid out label-left / input-right.
+            // Subtitle size: stepped +/- input with a Reset button, mirroring
+            // the View ▸ UI Scale widget. Laid out label-left / controls-right.
             {
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted("Subtitle Size");
@@ -1623,24 +1631,42 @@ void App::Render() {
                 const ImGuiStyle& st = ImGui::GetStyle();
                 float btn = ImGui::GetFrameHeight();
                 float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
-                float totalW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                float rowW = inputW + st.ItemInnerSpacing.x + resetW;
                 float avail = ImGui::GetContentRegionAvail().x;
-                if (avail > totalW)
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - totalW));
-                ImGui::SetNextItemWidth(totalW);
+                if (avail > rowW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+                ImGui::SetNextItemWidth(inputW);
                 if (ImGui::InputFloat("##subsize", &m_subtitleScale, 0.1f, 0.25f, "%.2fx"))
                     m_subtitleScale = std::clamp(m_subtitleScale, 0.5f, 3.0f);
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("R##subsize")) m_subtitleScale = 1.0f;
+                TooltipFor("Reset");
             }
-            if (ImGui::BeginMenu("Subtitle Delay")) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "Current: %+ld ms",
-                         std::lround(m_subtitleDelaySec * 1000.0));
-                ImGui::MenuItem(buf, nullptr, false, false);
-                ImGui::Separator();
-                if (ImGui::MenuItem("Earlier (-50 ms)", ";")) NudgeSubtitleDelay(-0.05);
-                if (ImGui::MenuItem("Later (+50 ms)", "'"))   NudgeSubtitleDelay(+0.05);
-                if (ImGui::MenuItem("Reset")) m_subtitleDelaySec = 0.0;
-                ImGui::EndMenu();
+            // Subtitle delay: stepped +/- input (milliseconds) with a Reset
+            // button, same widget style as Subtitle Size above.
+            {
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Subtitle Delay");
+                TooltipFor("Subtitle delay (negative = earlier)", "; / '");
+                ImGui::SameLine();
+                const ImGuiStyle& st = ImGui::GetStyle();
+                float btn = ImGui::GetFrameHeight();
+                float fieldW = ImGui::CalcTextSize("-9999 ms").x + st.FramePadding.x * 2.0f;
+                float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                float rowW = inputW + st.ItemInnerSpacing.x + resetW;
+                float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > rowW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+                ImGui::SetNextItemWidth(inputW);
+                float ms = static_cast<float>(std::lround(m_subtitleDelaySec * 1000.0));
+                if (ImGui::InputFloat("##subdelay", &ms, 50.0f, 50.0f, "%.0f ms"))
+                    m_subtitleDelaySec = ms / 1000.0;
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("R##subdelay")) m_subtitleDelaySec = 0.0;
+                TooltipFor("Reset");
             }
             ImGui::EndMenu();
         }
