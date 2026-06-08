@@ -1710,9 +1710,9 @@ void App::Render() {
 
         // Briefly flash a Play/Pause icon at the center of the video after a
         // toggle — visual confirmation, the kind of thing every mainstream
-        // player does. Skipped when the UI is hidden (immersive mode) so it
-        // doesn't intrude on the clean video view. ~100ms hold + ~400ms fade.
-        if (m_playPauseFlashStartNS > 0 && !m_uiHidden) {
+        // player does. Shown even when the UI is hidden, since it's the only
+        // feedback for the toggle in immersive mode. ~100ms hold + ~400ms fade.
+        if (m_playPauseFlashStartNS > 0) {
             uint64_t elapsed = SDL_GetTicksNS() - m_playPauseFlashStartNS;
             constexpr uint64_t kHoldNS = 100000000ULL;
             constexpr uint64_t kFadeNS = 400000000ULL;
