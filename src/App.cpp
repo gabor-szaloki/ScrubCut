@@ -327,6 +327,7 @@ bool App::Init() {
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
     m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
+    m_flashStatusOverlay = m_prefSettings.GetBool("flash_status_overlay", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
     m_userUiScale = std::clamp(m_prefSettings.GetFloat("ui_scale", 1.0f), 0.5f, 2.0f);
     m_subtitleScale = std::clamp(m_prefSettings.GetFloat("subtitle_scale", 1.0f), 0.5f, 3.0f);
@@ -478,6 +479,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("show_chapters", m_showChapters);
         m_prefSettings.SetBool("show_waveform", m_showWaveform);
         m_prefSettings.SetBool("show_tooltips", m_showTooltips);
+        m_prefSettings.SetBool("flash_status_overlay", m_flashStatusOverlay);
         m_prefSettings.SetBool("use_dpi_scaling", m_useDpiScaling);
         m_prefSettings.SetFloat("ui_scale", m_userUiScale);
         m_prefSettings.SetFloat("subtitle_scale", m_subtitleScale);
@@ -813,6 +815,7 @@ void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
 }
 
 void App::RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
+    if (!m_flashStatusOverlay) return;
     if (m_statusMsgStartNS == 0 || m_statusMsg.empty()) return;
     ImFont* font = m_ui.GetSubtitleFont();
     if (!font) return;
@@ -1443,6 +1446,7 @@ void App::Render() {
             ImGui::Separator();
             if (ImGui::MenuItem("Show Chapters", nullptr, m_showChapters))
                 m_showChapters = !m_showChapters;
+            TooltipFor("Show chapter markers on the timeline.");
             if (ImGui::MenuItem("Show Waveform", nullptr, m_showWaveform)) {
                 m_showWaveform = !m_showWaveform;
                 // Lazily kick off a scan when enabled and there's nothing
@@ -1455,8 +1459,13 @@ void App::Render() {
                     m_waveform.Start(m_currentFilePath, m_player.GetDuration());
                 }
             }
+            TooltipFor("Overlay the audio waveform on the timeline.");
             if (ImGui::MenuItem("Tooltips", nullptr, m_showTooltips))
                 m_showTooltips = !m_showTooltips;
+            TooltipFor("Show these hover tooltips throughout the UI.");
+            if (ImGui::MenuItem("Flash Status Overlay", nullptr, m_flashStatusOverlay))
+                m_flashStatusOverlay = !m_flashStatusOverlay;
+            TooltipFor("Brief on-screen feedback for keyboard actions (seeks, play/pause, volume, etc.).");
 #ifndef __APPLE__
             // Show the display's scale in the hotkey-hint slot, e.g. "125%",
             // so it's visible what the toggle would apply even while disabled.
@@ -1494,7 +1503,7 @@ void App::Render() {
                 float btn = ImGui::GetFrameHeight();
                 float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
                 float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
-                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                float resetW = ImGui::CalcTextSize("1").x + st.FramePadding.x * 2.0f;
                 float rowW = inputW + st.ItemInnerSpacing.x + resetW;
                 float avail = ImGui::GetContentRegionAvail().x;
                 if (avail > rowW)
@@ -1520,11 +1529,10 @@ void App::Render() {
                     }
                 }
                 ImGui::SameLine(0, st.ItemInnerSpacing.x);
-                if (ImGui::Button("R##uiscale") && m_userUiScale != 1.0f) {
+                if (ImGui::Button("1##uiscale") && m_userUiScale != 1.0f) {
                     m_userUiScale = 1.0f;            // reset (a decrease — no window grow)
                     m_ui.SetUiScale(GetEffectiveUiScale());
                 }
-                TooltipFor("Reset");
             }
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
@@ -1632,7 +1640,8 @@ void App::Render() {
                 float btn = ImGui::GetFrameHeight();
                 float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
                 float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
-                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                // Reset button is labelled with its target value (no tooltip needed).
+                float resetW = ImGui::CalcTextSize("1").x + st.FramePadding.x * 2.0f;
                 float rowW = inputW + st.ItemInnerSpacing.x + resetW;
                 float avail = ImGui::GetContentRegionAvail().x;
                 if (avail > rowW)
@@ -1641,8 +1650,7 @@ void App::Render() {
                 if (ImGui::InputFloat("##subsize", &m_subtitleScale, 0.1f, 0.25f, "%.2fx"))
                     m_subtitleScale = std::clamp(m_subtitleScale, 0.5f, 3.0f);
                 ImGui::SameLine(0, st.ItemInnerSpacing.x);
-                if (ImGui::Button("R##subsize")) m_subtitleScale = 1.0f;
-                TooltipFor("Reset");
+                if (ImGui::Button("1##subsize")) m_subtitleScale = 1.0f;
             }
             // Subtitle delay: stepped +/- input (milliseconds) with a Reset
             // button, same widget style as Subtitle Size above.
@@ -1655,7 +1663,7 @@ void App::Render() {
                 float btn = ImGui::GetFrameHeight();
                 float fieldW = ImGui::CalcTextSize("-9999 ms").x + st.FramePadding.x * 2.0f;
                 float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
-                float resetW = ImGui::CalcTextSize("R").x + st.FramePadding.x * 2.0f;
+                float resetW = ImGui::CalcTextSize("0").x + st.FramePadding.x * 2.0f;
                 float rowW = inputW + st.ItemInnerSpacing.x + resetW;
                 float avail = ImGui::GetContentRegionAvail().x;
                 if (avail > rowW)
@@ -1665,8 +1673,7 @@ void App::Render() {
                 if (ImGui::InputFloat("##subdelay", &ms, 50.0f, 50.0f, "%.0f ms"))
                     m_subtitleDelaySec = ms / 1000.0;
                 ImGui::SameLine(0, st.ItemInnerSpacing.x);
-                if (ImGui::Button("R##subdelay")) m_subtitleDelaySec = 0.0;
-                TooltipFor("Reset");
+                if (ImGui::Button("0##subdelay")) m_subtitleDelaySec = 0.0;
             }
             ImGui::EndMenu();
         }
@@ -1737,8 +1744,10 @@ void App::Render() {
         // Briefly flash a Play/Pause icon at the center of the video after a
         // toggle — visual confirmation, the kind of thing every mainstream
         // player does. Shown even when the UI is hidden, since it's the only
-        // feedback for the toggle in immersive mode. ~100ms hold + ~400ms fade.
-        if (m_playPauseFlashStartNS > 0) {
+        // feedback for the toggle in immersive mode. Gated by the same
+        // "Flash Status Overlay" setting as the top-right status flash.
+        // ~100ms hold + ~400ms fade.
+        if (m_playPauseFlashStartNS > 0 && m_flashStatusOverlay) {
             uint64_t elapsed = SDL_GetTicksNS() - m_playPauseFlashStartNS;
             constexpr uint64_t kHoldNS = 100000000ULL;
             constexpr uint64_t kFadeNS = 400000000ULL;

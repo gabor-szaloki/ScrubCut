@@ -156,6 +156,9 @@ private:
     bool m_showChapters = true;
     bool m_showWaveform = false;
     bool m_showTooltips = true;
+    // When on, brief on-screen feedback flashes for keyboard actions: the
+    // centre play/pause icon and the top-right status overlay.
+    bool m_flashStatusOverlay = true;
     bool m_useDpiScaling = true;
     // Explicit user-set UI scale (0.5x–2.0x), applied as a multiplier on top of
     // the automatic DPI scale in GetEffectiveUiScale.
