@@ -587,6 +587,41 @@ void App::ResetSubtitleState() {
     m_subtitleTracks = m_player.GetSubtitleTracks(); // embedded tracks; externals appended later
 }
 
+void App::ResetSettings() {
+    m_showChapters = true;
+    m_showWaveform = false;
+    m_showTooltips = true;
+    m_flashStatusOverlay = true;
+    m_autoHideCursor = true;
+    m_autoHideUI = false;
+    m_subtitleScale = 1.0f;
+    m_useDpiScaling = true;
+    m_userUiScale = 1.0f;
+    m_ui.SetUiScale(GetEffectiveUiScale());
+}
+
+void App::SubtitleSizeControl(const char* idSuffix) {
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("Subtitle Size");
+    ImGui::SameLine();
+    const ImGuiStyle& st = ImGui::GetStyle();
+    float btn = ImGui::GetFrameHeight();
+    float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
+    float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+    float resetW = ImGui::CalcTextSize("1").x + st.FramePadding.x * 2.0f;
+    float rowW = inputW + st.ItemInnerSpacing.x + resetW;
+    float avail = ImGui::GetContentRegionAvail().x;
+    if (avail > rowW)
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+    ImGui::SetNextItemWidth(inputW);
+    std::string inId = std::string("##subsize") + idSuffix;
+    if (ImGui::InputFloat(inId.c_str(), &m_subtitleScale, 0.1f, 0.25f, "%.2fx"))
+        m_subtitleScale = std::clamp(m_subtitleScale, 0.5f, 3.0f);
+    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+    std::string btnId = std::string("1##subsize") + idSuffix;
+    if (ImGui::Button(btnId.c_str())) m_subtitleScale = 1.0f;
+}
+
 void App::SelectAudioTrack(int streamIndex) {
     m_player.SetAudioTrack(streamIndex);
 }
@@ -1534,6 +1569,7 @@ void App::Render() {
                     m_ui.SetUiScale(GetEffectiveUiScale());
                 }
             }
+            SubtitleSizeControl("view");
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
@@ -1567,6 +1603,10 @@ void App::Render() {
                 SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                 std::filesystem::remove(GetAppDataDir() / "layout.ini");
             }
+            TooltipFor("Reset the window size and panel layout to defaults.");
+            if (ImGui::MenuItem("Reset Settings"))
+                ResetSettings();
+            TooltipFor("Restore the View settings to defaults.");
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Media", m_player.HasMedia())) {
@@ -1630,28 +1670,7 @@ void App::Render() {
                 }
                 ImGui::EndMenu();
             }
-            // Subtitle size: stepped +/- input with a Reset button, mirroring
-            // the View ▸ UI Scale widget. Laid out label-left / controls-right.
-            {
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextUnformatted("Subtitle Size");
-                ImGui::SameLine();
-                const ImGuiStyle& st = ImGui::GetStyle();
-                float btn = ImGui::GetFrameHeight();
-                float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
-                float inputW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
-                // Reset button is labelled with its target value (no tooltip needed).
-                float resetW = ImGui::CalcTextSize("1").x + st.FramePadding.x * 2.0f;
-                float rowW = inputW + st.ItemInnerSpacing.x + resetW;
-                float avail = ImGui::GetContentRegionAvail().x;
-                if (avail > rowW)
-                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
-                ImGui::SetNextItemWidth(inputW);
-                if (ImGui::InputFloat("##subsize", &m_subtitleScale, 0.1f, 0.25f, "%.2fx"))
-                    m_subtitleScale = std::clamp(m_subtitleScale, 0.5f, 3.0f);
-                ImGui::SameLine(0, st.ItemInnerSpacing.x);
-                if (ImGui::Button("1##subsize")) m_subtitleScale = 1.0f;
-            }
+            SubtitleSizeControl("media");
             // Subtitle delay: stepped +/- input (milliseconds) with a Reset
             // button, same widget style as Subtitle Size above.
             {

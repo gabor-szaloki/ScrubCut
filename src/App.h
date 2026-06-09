@@ -110,6 +110,15 @@ private:
     // Status label for chapter `index`: its title, or "Chapter N" if untitled.
     std::string ChapterLabel(int index) const;
 
+    // Restore the View/display preferences to their defaults. Does not touch
+    // window layout (see UIManager::ResetLayout), recent files, or playback
+    // state (and subtitle delay, which isn't persisted).
+    void ResetSettings();
+
+    // Inline "Subtitle Size" stepper + reset widget. Shared by the Media and
+    // View menus; idSuffix keeps the ImGui IDs distinct between the two.
+    void SubtitleSizeControl(const char* idSuffix);
+
     void CreateVideoTexture(int width, int height);
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
