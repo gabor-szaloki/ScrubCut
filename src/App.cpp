@@ -1434,7 +1434,7 @@ void App::Render() {
             if (ImGui::MenuItem("Fullscreen", "F", m_fullscreen)) {
                 SetFullscreen(!m_fullscreen);
             }
-            ImGui::Separator();
+            ImGui::SeparatorText("Windows");
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.winModName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
             if (ImGui::MenuItem("Marks", (std::string(kKeys.winModName) + "+M").c_str(), m_showSegments)) {
@@ -1443,7 +1443,7 @@ void App::Render() {
             }
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str(), m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
-            ImGui::Separator();
+            ImGui::SeparatorText("Settings");
             if (ImGui::MenuItem("Show Chapters", nullptr, m_showChapters))
                 m_showChapters = !m_showChapters;
             TooltipFor("Show chapter markers on the timeline.");
@@ -1542,7 +1542,7 @@ void App::Render() {
                 m_uiHidden = !m_uiHidden;
                 m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
             }
-            ImGui::Separator();
+            ImGui::SeparatorText("Reset");
             if (ImGui::MenuItem("Reset Layout")) {
                 // Clear "re-maximize on fullscreen exit" so the upcoming
                 // SetFullscreen(false) doesn't undo our un-maximize below.
