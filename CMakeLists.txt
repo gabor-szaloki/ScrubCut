@@ -60,6 +60,20 @@ add_custom_target(generate_version
 )
 add_dependencies(ScrubCut generate_version)
 
+# --- Generated shader header (GLSL sources embedded as raw string literals) ---
+set(_SHADER_DIR "${CMAKE_SOURCE_DIR}/src/ui/shaders")
+set(_SHADER_HEADER "${_GENERATED_DIR}/scrubcut_shaders.h")
+add_custom_target(embed_shaders
+    COMMAND ${CMAKE_COMMAND}
+        -DSHADER_DIR=${_SHADER_DIR}
+        -DOUTPUT_FILE=${_SHADER_HEADER}
+        -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
+    BYPRODUCTS ${_SHADER_HEADER}
+    SOURCES ${_SHADER_DIR}/tonemap.vert.glsl ${_SHADER_DIR}/tonemap.frag.glsl
+    VERBATIM
+)
+add_dependencies(ScrubCut embed_shaders)
+
 target_include_directories(ScrubCut PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party

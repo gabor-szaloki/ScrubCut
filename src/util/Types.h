@@ -6,6 +6,37 @@
 
 enum class ExportMode { SourceFormat, GIF };
 
+// Color characteristics of the decoded video, derived from the transfer
+// function. SDR frames go straight to an 8-bit sRGB texture; HDR frames are
+// kept in 10-bit BT.2020 and tone-mapped to SDR on the GPU at draw time.
+enum class VideoColorMode { SDR, HDR_PQ, HDR_HLG };
+
+// Source color primaries (gamut), used to pick the gamut->BT.709 conversion in
+// the tone-map shader. Only the primaries the shader can convert from are
+// distinguished; anything else (including unspecified) defaults to BT.2020, the
+// near-universal HDR gamut. Integer values are passed to the shader's
+// uPrimaries, so keep them in sync with the uPrimaries branch in
+// src/ui/shaders/tonemap.frag.glsl.
+enum class VideoColorPrimaries { BT709 = 0, BT2020 = 1, DisplayP3 = 2 };
+
+// HDR->SDR tone-mapping operator, selectable from View > HDR. The order here is
+// also the menu order. The integer values are passed straight to the
+// tone-mapping shader, so keep them in sync with the uTonemapper branch in
+// src/ui/shaders/tonemap.frag.glsl.
+enum class Tonemapper { None = 0, Reinhard = 1, Uncharted2 = 2, ACES = 3, AgX = 4 };
+inline constexpr int kTonemapperCount = 5;
+
+inline const char* TonemapperName(Tonemapper t) {
+    switch (t) {
+        case Tonemapper::None:       return "No Tonemapping";
+        case Tonemapper::Reinhard:   return "Reinhard";
+        case Tonemapper::Uncharted2: return "Uncharted 2 (VLC)";
+        case Tonemapper::ACES:       return "ACES Filmic";
+        case Tonemapper::AgX:        return "AgX";
+    }
+    return "?";
+}
+
 struct TimeRange {
     double startSec = 0.0;
     double endSec = 0.0;

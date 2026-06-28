@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ui/UIManager.h"
+#include "ui/VideoTonemap.h"
 #include "core/Player.h"
 #include "core/SegmentManager.h"
 #include "core/WaveformExtractor.h"
@@ -106,6 +107,9 @@ private:
     void FlashVolume();
     void FlashAudioTrack();
     void FlashSubtitleTrack();
+    // Cycle the HDR->SDR tone-mapping operator by +1/-1 and flash its name.
+    void CycleTonemapper(int dir);
+    void FlashTonemapper();
     void FlashSubtitleDelay();
     // Status label for chapter `index`: its title, or "Chapter N" if untitled.
     std::string ChapterLabel(int index) const;
@@ -242,9 +246,18 @@ private:
     std::string m_currentFilePath;
 
     // Display
-    GLuint m_videoTexture = 0;
+    GLuint m_videoTexture = 0;       // source frame (RGBA8 for SDR, RGB10_A2 for HDR)
+    GLuint m_displayTexture = 0;     // texture ImGui composites: == m_videoTexture for
+                                     // SDR, the tone-mapper's SDR output for HDR
     int m_videoWidth = 0;
     int m_videoHeight = 0;
+    VideoColorMode m_videoColorMode = VideoColorMode::SDR;
+    VideoTonemap m_tonemap;          // GPU HDR->SDR pass (HDR videos only)
+    // Selected HDR->SDR tone-mapping operator (View > HDR, persisted in prefs).
+    Tonemapper m_tonemapper = Tonemapper::Uncharted2;
+    // Operator last applied to m_displayTexture, so a change while paused (no new
+    // frame arriving) still triggers a re-tonemap of the held frame.
+    Tonemapper m_lastProcessedTonemapper = Tonemapper::Uncharted2;
 
     // Segment hover state (shared between timeline bar and segments panel)
     int m_hoveredSegment = -1;       // last frame's value, used for rendering

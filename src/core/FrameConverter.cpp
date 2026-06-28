@@ -1,6 +1,24 @@
 #include "core/FrameConverter.h"
 #include "util/Log.h"
 
+VideoColorMode FrameConverter::ColorModeForTransfer(int colorTrc) {
+    switch (colorTrc) {
+        case AVCOL_TRC_SMPTE2084:    return VideoColorMode::HDR_PQ;   // HDR10 / PQ
+        case AVCOL_TRC_ARIB_STD_B67: return VideoColorMode::HDR_HLG;  // HLG
+        default:                     return VideoColorMode::SDR;
+    }
+}
+
+VideoColorPrimaries FrameConverter::PrimariesForTag(int colorPrimaries) {
+    switch (colorPrimaries) {
+        case AVCOL_PRI_BT709:    return VideoColorPrimaries::BT709;
+        case AVCOL_PRI_SMPTE431: // DCI-P3 (approximated as P3-D65 below)
+        case AVCOL_PRI_SMPTE432: return VideoColorPrimaries::DisplayP3; // P3-D65
+        case AVCOL_PRI_BT2020:
+        default:                 return VideoColorPrimaries::BT2020;
+    }
+}
+
 FrameConverter::~FrameConverter() {
     if (m_swsCtx)
         sws_freeContext(m_swsCtx);
@@ -11,13 +29,15 @@ const uint8_t* FrameConverter::Convert(AVFrame* frame) {
     if (!frame)
         return nullptr;
 
-    EnsureContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format));
+    EnsureContext(frame);
 
     if (!m_swsCtx)
         return nullptr;
 
+    // Both the SDR (RGBA) and HDR (X2BGR10LE) destination formats are 4 bytes
+    // per pixel, so the destination stride is the same either way.
     uint8_t* dstData[1] = { m_buffer };
-    int dstLinesize[1] = { m_width * 4 }; // RGBA = 4 bytes per pixel
+    int dstLinesize[1] = { m_width * 4 };
 
     sws_scale(m_swsCtx,
               frame->data, frame->linesize,
@@ -27,8 +47,14 @@ const uint8_t* FrameConverter::Convert(AVFrame* frame) {
     return m_buffer;
 }
 
-void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) {
-    if (m_swsCtx && m_width == width && m_height == height && m_srcFmt == srcFmt)
+void FrameConverter::EnsureContext(AVFrame* frame) {
+    const int width = frame->width;
+    const int height = frame->height;
+    const AVPixelFormat srcFmt = static_cast<AVPixelFormat>(frame->format);
+    const int trc = frame->color_trc;
+
+    if (m_swsCtx && m_width == width && m_height == height &&
+        m_srcFmt == srcFmt && m_srcTrc == trc)
         return;
 
     if (m_swsCtx) {
@@ -39,6 +65,8 @@ void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) 
     m_width = width;
     m_height = height;
     m_srcFmt = srcFmt;
+    m_srcTrc = trc;
+    m_colorMode = ColorModeForTransfer(trc);
 
     // Normalize deprecated JPEG-range formats to their standard equivalents.
     // The actual range is communicated via sws_setColorspaceDetails below.
@@ -51,9 +79,16 @@ void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) 
         default: break;
     }
 
+    // HDR (PQ/HLG) is kept in 10-bit BT.2020 and tone-mapped on the GPU. SDR
+    // collapses straight to 8-bit sRGB as before. X2BGR10LE packs as
+    // (msb)2X 10B 10G 10R(lsb), which matches GL_RGB10_A2 + RGBA +
+    // GL_UNSIGNED_INT_2_10_10_10_REV (R in the low 10 bits) on little-endian.
+    const bool hdr = (m_colorMode != VideoColorMode::SDR);
+    m_dstFmt = hdr ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_RGBA;
+
     m_swsCtx = sws_getContext(
         width, height, normalizedFmt,
-        width, height, AV_PIX_FMT_RGBA,
+        width, height, m_dstFmt,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
 
@@ -62,16 +97,28 @@ void FrameConverter::EnsureContext(int width, int height, AVPixelFormat srcFmt) 
         return;
     }
 
-    // Set correct color range so sws_scale uses the right conversion matrix
-    if (fullRange) {
-        int srcRange = 1;  // full range
+    if (hdr) {
+        // Apply the BT.2020 YUV->RGB matrix coefficients (the standard for HDR
+        // content) with the correct input range so the 10-bit R'G'B' is
+        // reconstructed faithfully. The transfer function (PQ/HLG) and the source
+        // primaries (BT.2020 or P3) are deliberately preserved — the GPU
+        // tone-mapper decodes them. dstRange is full (RGB is always full range).
+        int srcRange = (frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+        const int* inv_table = sws_getCoefficients(SWS_CS_BT2020);
+        const int* table = sws_getCoefficients(SWS_CS_BT2020);
+        sws_setColorspaceDetails(m_swsCtx, inv_table, srcRange, table, 1,
+                                 0, 1 << 16, 1 << 16);
+    } else if (fullRange) {
+        // SDR JPEG-range input: keep the default (BT.601/709) coefficients but
+        // flag the input as full range so the conversion matrix is correct.
+        int srcRange = 1;
         int dstRange = 1;
         const int* inv_table = sws_getCoefficients(SWS_CS_DEFAULT);
         const int* table = sws_getCoefficients(SWS_CS_DEFAULT);
         sws_setColorspaceDetails(m_swsCtx, inv_table, srcRange, table, dstRange, 0, 1 << 16, 1 << 16);
     }
 
-    int needed = av_image_get_buffer_size(AV_PIX_FMT_RGBA, width, height, 1);
+    int needed = av_image_get_buffer_size(m_dstFmt, width, height, 1);
     if (needed > m_bufferSize) {
         FreeBuffer();
         m_bufferSize = needed;

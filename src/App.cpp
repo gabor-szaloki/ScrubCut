@@ -299,6 +299,11 @@ bool App::Init() {
     SDL_GL_MakeCurrent(m_window, m_glContext);
     SDL_GL_SetSwapInterval(1);
 
+    // GPU HDR->SDR tone-mapper. Non-fatal if it fails to init — SDR playback is
+    // unaffected; only HDR videos would then display incorrectly.
+    if (!m_tonemap.Init())
+        LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
+
     // Delete layout files before ImGui loads them
     bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
     if (resetLayout) {
@@ -337,6 +342,9 @@ bool App::Init() {
     m_player.SetMuted(m_prefSettings.GetBool("muted", false));
     m_exportDirMode = static_cast<ExportDirMode>(
         std::clamp(m_prefSettings.GetInt("export_dir_mode", 0), 0, 1));
+    m_tonemapper = static_cast<Tonemapper>(std::clamp(
+        m_prefSettings.GetInt("tonemapper", static_cast<int>(Tonemapper::Uncharted2)),
+        0, kTonemapperCount - 1));
     {
         std::string customDir = m_prefSettings.GetString("export_custom_dir", "");
         snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", customDir.c_str());
@@ -429,12 +437,38 @@ void App::Run() {
             const uint8_t* rgba = nullptr;
             int w = 0, h = 0;
             if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
-                if (w != m_videoWidth || h != m_videoHeight) {
+                VideoColorMode mode = m_player.GetVideoColorMode();
+                if (w != m_videoWidth || h != m_videoHeight || mode != m_videoColorMode) {
                     m_videoWidth = w;
                     m_videoHeight = h;
+                    m_videoColorMode = mode;
                     CreateVideoTexture(w, h);
                 }
                 UploadFrame(rgba, w, h);
+                // HDR frames carry their PQ/HLG transfer in a 10-bit texture;
+                // tone-map them to an SDR texture before ImGui composites them.
+                if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady()) {
+                    m_displayTexture = m_tonemap.Process(m_videoTexture, w, h,
+                                                         m_videoColorMode,
+                                                         m_player.GetVideoColorPrimaries(),
+                                                         m_tonemapper);
+                    m_lastProcessedTonemapper = m_tonemapper;
+                } else {
+                    m_displayTexture = m_videoTexture;
+                }
+            }
+        };
+
+        // Re-run the HDR tone-map on the held frame when the operator changes
+        // while paused — no new frame arrives then, so fetchFrame() won't.
+        auto refreshTonemap = [&]() {
+            if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady() &&
+                m_videoTexture && m_tonemapper != m_lastProcessedTonemapper) {
+                m_displayTexture = m_tonemap.Process(m_videoTexture, m_videoWidth,
+                                                     m_videoHeight, m_videoColorMode,
+                                                     m_player.GetVideoColorPrimaries(),
+                                                     m_tonemapper);
+                m_lastProcessedTonemapper = m_tonemapper;
             }
         };
 
@@ -442,11 +476,14 @@ void App::Run() {
             TRACE_EVENT("TryGetVideoFrame");
             fetchFrame();
         }
+        refreshTonemap();
 
         Render();
 
         // Pick up frames from seeks triggered during Render (timeline/slider drags)
         fetchFrame();
+        // Apply a tone-mapper change made via the View > HDR menu this frame.
+        refreshTonemap();
     }
 }
 
@@ -489,6 +526,7 @@ void App::Shutdown() {
         m_prefSettings.SetBool("muted", m_player.IsMuted());
         m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
         m_prefSettings.SetString("export_custom_dir", m_exportCustomDir);
+        m_prefSettings.SetInt("tonemapper", static_cast<int>(m_tonemapper));
         SaveRecentFiles();
         m_prefSettings.Save();
     }
@@ -498,6 +536,8 @@ void App::Shutdown() {
         glDeleteTextures(1, &m_videoTexture);
         m_videoTexture = 0;
     }
+    m_displayTexture = 0;
+    m_tonemap.Shutdown();
 
     m_ui.Shutdown();
 
@@ -532,6 +572,7 @@ void App::OpenFile(const std::string& path) {
         glDeleteTextures(1, &m_videoTexture);
         m_videoTexture = 0;
     }
+    m_displayTexture = 0;
     m_videoWidth = 0;
     m_videoHeight = 0;
 
@@ -557,6 +598,7 @@ void App::OpenFile(const std::string& path) {
 
     m_videoWidth = m_player.GetVideoWidth();
     m_videoHeight = m_player.GetVideoHeight();
+    m_videoColorMode = m_player.GetVideoColorMode();
     CreateVideoTexture(m_videoWidth, m_videoHeight);
 
     std::string title = "ScrubCut - " + path;
@@ -597,6 +639,7 @@ void App::ResetSettings() {
     m_subtitleScale = 1.0f;
     m_useDpiScaling = true;
     m_userUiScale = 1.0f;
+    m_tonemapper = Tonemapper::Uncharted2;
     m_ui.SetUiScale(GetEffectiveUiScale());
 }
 
@@ -706,6 +749,18 @@ void App::CycleSubtitleTrack(int dir) {
     SelectSubtitleTrack(next - 1);
     FlashSubtitleTrack();
     BumpUIActivity();
+}
+
+void App::CycleTonemapper(int dir) {
+    int n = kTonemapperCount;
+    int next = ((static_cast<int>(m_tonemapper) + dir) % n + n) % n;
+    m_tonemapper = static_cast<Tonemapper>(next);
+    FlashTonemapper();
+    BumpUIActivity();
+}
+
+void App::FlashTonemapper() {
+    ShowStatus(std::string("Tonemapper: ") + TonemapperName(m_tonemapper));
 }
 
 void App::NudgeSubtitleDelay(double deltaSec) {
@@ -1155,6 +1210,9 @@ void App::ProcessEvents() {
                 if (winMod) {
                     m_showTimeline = !m_showTimeline;
                     BumpUIActivity();
+                } else if (!cmd) {
+                    // Plain T: cycle HDR->SDR tone-mapping operator (Shift = previous).
+                    CycleTonemapper(shift ? -1 : +1);
                 }
                 break;
             case SDLK_M:
@@ -1469,6 +1527,31 @@ void App::Render() {
             if (ImGui::MenuItem("Fullscreen", "F", m_fullscreen)) {
                 SetFullscreen(!m_fullscreen);
             }
+            if (ImGui::BeginMenu("HDR")) {
+                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 20.0f);
+                ImGui::TextDisabled(
+                    "ScrubCut doesn't support HDR displays yet. Select below what "
+                    "tonemapper should be used to convert HDR content to SDR");
+                ImGui::PopTextWrapPos();
+                ImGui::Separator();
+                // Hints mark the operator that T / Shift+T would switch to (next/prev).
+                int cur = static_cast<int>(m_tonemapper);
+                int nextTm = (cur + 1) % kTonemapperCount;
+                int prevTm = (cur - 1 + kTonemapperCount) % kTonemapperCount;
+                auto tmHint = [&](int idx) -> const char* {
+                    if (nextTm == idx && prevTm == idx) return "T / Shift+T";
+                    if (nextTm == idx) return "T";
+                    if (prevTm == idx) return "Shift+T";
+                    return nullptr;
+                };
+                for (int i = 0; i < kTonemapperCount; ++i) {
+                    Tonemapper t = static_cast<Tonemapper>(i);
+                    if (ImGui::MenuItem(TonemapperName(t), tmHint(i), m_tonemapper == t))
+                        m_tonemapper = t;
+                }
+                ImGui::EndMenu();
+            }
+            TooltipFor("Tone-mapping operator used to display HDR videos on this SDR screen.");
             ImGui::SeparatorText("Windows");
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.winModName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
@@ -1745,7 +1828,8 @@ void App::Render() {
             cursor.x + (avail.x - displayW) * 0.5f,
             cursor.y + (avail.y - displayH) * 0.5f
         ));
-        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(m_videoTexture)),
+        GLuint tex = m_displayTexture ? m_displayTexture : m_videoTexture;
+        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(tex)),
                       ImVec2(displayW, displayH));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
@@ -2499,10 +2583,12 @@ void App::Render() {
         else
             brateBuf[0] = '\0';
 
-        char infoRight[128];
-        snprintf(infoRight, sizeof(infoRight), "%dx%d  |  %.1f fps  |  %s  |  %s  |  %s",
+        const std::string& colorLabel = m_player.GetColorSpaceLabel();
+        char infoRight[160];
+        snprintf(infoRight, sizeof(infoRight), "%dx%d  |  %.1f fps  |  %s  |  %s  |  %s  |  %s",
                  m_videoWidth, m_videoHeight, m_player.GetFrameRate(),
-                 m_player.GetVideoCodecName(), brateBuf, sizeBuf);
+                 m_player.GetVideoCodecName(),
+                 colorLabel.empty() ? "?" : colorLabel.c_str(), brateBuf, sizeBuf);
         float infoRightWidth = ImGui::CalcTextSize(infoRight).x;
         ImGui::SameLine(panelWidth - infoRightWidth);
         ImGui::Text("%s", infoRight);
@@ -3458,20 +3544,29 @@ void App::CreateVideoTexture(int width, int height) {
         m_videoTexture = 0;
     }
 
+    // HDR frames are 10-bit packed BT.2020 (still PQ/HLG-encoded) and get
+    // tone-mapped on the GPU; SDR frames are ready-to-display 8-bit sRGB.
+    const bool hdr = (m_videoColorMode != VideoColorMode::SDR);
+    const GLint internalFormat = hdr ? GL_RGB10_A2 : GL_RGBA8;
+
     glGenTextures(1, &m_videoTexture);
     glBindTexture(GL_TEXTURE_2D, m_videoTexture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 void App::UploadFrame(const uint8_t* rgba, int width, int height) {
     if (!m_videoTexture) return;
+    // FrameConverter packs HDR as AV_PIX_FMT_X2BGR10LE, which matches RGBA +
+    // GL_UNSIGNED_INT_2_10_10_10_REV; SDR is plain RGBA8.
+    const bool hdr = (m_videoColorMode != VideoColorMode::SDR);
+    const GLenum type = hdr ? GL_UNSIGNED_INT_2_10_10_10_REV : GL_UNSIGNED_BYTE;
     glBindTexture(GL_TEXTURE_2D, m_videoTexture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, type, rgba);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 

@@ -14,6 +14,52 @@ static void SetCurrentThreadName(const wchar_t* name) {
 static void SetCurrentThreadName(const wchar_t*) {}
 #endif
 
+namespace {
+
+// Human-readable color-primaries (gamut) name for the timeline label. Never
+// empty: unspecified/unrecognized values map to "Unknown" so the label always
+// carries gamut information instead of silently dropping it.
+const char* PrimariesLabel(int pri) {
+    switch (pri) {
+        case AVCOL_PRI_BT2020:    return "BT.2020";
+        case AVCOL_PRI_BT709:     return "BT.709";
+        case AVCOL_PRI_BT470BG:   // PAL / 625-line
+        case AVCOL_PRI_SMPTE170M: // NTSC / 525-line
+        case AVCOL_PRI_SMPTE240M: return "BT.601";
+        case AVCOL_PRI_SMPTE432:  return "Display P3"; // P3-D65
+        case AVCOL_PRI_SMPTE431:  return "DCI-P3";      // P3-DCI
+        case AVCOL_PRI_BT470M:    return "BT.470M";
+        case AVCOL_PRI_FILM:      return "Film";
+        default:                  return "Unknown";
+    }
+}
+
+// Human-readable transfer (EOTF/OETF) name, or "" when unspecified/unrecognized
+// (the label omits the transfer in that case).
+const char* TransferLabel(int trc) {
+    switch (trc) {
+        case AVCOL_TRC_SMPTE2084:    return "PQ";
+        case AVCOL_TRC_ARIB_STD_B67: return "HLG";
+        case AVCOL_TRC_BT709:        return "BT.709";
+        case AVCOL_TRC_IEC61966_2_1: return "sRGB";
+        case AVCOL_TRC_LINEAR:       return "Linear";
+        case AVCOL_TRC_GAMMA22:      return "gamma 2.2";
+        case AVCOL_TRC_GAMMA28:      return "gamma 2.8";
+        case AVCOL_TRC_SMPTE170M:    return "BT.601";
+        case AVCOL_TRC_SMPTE240M:    return "SMPTE 240M";
+        case AVCOL_TRC_BT2020_10:
+        case AVCOL_TRC_BT2020_12:    return "BT.2020";
+        case AVCOL_TRC_SMPTE428:     return "SMPTE 428";
+        case AVCOL_TRC_LOG:          return "Log";
+        case AVCOL_TRC_LOG_SQRT:     return "Log sqrt";
+        case AVCOL_TRC_BT1361_ECG:   return "BT.1361";
+        case AVCOL_TRC_IEC61966_2_4: return "xvYCC";
+        default:                     return "";
+    }
+}
+
+} // namespace
+
 Player::Player() = default;
 
 Player::~Player() {
@@ -28,6 +74,27 @@ bool Player::Open(const std::string& path) {
 
     if (!m_videoDecoder.Open(m_demuxer.GetVideoCodecParams()))
         return false;
+
+    // Determine HDR vs SDR from the stream's transfer characteristic so the
+    // renderer can pick the right texture format before the first frame lands.
+    if (AVCodecParameters* vpar = m_demuxer.GetVideoCodecParams()) {
+        m_videoColorMode = FrameConverter::ColorModeForTransfer(vpar->color_trc);
+        m_videoColorPrimaries = FrameConverter::PrimariesForTag(vpar->color_primaries);
+
+        // Build the timeline colorspace label: "<primaries>[ <transfer>] (<tag>)".
+        // Primaries are always present (Unknown if unspecified). The transfer is
+        // appended when known and not already named by the primaries, so e.g.
+        // BT.709 primaries + BT.709 transfer reads "BT.709 (SDR)" rather than
+        // doubling up, while BT.709 + sRGB stays "BT.709 sRGB (SDR)".
+        const char* prim = PrimariesLabel(vpar->color_primaries);
+        const char* trc = TransferLabel(vpar->color_trc);
+        std::string label = prim;
+        if (trc[0] != '\0' && label != trc)
+            label += std::string(" ") + trc;
+        const bool hdr = (m_videoColorMode != VideoColorMode::SDR);
+        label += hdr ? " (HDR)" : " (SDR)";
+        m_videoColorSpaceLabel = std::move(label);
+    }
 
     m_chapters.clear();
     m_audioTracks.clear();
@@ -188,6 +255,9 @@ void Player::Close() {
 
     m_hasMedia = false;
     m_hasAudio = false;
+    m_videoColorMode = VideoColorMode::SDR;
+    m_videoColorPrimaries = VideoColorPrimaries::BT2020;
+    m_videoColorSpaceLabel.clear();
     m_playing = false;
     m_eof = false;
     m_lastDisplayedPts = AV_NOPTS_VALUE;

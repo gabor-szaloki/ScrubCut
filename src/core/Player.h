@@ -66,6 +66,15 @@ public:
     double GetFrameDuration() const;
     int GetVideoWidth() const { return m_videoDecoder.GetWidth(); }
     int GetVideoHeight() const { return m_videoDecoder.GetHeight(); }
+    // Color mode of the open video (SDR / HDR PQ / HDR HLG), derived from the
+    // stream's transfer characteristic at Open(). Drives texture format + GPU
+    // tone-mapping in App.
+    VideoColorMode GetVideoColorMode() const { return m_videoColorMode; }
+    // Source gamut, for the tone-map shader's gamut->BT.709 conversion.
+    VideoColorPrimaries GetVideoColorPrimaries() const { return m_videoColorPrimaries; }
+    // Short human-readable colorspace label for the timeline, e.g.
+    // "BT.2020 PQ (HDR)" or "BT.709 (SDR)". Empty when no media is open.
+    const std::string& GetColorSpaceLabel() const { return m_videoColorSpaceLabel; }
     const char* GetVideoCodecName() const;
     int64_t GetBitRate() const;
     int64_t GetFileSize() const;
@@ -213,6 +222,9 @@ private:
     std::atomic<bool> m_eof{false};
     bool m_hasMedia = false;
     bool m_hasAudio = false;
+    VideoColorMode m_videoColorMode = VideoColorMode::SDR;
+    VideoColorPrimaries m_videoColorPrimaries = VideoColorPrimaries::BT2020;
+    std::string m_videoColorSpaceLabel;
 
     int64_t m_lastDisplayedPts = AV_NOPTS_VALUE;
 
