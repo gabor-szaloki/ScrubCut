@@ -141,22 +141,8 @@ bool VideoTonemap::EnsureTarget(int width, int height) {
     return true;
 }
 
-GLuint VideoTonemap::Process(GLuint srcTex, int width, int height, VideoColorMode mode,
-                             VideoColorPrimaries primaries, Tonemapper tonemapper) {
-    if (!m_ready || width <= 0 || height <= 0)
-        return 0;
-    if (!EnsureTarget(width, height))
-        return 0;
-
-    // Save the state we touch so the subsequent ImGui pass is undisturbed.
-    GLint prevFbo = 0;
-    GLint prevViewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    GLboolean blend = glIsEnabled(GL_BLEND);
-    GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-
+void VideoTonemap::RenderPass(GLuint srcTex, int width, int height, VideoColorMode mode,
+                              VideoColorPrimaries primaries, Tonemapper tonemapper) {
     m_glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
     glViewport(0, 0, width, height);
     glDisable(GL_BLEND);
@@ -174,9 +160,28 @@ GLuint VideoTonemap::Process(GLuint srcTex, int width, int height, VideoColorMod
 
     m_glBindVertexArray(m_vao);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    m_glBindVertexArray(0);
+}
+
+GLuint VideoTonemap::Process(GLuint srcTex, int width, int height, VideoColorMode mode,
+                             VideoColorPrimaries primaries, Tonemapper tonemapper) {
+    if (!m_ready || width <= 0 || height <= 0)
+        return 0;
+    if (!EnsureTarget(width, height))
+        return 0;
+
+    // Save the state we touch so the subsequent ImGui pass is undisturbed.
+    GLint prevFbo = 0;
+    GLint prevViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    GLboolean blend = glIsEnabled(GL_BLEND);
+    GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+
+    RenderPass(srcTex, width, height, mode, primaries, tonemapper);
 
     // Restore state.
-    m_glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_2D, 0);
     m_glUseProgram(0);
     m_glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
@@ -188,11 +193,65 @@ GLuint VideoTonemap::Process(GLuint srcTex, int width, int height, VideoColorMod
     return m_outTex;
 }
 
+bool VideoTonemap::RenderToBuffer(const uint8_t* src, int width, int height, VideoColorMode mode,
+                                  VideoColorPrimaries primaries, Tonemapper tonemapper,
+                                  std::vector<uint8_t>& outRGBA) {
+    if (!m_ready || !src || width <= 0 || height <= 0)
+        return false;
+    if (!EnsureTarget(width, height))
+        return false;
+
+    // Upload the packed 10-bit source into a GL_RGB10_A2 texture — same format
+    // the display path uses for HDR frames (X2BGR10LE == RGBA + REV_2_10_10_10).
+    if (!m_inTex)
+        glGenTextures(1, &m_inTex);
+    glBindTexture(GL_TEXTURE_2D, m_inTex);
+    if (m_inW != width || m_inH != height) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB10_A2, width, height, 0, GL_RGBA,
+                     GL_UNSIGNED_INT_2_10_10_10_REV, src);
+        m_inW = width;
+        m_inH = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
+                        GL_UNSIGNED_INT_2_10_10_10_REV, src);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    GLint prevFbo = 0;
+    GLint prevViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+
+    RenderPass(m_inTex, width, height, mode, primaries, tonemapper);
+
+    // Read the SDR result back while the FBO is still bound. The fullscreen
+    // triangle maps image-top to the FBO's bottom row, and glReadPixels returns
+    // bottom-to-top, so the first row read is the image top — no flip needed.
+    outRGBA.resize(static_cast<size_t>(width) * height * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outRGBA.data());
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    m_glUseProgram(0);
+    m_glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    return true;
+}
+
 void VideoTonemap::Shutdown() {
     if (m_outTex) {
         glDeleteTextures(1, &m_outTex);
         m_outTex = 0;
     }
+    if (m_inTex) {
+        glDeleteTextures(1, &m_inTex);
+        m_inTex = 0;
+    }
+    m_inW = m_inH = 0;
     if (m_fbo && m_glDeleteFramebuffers) {
         m_glDeleteFramebuffers(1, &m_fbo);
         m_fbo = 0;

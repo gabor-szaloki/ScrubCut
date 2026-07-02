@@ -120,4 +120,7 @@ struct ExportSettings {
     std::vector<FrameMark> frames;
     int gifWidth = 480;
     double gifFps = 15.0;
+    // HDR->SDR operator used when re-encoding HDR sources (GIF/PNG). Mirrors the
+    // user's current display selection so exports match what's on screen.
+    Tonemapper tonemapper = Tonemapper::Uncharted2;
 };

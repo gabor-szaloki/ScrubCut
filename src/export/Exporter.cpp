@@ -6,6 +6,11 @@
 #include "util/Log.h"
 #include "util/FFmpegUtils.h"
 
+#include <SDL3/SDL.h>
+
+#include <cstring>
+#include <vector>
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb/stb_image_write.h"
 
@@ -46,8 +51,34 @@ void Exporter::Cancel() {
         m_thread.join();
 }
 
+bool Exporter::EnsureTonemap() {
+    if (m_tonemap.IsReady())
+        return true;
+    if (!m_glCurrent)
+        return false;  // no export GL context available
+    return m_tonemap.Init();
+}
+
 void Exporter::ExportThread() {
     SetCurrentThreadName(L"ScrubCut Export");
+
+    // Make the offscreen GL context current on this thread so HDR sources can be
+    // tone-mapped via the shader. Released at the end. Harmless for SDR exports.
+    m_glCurrent = false;
+    if (m_glContext && m_glWindow)
+        m_glCurrent = SDL_GL_MakeCurrent(m_glWindow, m_glContext);
+
+    // Tear down GL objects (while the context is still current) and release the
+    // context. Must run on every exit path so the context isn't left current on
+    // a dead thread. Called before every `return` below.
+    auto finish = [&]() {
+        m_tonemap.Shutdown();
+        if (m_glCurrent) {
+            SDL_GL_MakeCurrent(nullptr, nullptr);
+            m_glCurrent = false;
+        }
+        m_progress.running = false;
+    };
 
     int totalItems = static_cast<int>(m_settings.segments.size() + m_settings.frames.size());
     int itemsDone = 0;
@@ -109,7 +140,7 @@ void Exporter::ExportThread() {
         }
 
         if (!ok && !m_cancel) {
-            m_progress.running = false;
+            finish();
             return;
         }
         itemsDone++;
@@ -126,7 +157,7 @@ void Exporter::ExportThread() {
                  itemsDone + 1, totalItems, outPath.c_str());
         bool ok = ExportFramePNG(m_inputPath, f, outPath);
         if (!ok && !m_cancel) {
-            m_progress.running = false;
+            finish();
             return;
         }
         itemsDone++;
@@ -138,7 +169,7 @@ void Exporter::ExportThread() {
         m_progress.finished = true;
         LOG_INFO("Export complete");
     }
-    m_progress.running = false;
+    finish();
 }
 
 std::string Exporter::BuildOutputPath(const std::string& basePath, const std::string& markName,
@@ -415,6 +446,19 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     AVColorSpace colorspace = vpar ? vpar->color_space : AVCOL_SPC_UNSPECIFIED;
     AVColorRange colorrange = vpar ? vpar->color_range : AVCOL_RANGE_UNSPECIFIED;
 
+    // HDR sources can't be fed to the SDR palette filter as-is — they'd read
+    // washed-out. Tone-map each frame to SDR RGBA8 via the shader first, then
+    // feed RGBA into the graph. Detect HDR here and set up the tone-mapper.
+    VideoColorMode colorMode = vpar ? FrameConverter::ColorModeForTransfer(vpar->color_trc)
+                                    : VideoColorMode::SDR;
+    VideoColorPrimaries colorPrimaries = vpar ? FrameConverter::PrimariesForTag(vpar->color_primaries)
+                                              : VideoColorPrimaries::BT2020;
+    const bool hdr = (colorMode != VideoColorMode::SDR);
+    if (hdr && !EnsureTonemap()) {
+        m_progress.SetError("GIF: HDR export needs the GPU tone-mapper, which is unavailable");
+        return false;
+    }
+
     // Compute output height maintaining aspect ratio (must be even)
     int outH = (gifWidth * srcH / srcW) & ~1;
     if (outH < 2) outH = 2;
@@ -427,15 +471,25 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
         return false;
     }
 
-    // Buffer source (include color space info to avoid filter warnings)
+    // Buffer source (include color space info to avoid filter warnings). For HDR
+    // we feed already-tone-mapped RGBA frames, so the source format is rgba and
+    // no colorspace metadata is needed.
     char bufSrcArgs[512];
-    snprintf(bufSrcArgs, sizeof(bufSrcArgs),
-             "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/1"
-             ":colorspace=%d:range=%d",
-             srcW, srcH, static_cast<int>(srcFmt),
-             srcTimeBase.num, srcTimeBase.den,
-             static_cast<int>(std::round(srcFps)),
-             static_cast<int>(colorspace), static_cast<int>(colorrange));
+    if (hdr) {
+        snprintf(bufSrcArgs, sizeof(bufSrcArgs),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/1",
+                 srcW, srcH, static_cast<int>(AV_PIX_FMT_RGBA),
+                 srcTimeBase.num, srcTimeBase.den,
+                 static_cast<int>(std::round(srcFps)));
+    } else {
+        snprintf(bufSrcArgs, sizeof(bufSrcArgs),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/1"
+                 ":colorspace=%d:range=%d",
+                 srcW, srcH, static_cast<int>(srcFmt),
+                 srcTimeBase.num, srcTimeBase.den,
+                 static_cast<int>(std::round(srcFps)),
+                 static_cast<int>(colorspace), static_cast<int>(colorrange));
+    }
 
     AVFilterContext* bufSrcCtx = nullptr;
     AVFilterContext* bufSinkCtx = nullptr;
@@ -476,14 +530,25 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     // motion) and fast-forward gets FEWER (no redundant duplicates).
     double srcSampleFps = (range.speed > 0.0) ? gifFps / range.speed : gifFps;
     char filterDesc[512];
-    snprintf(filterDesc, sizeof(filterDesc),
-             "fps=fps=%.4f,scale=%d:%d:flags=lanczos,"
-             "format=rgb24,colorspace=all=bt709:iall=bt709:fast=1,"
-             "setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1,"
-             "split[a][b];"
-             "[a]palettegen=stats_mode=full[p];"
-             "[b][p]paletteuse=dither=bayer:bayer_scale=3",
-             srcSampleFps, gifWidth, outH);
+    if (hdr) {
+        // HDR frames arrive already tone-mapped to sRGB BT.709 RGBA, so the
+        // colorspace conversion is skipped — just resample, scale, and palettize.
+        snprintf(filterDesc, sizeof(filterDesc),
+                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,format=rgb24,"
+                 "split[a][b];"
+                 "[a]palettegen=stats_mode=full[p];"
+                 "[b][p]paletteuse=dither=bayer:bayer_scale=3",
+                 srcSampleFps, gifWidth, outH);
+    } else {
+        snprintf(filterDesc, sizeof(filterDesc),
+                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,"
+                 "format=rgb24,colorspace=all=bt709:iall=bt709:fast=1,"
+                 "setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1,"
+                 "split[a][b];"
+                 "[a]palettegen=stats_mode=full[p];"
+                 "[b][p]paletteuse=dither=bayer:bayer_scale=3",
+                 srcSampleFps, gifWidth, outH);
+    }
 
     ret = avfilter_graph_parse_ptr(filterGraph, filterDesc, &inputs, &outputs, nullptr);
     avfilter_inout_free(&inputs);
@@ -571,6 +636,11 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     AVFrame* decFrame = av_frame_alloc();
     AVFrame* filtFrame = av_frame_alloc();
     AVPacket* encPkt = av_packet_alloc();
+
+    // HDR only: converts each decoded frame to packed 10-bit, then the shader
+    // tone-maps it to the SDR RGBA8 that gets fed into the (rgba) filter graph.
+    FrameConverter gifConv;
+    std::vector<uint8_t> tmRGBA;
 
     int videoIdx = demuxer.GetVideoStreamIndex();
     double segDuration = range.endSec - range.startSec;
@@ -669,7 +739,39 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
                 m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalItems;
             }
 
-            ret = av_buffersrc_add_frame(bufSrcCtx, decFrame);
+            if (hdr) {
+                // Tone-map the HDR frame to SDR RGBA8, wrap it in an rgba AVFrame
+                // (keeping the source pts/time_base), and feed that to the graph.
+                const uint8_t* packed = gifConv.Convert(decFrame);
+                if (!packed || !m_tonemap.RenderToBuffer(packed, gifConv.GetWidth(),
+                                                         gifConv.GetHeight(), colorMode,
+                                                         colorPrimaries, m_settings.tonemapper,
+                                                         tmRGBA)) {
+                    av_frame_unref(decFrame);
+                    m_progress.SetError("GIF: HDR tone-map failed");
+                    goto gif_cleanup;
+                }
+                AVFrame* rgbaFrame = av_frame_alloc();
+                rgbaFrame->format = AV_PIX_FMT_RGBA;
+                rgbaFrame->width = gifConv.GetWidth();
+                rgbaFrame->height = gifConv.GetHeight();
+                if (av_frame_get_buffer(rgbaFrame, 0) < 0) {
+                    av_frame_free(&rgbaFrame);
+                    av_frame_unref(decFrame);
+                    m_progress.SetError("GIF: Failed to alloc RGBA frame");
+                    goto gif_cleanup;
+                }
+                for (int y = 0; y < rgbaFrame->height; y++) {
+                    memcpy(rgbaFrame->data[0] + static_cast<size_t>(y) * rgbaFrame->linesize[0],
+                           tmRGBA.data() + static_cast<size_t>(y) * rgbaFrame->width * 4,
+                           static_cast<size_t>(rgbaFrame->width) * 4);
+                }
+                rgbaFrame->pts = decFrame->pts;
+                ret = av_buffersrc_add_frame_flags(bufSrcCtx, rgbaFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
+                av_frame_free(&rgbaFrame);
+            } else {
+                ret = av_buffersrc_add_frame(bufSrcCtx, decFrame);
+            }
             av_frame_unref(decFrame);
             if (ret < 0) {
                 m_progress.SetError("GIF: Failed to feed filter: " + ff::ErrorString(ret));
@@ -820,6 +922,26 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
         av_frame_free(&captured);
         m_progress.SetError("Frame conversion failed");
         return false;
+    }
+
+    // HDR frames come back as 10-bit packed X2BGR10LE, which stb would misread
+    // as 8-bit RGBA. Tone-map them to SDR RGBA8 through the same shader the
+    // display uses. Requires the export GL context.
+    std::vector<uint8_t> tonemapped;
+    if (conv.GetColorMode() != VideoColorMode::SDR) {
+        if (!EnsureTonemap()) {
+            av_frame_free(&captured);
+            m_progress.SetError("HDR frame export needs the GPU tone-mapper, which is unavailable");
+            return false;
+        }
+        VideoColorPrimaries prim = FrameConverter::PrimariesForTag(vparams->color_primaries);
+        if (!m_tonemap.RenderToBuffer(rgba, W, H, conv.GetColorMode(), prim,
+                                      m_settings.tonemapper, tonemapped)) {
+            av_frame_free(&captured);
+            m_progress.SetError("HDR tone-map failed for frame export");
+            return false;
+        }
+        rgba = tonemapped.data();
     }
 
     int ok = stbi_write_png(outputPath.c_str(), W, H, 4, rgba, W * 4);

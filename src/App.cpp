@@ -304,6 +304,22 @@ bool App::Init() {
     if (!m_tonemap.Init())
         LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
 
+    // A second, hidden GL context so the Exporter's background thread can run the
+    // same tone-map shader for HDR re-encode exports (GIF/PNG). It shares no
+    // objects with the main context — the Exporter builds its own. Creating a
+    // context makes it current on this thread, so restore the main one after.
+    // Non-fatal: without it, HDR re-encode exports report an error.
+    m_exportGLWindow = SDL_CreateWindow("ScrubCut Export", 1, 1,
+                                        SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (m_exportGLWindow) {
+        m_exportGLContext = SDL_GL_CreateContext(m_exportGLWindow);
+        SDL_GL_MakeCurrent(m_window, m_glContext);  // restore main context
+    }
+    if (m_exportGLContext)
+        m_exporter.SetTonemapContext(m_exportGLWindow, m_exportGLContext);
+    else
+        LOG_ERROR("Export GL context unavailable; HDR GIF/PNG export will be disabled");
+
     // Delete layout files before ImGui loads them
     bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
     if (resetLayout) {
@@ -540,6 +556,18 @@ void App::Shutdown() {
     m_tonemap.Shutdown();
 
     m_ui.Shutdown();
+
+    // Stop any in-flight export (joins its thread) before tearing down the
+    // export GL context it may still be using.
+    m_exporter.Cancel();
+    if (m_exportGLContext) {
+        SDL_GL_DestroyContext(m_exportGLContext);
+        m_exportGLContext = nullptr;
+    }
+    if (m_exportGLWindow) {
+        SDL_DestroyWindow(m_exportGLWindow);
+        m_exportGLWindow = nullptr;
+    }
 
     if (m_glContext) {
         SDL_GL_DestroyContext(m_glContext);
@@ -3283,6 +3311,26 @@ void App::Render() {
                 ImGui::EndChild();
             }
 
+            // HDR sources are tone-mapped to SDR when re-encoded (GIF/PNG). Show
+            // which operator will be used so exports match what's on screen.
+            if (m_videoColorMode != VideoColorMode::SDR) {
+                ImGui::Spacing();
+                const ImVec4 accent(0.35f, 0.70f, 1.0f, 1.0f); // info blue
+                ImGui::PushStyleColor(ImGuiCol_Border, accent);
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.35f, 0.70f, 1.0f, 0.08f));
+                ImGui::BeginChild("##hdrExportInfo", ImVec2(dialogWidth, 0.0f),
+                                  ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY,
+                                  ImGuiWindowFlags_NoScrollbar);
+                ImGui::TextColored(accent, "HDR video");
+                ImGui::TextWrapped(
+                    "GIF and PNG exports will be converted to SDR using the currently "
+                    "selected tonemapper (%s). Source-format segment exports copy the "
+                    "original HDR video untouched.",
+                    TonemapperName(m_tonemapper));
+                ImGui::EndChild();
+                ImGui::PopStyleColor(2);
+            }
+
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -3299,6 +3347,9 @@ void App::Render() {
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "All marks must have a name.");
 
             auto triggerExport = [&]() {
+                // WYSIWYG: HDR re-encode exports use the operator the user is
+                // currently viewing with.
+                m_pendingExport.tonemapper = m_tonemapper;
                 m_pendingExport.segments.clear();
                 m_pendingExport.frames.clear();
                 for (const Row& row : rows) {

@@ -4,6 +4,9 @@
 
 #include <SDL3/SDL_opengl.h>
 
+#include <cstdint>
+#include <vector>
+
 // GPU HDR->SDR tone-mapper.
 //
 // HDR frames reach us as 10-bit BT.2020 R'G'B' still carrying their PQ/HLG
@@ -33,9 +36,23 @@ public:
     GLuint Process(GLuint srcTex, int width, int height, VideoColorMode mode,
                    VideoColorPrimaries primaries, Tonemapper tonemapper);
 
+    // Tone-map raw HDR pixel data (10-bit packed AV_PIX_FMT_X2BGR10LE, as
+    // produced by FrameConverter for HDR) into a tightly-packed 8-bit RGBA
+    // buffer, top row first. Uploads the data itself, so no source texture is
+    // needed — used by the offscreen export path. `outRGBA` is resized to
+    // width*height*4. Returns false if not ready or on error. Requires a current
+    // GL context. Same math as Process(), so exports match the display.
+    bool RenderToBuffer(const uint8_t* src, int width, int height, VideoColorMode mode,
+                        VideoColorPrimaries primaries, Tonemapper tonemapper,
+                        std::vector<uint8_t>& outRGBA);
+
 private:
     bool LoadProcs();
     bool EnsureTarget(int width, int height);
+    // Render `srcTex` through the shader into the FBO. Assumes the caller has
+    // saved GL state and leaves the FBO bound for a subsequent read-back.
+    void RenderPass(GLuint srcTex, int width, int height, VideoColorMode mode,
+                    VideoColorPrimaries primaries, Tonemapper tonemapper);
 
     bool m_ready = false;
     GLuint m_program = 0;
@@ -44,6 +61,9 @@ private:
     GLuint m_outTex = 0;
     int m_outW = 0;
     int m_outH = 0;
+    GLuint m_inTex = 0;  // source upload texture for RenderToBuffer
+    int m_inW = 0;
+    int m_inH = 0;
     GLint m_uTex = -1;
     GLint m_uTransfer = -1;
     GLint m_uPrimaries = -1;

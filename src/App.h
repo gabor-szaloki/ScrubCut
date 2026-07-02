@@ -145,6 +145,10 @@ private:
 
     SDL_Window* m_window = nullptr;
     SDL_GLContext m_glContext = nullptr;
+    // Hidden window + GL context handed to the Exporter so it can run the HDR
+    // tone-map shader on its background thread (see Exporter::SetTonemapContext).
+    SDL_Window* m_exportGLWindow = nullptr;
+    SDL_GLContext m_exportGLContext = nullptr;
     UIManager m_ui;
     Settings m_layoutSettings;
     Settings m_prefSettings;

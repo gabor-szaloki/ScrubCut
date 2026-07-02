@@ -2,6 +2,9 @@
 
 #include "util/Types.h"
 #include "util/FFmpegUtils.h"
+#include "ui/VideoTonemap.h"
+
+#include <SDL3/SDL_video.h>
 
 #include <string>
 #include <thread>
@@ -54,12 +57,25 @@ public:
 
     void Start(const std::string& inputPath, const ExportSettings& settings);
     void Cancel();
+
+    // Provide an offscreen GL window+context so the export thread can run the
+    // HDR tone-map shader (VideoTonemap). Owned by App; call once after the main
+    // GL context is created. Without it, HDR re-encode exports fail with an
+    // error rather than producing wrong output.
+    void SetTonemapContext(SDL_Window* window, SDL_GLContext context) {
+        m_glWindow = window;
+        m_glContext = context;
+    }
     void ResetProgress() { if (!m_progress.running) m_progress.Reset(); }
     const Progress& GetProgress() const { return m_progress; }
     bool IsRunning() const { return m_progress.running; }
 
 private:
     void ExportThread();
+
+    // Lazily compile the tone-map shader (requires the export GL context to be
+    // current). Returns true if the tone-mapper is ready to use.
+    bool EnsureTonemap();
 
     bool ExportSegmentStreamCopy(const std::string& inputPath,
                                   const TimeRange& range,
@@ -82,4 +98,10 @@ private:
     std::string m_inputPath;
     ExportSettings m_settings;
     std::atomic<bool> m_cancel{false};
+
+    // Offscreen GL context for HDR tone-mapping on the export thread (set by App).
+    SDL_Window* m_glWindow = nullptr;
+    SDL_GLContext m_glContext = nullptr;
+    VideoTonemap m_tonemap;
+    bool m_glCurrent = false;  // is the export context current on this thread
 };
