@@ -167,9 +167,13 @@ add_dependencies(ScrubCut embed_shaders)
 
 target_include_directories(ScrubCut PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/third_party
     ${_GENERATED_DIR}
     ${FFMPEG_INCLUDE_DIRS}
+)
+# SYSTEM so warnings inside vendored headers (sprintf deprecation in
+# stb_image_write.h) don't pollute our build output.
+target_include_directories(ScrubCut SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party
 )
 
 target_link_libraries(ScrubCut PRIVATE
@@ -181,6 +185,12 @@ target_link_libraries(ScrubCut PRIVATE
 # Link ws2_32 and friends on Windows (needed by FFmpeg)
 if(WIN32)
     target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi)
+endif()
+
+# FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the
+# harmless duplicates.
+if(APPLE)
+    target_link_options(ScrubCut PRIVATE LINKER:-no_warn_duplicate_libraries)
 endif()
 
 # Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are
