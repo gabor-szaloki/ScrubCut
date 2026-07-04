@@ -5,7 +5,7 @@ Demuxer::~Demuxer() {
     Close();
 }
 
-bool Demuxer::Open(const std::string& path) {
+bool Demuxer::Open(const std::string& path, const char* purpose) {
     Close();
 
     int ret = avformat_open_input(&m_fmtCtx, path.c_str(), nullptr, nullptr);
@@ -31,10 +31,15 @@ bool Demuxer::Open(const std::string& path) {
         return false;
     }
 
-    LOG_INFO("Opened: %s", path.c_str());
-    LOG_INFO("  Video stream: %d, Audio stream: %d", m_videoStreamIdx, m_audioStreamIdx);
-    LOG_INFO("  Duration: %.2f seconds", GetDuration());
-    LOG_INFO("  Frame rate: %.2f fps", GetVideoFrameRate());
+    if (purpose) {
+        // Secondary open of a file whose details the main open already logged.
+        LOG_INFO("Opened (%s): %s", purpose, path.c_str());
+    } else {
+        LOG_INFO("Opened: %s", path.c_str());
+        LOG_INFO("  Video stream: %d, Audio stream: %d", m_videoStreamIdx, m_audioStreamIdx);
+        LOG_INFO("  Duration: %.2f seconds", GetDuration());
+        LOG_INFO("  Frame rate: %.2f fps", GetVideoFrameRate());
+    }
 
     return true;
 }

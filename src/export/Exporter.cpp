@@ -189,7 +189,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
                                         const TimeRange& range,
                                         const std::string& outputPath) {
     Demuxer demuxer;
-    if (!demuxer.Open(inputPath)) {
+    if (!demuxer.Open(inputPath, "export")) {
         m_progress.SetError("Failed to open input: " + inputPath);
         return false;
     }
@@ -406,13 +406,13 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
                                  int gifWidth, double gifFps) {
     // Open input
     Demuxer demuxer;
-    if (!demuxer.Open(inputPath)) {
+    if (!demuxer.Open(inputPath, "export")) {
         m_progress.SetError("GIF: Failed to open input");
         return false;
     }
 
     VideoDecoder decoder;
-    if (!decoder.Open(demuxer.GetVideoCodecParams())) {
+    if (!decoder.Open(demuxer.GetVideoCodecParams(), /*quiet=*/true)) {
         m_progress.SetError("GIF: Failed to open video decoder");
         return false;
     }
@@ -821,7 +821,7 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
                                const FrameMark& frame,
                                const std::string& outputPath) {
     Demuxer demuxer;
-    if (!demuxer.Open(inputPath)) {
+    if (!demuxer.Open(inputPath, "export")) {
         m_progress.SetError("Failed to open input: " + inputPath);
         return false;
     }
@@ -833,7 +833,7 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
     }
 
     VideoDecoder decoder;
-    if (!decoder.Open(vparams)) {
+    if (!decoder.Open(vparams, /*quiet=*/true)) {
         m_progress.SetError("Failed to open video decoder");
         return false;
     }

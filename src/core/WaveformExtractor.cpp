@@ -38,7 +38,7 @@ void WaveformExtractor::Reset() {
 
 void WaveformExtractor::Worker(std::string path, double durationSec) {
     Demuxer demux;
-    if (!demux.Open(path)) {
+    if (!demux.Open(path, "waveform scan")) {
         LOG_WARN("Waveform: failed to open %s", path.c_str());
         m_running.store(false, std::memory_order_relaxed);
         return;

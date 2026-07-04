@@ -5,7 +5,7 @@ VideoDecoder::~VideoDecoder() {
     Close();
 }
 
-bool VideoDecoder::Open(AVCodecParameters* codecParams) {
+bool VideoDecoder::Open(AVCodecParameters* codecParams, bool quiet) {
     Close();
 
     const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
@@ -38,7 +38,8 @@ bool VideoDecoder::Open(AVCodecParameters* codecParams) {
         return false;
     }
 
-    LOG_INFO("Video decoder opened: %s, %dx%d", codec->name, GetWidth(), GetHeight());
+    if (!quiet)
+        LOG_INFO("Video decoder opened: %s, %dx%d", codec->name, GetWidth(), GetHeight());
     return true;
 }
 

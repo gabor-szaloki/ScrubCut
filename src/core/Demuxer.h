@@ -11,7 +11,10 @@ public:
     Demuxer(const Demuxer&) = delete;
     Demuxer& operator=(const Demuxer&) = delete;
 
-    bool Open(const std::string& path);
+    // Open `path`. `purpose` labels secondary opens of an already-open file
+    // (frame cache, waveform scan, export): when set, the log is a single
+    // "Opened (<purpose>)" line instead of the full stream/duration block.
+    bool Open(const std::string& path, const char* purpose = nullptr);
     void Close();
 
     // Read the next packet. Returns 0 on success, AVERROR_EOF at end, or negative error.

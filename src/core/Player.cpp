@@ -174,8 +174,8 @@ bool Player::Open(const std::string& path) {
     // Independent demuxer + decoder for backward-step cache population.
     // Failure here is non-fatal — caching just falls back to no-op and
     // backward stepping does a full re-seek per step like before.
-    if (!m_cacheDemuxer.Open(path) ||
-        !m_cacheDecoder.Open(m_cacheDemuxer.GetVideoCodecParams())) {
+    if (!m_cacheDemuxer.Open(path, "frame cache") ||
+        !m_cacheDecoder.Open(m_cacheDemuxer.GetVideoCodecParams(), /*quiet=*/true)) {
         m_cacheDecoder.Close();
         m_cacheDemuxer.Close();
     }

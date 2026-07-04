@@ -12,7 +12,9 @@ public:
     VideoDecoder(const VideoDecoder&) = delete;
     VideoDecoder& operator=(const VideoDecoder&) = delete;
 
-    bool Open(AVCodecParameters* codecParams);
+    // `quiet` suppresses the success log line — used by secondary decoders
+    // (frame cache, export) whose codec/dimensions the main open already logged.
+    bool Open(AVCodecParameters* codecParams, bool quiet = false);
     void Close();
 
     // Send a packet to the decoder. Pass nullptr to flush.
