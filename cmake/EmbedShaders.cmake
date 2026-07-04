@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.21)  # script mode: enables IN_LIST policy
 # Invoked at build time via: cmake -P EmbedShaders.cmake
 # Inputs (passed as -DVAR=value):
 #   SHADER_BLOB_DIR - directory holding the compiled blobs
-#   FORMATS         - comma-separated formats to embed (of: spv,dxil,msl) —
+#   FORMATS         - comma-separated formats to embed (of: spv,dxbc,msl) —
 #                     only what the platform's SDL_GPU backends can consume.
 #                     The other formats' Blobs are emitted empty and skipped by
 #                     VideoTonemap's format selection.
@@ -22,10 +22,10 @@ string(REPLACE "," ";" _formats "${FORMATS}")
 # name=format=blob-file basename
 set(_SHADERS
     "kVertSpirv=spv=tonemap.vert.spv"
-    "kVertDxil=dxil=tonemap.vert.dxil"
+    "kVertDxbc=dxbc=tonemap.vert.dxbc"
     "kVertMsl=msl=tonemap.vert.msl"
     "kFragSpirv=spv=tonemap.frag.spv"
-    "kFragDxil=dxil=tonemap.frag.dxil"
+    "kFragDxbc=dxbc=tonemap.frag.dxbc"
     "kFragMsl=msl=tonemap.frag.msl"
 )
 

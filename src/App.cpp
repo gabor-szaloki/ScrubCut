@@ -284,10 +284,15 @@ bool App::Init() {
     // GPU device. The D3D12 fewer-resource-slots property drops the Tier-2
     // resource-binding requirement (supports older GPUs like Intel
     // Haswell/Broadwell); legal because we bind no storage resources.
+    // DXBC (SM 5.x) rather than DXIL: our shaders don't need SM6, DXBC works
+    // on all D3D12 hardware, and declaring DXIL would force SDL's D3D12
+    // driver probe to create a throwaway device just to check SM6 support —
+    // ~250 ms of startup on some drivers. With DXBC + fewer-resource-slots,
+    // the probe is skipped entirely on Windows 11.
     {
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXIL_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
         SDL_SetBooleanProperty(props,
             SDL_PROP_GPU_DEVICE_CREATE_D3D12_ALLOW_FEWER_RESOURCE_SLOTS_BOOLEAN, true);

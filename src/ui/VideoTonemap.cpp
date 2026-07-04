@@ -23,7 +23,7 @@ bool VideoTonemap::Init(SDL_GPUDevice* device) {
     m_device = device;
 
     // Pick the shader format the device accepts. A format's blob can be empty
-    // when it isn't compiled on this platform (DXIL on macOS) — skip those.
+    // when it isn't compiled on this platform (DXBC on macOS) — skip those.
     const SDL_GPUShaderFormat avail = SDL_GetGPUShaderFormats(device);
     SDL_GPUShaderFormat format;
     tonemap_shader::Blob vertBlob, fragBlob;
@@ -33,10 +33,10 @@ bool VideoTonemap::Init(SDL_GPUDevice* device) {
         vertBlob = tonemap_shader::kVertMsl;
         fragBlob = tonemap_shader::kFragMsl;
         entrypoint = "main0";  // SPIRV-Cross renames `main` when emitting MSL
-    } else if ((avail & SDL_GPU_SHADERFORMAT_DXIL) && tonemap_shader::kFragDxil.size) {
-        format = SDL_GPU_SHADERFORMAT_DXIL;
-        vertBlob = tonemap_shader::kVertDxil;
-        fragBlob = tonemap_shader::kFragDxil;
+    } else if ((avail & SDL_GPU_SHADERFORMAT_DXBC) && tonemap_shader::kFragDxbc.size) {
+        format = SDL_GPU_SHADERFORMAT_DXBC;
+        vertBlob = tonemap_shader::kVertDxbc;
+        fragBlob = tonemap_shader::kFragDxbc;
         entrypoint = "main";
     } else if ((avail & SDL_GPU_SHADERFORMAT_SPIRV) && tonemap_shader::kFragSpirv.size) {
         format = SDL_GPU_SHADERFORMAT_SPIRV;

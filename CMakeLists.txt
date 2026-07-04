@@ -61,10 +61,11 @@ add_dependencies(ScrubCut generate_version)
 
 # --- Shaders: HLSL compiled at build time to blobs, embedded into a header ---
 # Windows/Linux: the shadercross CLI (vcpkg host tool sdl3-shadercross)
-# produces SPIRV + DXIL + MSL. macOS: vcpkg can't provision shadercross (no
+# produces SPIRV + DXBC (SM 5.x — deliberately not DXIL, see the GPU device
+# creation comment in App.cpp). macOS: vcpkg can't provision shadercross (no
 # DirectX Shader Compiler port there), so glslang compiles HLSL -> SPIRV and
 # spirv-cross derives MSL from it — verified to produce the same MSL interface
-# as shadercross. DXIL isn't produced on macOS; SDL_GPU only uses MSL there.
+# as shadercross.
 set(_SHADER_DIR "${CMAKE_SOURCE_DIR}/src/ui/shaders")
 set(_SHADER_BLOB_DIR "${_GENERATED_DIR}/shaders")
 set(_SHADER_HEADER "${_GENERATED_DIR}/scrubcut_shaders.h")
@@ -72,7 +73,7 @@ file(MAKE_DIRECTORY "${_SHADER_BLOB_DIR}")
 
 # Only the formats the platform's SDL_GPU backends can consume get embedded:
 # D3D12/Vulkan (Windows) and Vulkan (Linux) never load MSL, and Metal (macOS)
-# never loads SPIRV/DXIL — SPIRV is produced on macOS only as the spirv-cross
+# never loads SPIRV/DXBC — SPIRV is produced on macOS only as the spirv-cross
 # input. The other formats are embedded as empty Blobs.
 set(_SHADER_BLOBS "")
 if(APPLE)
@@ -114,7 +115,7 @@ if(APPLE)
             VERBATIM)
     endforeach()
 else()
-    set(_SHADER_EMBED_FORMATS "spv,dxil")
+    set(_SHADER_EMBED_FORMATS "spv,dxbc")
     find_program(SHADERCROSS_EXECUTABLE
         NAMES shadercross
         PATHS
@@ -131,7 +132,7 @@ else()
         else()
             set(_stagearg fragment)
         endif()
-        foreach(_fmt spv dxil)
+        foreach(_fmt spv dxbc)
             set(_blob "${_SHADER_BLOB_DIR}/tonemap.${_stage}.${_fmt}")
             list(APPEND _SHADER_BLOBS "${_blob}")
             add_custom_command(OUTPUT "${_blob}"
