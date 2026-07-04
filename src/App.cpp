@@ -1884,7 +1884,10 @@ void App::Render() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::Begin("Viewport");
-    if (m_videoTexture && m_player.HasMedia()) {
+    // Gate on m_displayTexture, not m_videoTexture: a freshly created texture
+    // has undefined contents (pink garbage on Metal) until the first decoded
+    // frame is uploaded, and m_displayTexture is only set after that upload.
+    if (m_displayTexture && m_player.HasMedia()) {
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float aspectRatio = static_cast<float>(m_videoWidth) / static_cast<float>(m_videoHeight);
         float displayW = avail.x;
@@ -1898,8 +1901,7 @@ void App::Render() {
             cursor.x + (avail.x - displayW) * 0.5f,
             cursor.y + (avail.y - displayH) * 0.5f
         ));
-        SDL_GPUTexture* tex = m_displayTexture ? m_displayTexture : m_videoTexture;
-        ImGui::Image(reinterpret_cast<ImTextureID>(tex), ImVec2(displayW, displayH));
+        ImGui::Image(reinterpret_cast<ImTextureID>(m_displayTexture), ImVec2(displayW, displayH));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
         // Click the video to toggle play/pause; double-click to toggle
@@ -1970,7 +1972,9 @@ void App::Render() {
         RenderSubtitleOverlay(imgMin, imgMax);
         // Top-right flash for track/delay/size changes — explicit user feedback.
         RenderStatusOverlay(imgMin, imgMax);
-    } else {
+    } else if (!m_player.HasMedia()) {
+        // (When media is open but the first frame hasn't arrived yet, draw
+        // nothing rather than flashing this hint for a frame or two.)
         std::string line1 = "Drag and drop a video file to open it";
         std::string line2 = "or press " + std::string(kKeys.cmdName) + "+O to browse";
         std::string line3 = "Press ? or " + std::string(kKeys.winModName) + "+H for keyboard shortcuts";
@@ -3683,6 +3687,9 @@ void App::CreateVideoTexture(int width, int height) {
         SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);
         m_videoTexture = nullptr;
     }
+    // May point at the texture released above; don't display anything until
+    // the first frame lands in the new texture.
+    m_displayTexture = nullptr;
     if (m_frameTransfer) {
         SDL_ReleaseGPUTransferBuffer(m_gpuDevice, m_frameTransfer);
         m_frameTransfer = nullptr;
