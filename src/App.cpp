@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <future>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -256,8 +257,42 @@ static bool SpeedCombo(const char* id, double currentSpeed, double& outSpeed, bo
 bool App::Init() {
     LogFile::Get().Open();
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
         LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
+        return false;
+    }
+
+    // Kick off GPU device creation on a worker thread as early as possible —
+    // creating a D3D12 device costs ~250 ms on some drivers and needs only
+    // the video subsystem. It overlaps everything below (audio init, window
+    // creation, settings, geometry, showing the pre-painted window) and is
+    // joined right before SDL_ClaimWindowForGPUDevice.
+    //
+    // The D3D12 fewer-resource-slots property drops the Tier-2
+    // resource-binding requirement (supports older GPUs like Intel
+    // Haswell/Broadwell); legal because we bind no storage resources.
+    // DXBC (SM 5.x) rather than DXIL: our shaders don't need SM6, DXBC works
+    // on all D3D12 hardware, and declaring DXIL would force SDL's D3D12
+    // driver probe to create a throwaway device just to check SM6 support —
+    // another ~250 ms on the same drivers. With DXBC + fewer-resource-slots,
+    // the probe is skipped entirely on Windows 11.
+    std::future<SDL_GPUDevice*> deviceFuture = std::async(std::launch::async, []() {
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
+        SDL_SetBooleanProperty(props,
+            SDL_PROP_GPU_DEVICE_CREATE_D3D12_ALLOW_FEWER_RESOURCE_SLOTS_BOOLEAN, true);
+#ifndef NDEBUG
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, true);
+#endif
+        SDL_GPUDevice* device = SDL_CreateGPUDeviceWithProperties(props);
+        SDL_DestroyProperties(props);
+        return device;
+    });
+
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        LOG_ERROR("SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
         return false;
     }
 
@@ -268,7 +303,8 @@ bool App::Init() {
 
     // Create hidden so the user never sees the brief flash of the creation
     // size / position before we apply the saved geometry (and optional
-    // maximize). SDL_ShowWindow is called once Init has settled the state.
+    // maximize). SDL_ShowWindow is called as soon as the geometry is settled —
+    // before the GPU init, so the window appears without waiting for it.
     m_window = SDL_CreateWindow(
         windowTitle,
         1280, 720,
@@ -281,58 +317,17 @@ bool App::Init() {
         return false;
     }
 
-    // GPU device. The D3D12 fewer-resource-slots property drops the Tier-2
-    // resource-binding requirement (supports older GPUs like Intel
-    // Haswell/Broadwell); legal because we bind no storage resources.
-    // DXBC (SM 5.x) rather than DXIL: our shaders don't need SM6, DXBC works
-    // on all D3D12 hardware, and declaring DXIL would force SDL's D3D12
-    // driver probe to create a throwaway device just to check SM6 support —
-    // ~250 ms of startup on some drivers. With DXBC + fewer-resource-slots,
-    // the probe is skipped entirely on Windows 11.
-    {
-        SDL_PropertiesID props = SDL_CreateProperties();
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
-        SDL_SetBooleanProperty(props,
-            SDL_PROP_GPU_DEVICE_CREATE_D3D12_ALLOW_FEWER_RESOURCE_SLOTS_BOOLEAN, true);
-#ifndef NDEBUG
-        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, true);
-#endif
-        m_gpuDevice = SDL_CreateGPUDeviceWithProperties(props);
-        SDL_DestroyProperties(props);
-    }
-    if (!m_gpuDevice) {
-        LOG_ERROR("SDL_CreateGPUDeviceWithProperties failed: %s", SDL_GetError());
-        return false;
-    }
-    LOG_INFO("GPU driver: %s", SDL_GetGPUDeviceDriver(m_gpuDevice));
-
-    // Claiming defaults to SDR composition + VSYNC present mode.
-    if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
-        LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
-        return false;
-    }
-
-    // GPU HDR->SDR tone-mapper. Non-fatal if it fails to init — SDR playback is
-    // unaffected; only HDR videos would then display incorrectly.
-    if (!m_tonemap.Init(m_gpuDevice))
-        LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
-
-    // The Exporter's background thread runs the same tone-map pass for HDR
-    // re-encode exports (GIF/PNG) on its own command buffers of this device.
-    m_exporter.SetTonemapDevice(m_gpuDevice);
+    // Load settings, apply the saved window geometry, and show the window
+    // BEFORE the GPU init below — creating a D3D12 device costs ~250 ms on
+    // some drivers, and this way the window appears almost immediately (SDL
+    // clears it to black until the first frame) instead of after the full
+    // GPU setup.
 
     // Delete layout files before ImGui loads them
     bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
     if (resetLayout) {
         std::filesystem::remove(GetAppDataDir() / "imgui.ini");
         std::filesystem::remove(GetAppDataDir() / "layout.ini");
-    }
-
-    if (!m_ui.Init(m_window, m_gpuDevice, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM)) {
-        LOG_ERROR("UIManager::Init failed");
-        return false;
     }
 
     if (CommandLine::Get().HasFlag("-trace")) {
@@ -371,13 +366,12 @@ bool App::Init() {
 
     LoadRecentFiles();
 
-    // Apply the initial UI scale (1.0 unless DPI scaling is enabled on Windows).
-    m_ui.SetUiScale(GetEffectiveUiScale());
-
     if (resetLayout) {
         // Default window size is scaled by the effective UI scale so UI elements
-        // are readable on high-DPI displays.
-        float uiScale = m_ui.GetUiScale();
+        // are readable on high-DPI displays. (GetEffectiveUiScale rather than
+        // m_ui.GetUiScale() — ImGui isn't initialized yet at this point; the
+        // values are identical.)
+        float uiScale = GetEffectiveUiScale();
         SDL_SetWindowSize(m_window,
                           static_cast<int>(1280 * uiScale),
                           static_cast<int>(720 * uiScale));
@@ -417,9 +411,56 @@ bool App::Init() {
         SDL_MaximizeWindow(m_window);
     }
 
-    // Now reveal the window — at the correct geometry and maximize state.
+    // Reveal the window — at the correct geometry and maximize state.
     SDL_ShowWindow(m_window);
 
+    // During the GPU init below the freshly shown window would sit solid
+    // black (SDL's WM_ERASEBKGND fill). Paint it with the UI background color
+    // through the software window surface — no GPU needed — so it looks like
+    // the app frame immediately. The surface is destroyed right away; the
+    // window is claimed for the GPU device below.
+    if (SDL_Surface* surface = SDL_GetWindowSurface(m_window)) {
+        // What's visible once the UI is up isn't the raw 0.1f clear color but
+        // the Viewport window's WindowBg (0.06, alpha 0.94) composited over
+        // it: 0.06*0.94 + 0.1*0.06 = 0.0624 -> RGB(15,15,15).
+        SDL_FillSurfaceRect(surface, nullptr, SDL_MapSurfaceRGB(surface, 15, 15, 15));
+        SDL_UpdateWindowSurface(m_window);
+        SDL_DestroyWindowSurface(m_window);
+    }
+    m_startupWindowShownNS = SDL_GetTicksNS();
+
+    // Join the GPU device creation started at the top of Init.
+    m_gpuDevice = deviceFuture.get();
+    if (!m_gpuDevice) {
+        LOG_ERROR("SDL_CreateGPUDeviceWithProperties failed: %s", SDL_GetError());
+        return false;
+    }
+    LOG_INFO("GPU driver: %s", SDL_GetGPUDeviceDriver(m_gpuDevice));
+
+    // Claiming defaults to SDR composition + VSYNC present mode.
+    if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
+        LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
+        return false;
+    }
+
+    // GPU HDR->SDR tone-mapper. Non-fatal if it fails to init — SDR playback is
+    // unaffected; only HDR videos would then display incorrectly.
+    if (!m_tonemap.Init(m_gpuDevice))
+        LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
+
+    // The Exporter's background thread runs the same tone-map pass for HDR
+    // re-encode exports (GIF/PNG) on its own command buffers of this device.
+    m_exporter.SetTonemapDevice(m_gpuDevice);
+
+    if (!m_ui.Init(m_window, m_gpuDevice, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM)) {
+        LOG_ERROR("UIManager::Init failed");
+        return false;
+    }
+
+    // Apply the initial UI scale (1.0 unless DPI scaling is enabled on Windows).
+    m_ui.SetUiScale(GetEffectiveUiScale());
+
+    m_startupInitDoneNS = SDL_GetTicksNS();
     LOG_INFO("ScrubCut initialized");
     m_running = true;
 
@@ -3615,6 +3656,14 @@ void App::Render() {
         m_screenshotPending = false;
     } else {
         SDL_SubmitGPUCommandBuffer(cmd);
+    }
+
+    // One-time startup timing report (times are since SDL init).
+    if (!m_startupReported) {
+        m_startupReported = true;
+        LOG_INFO("Startup: window shown %.0f ms, init done %.0f ms, first frame %.0f ms",
+                 m_startupWindowShownNS / 1e6, m_startupInitDoneNS / 1e6,
+                 SDL_GetTicksNS() / 1e6);
     }
 }
 

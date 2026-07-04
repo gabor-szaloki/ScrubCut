@@ -284,6 +284,12 @@ private:
     bool m_screenshotPending = false;
     int m_screenshotCounter = 0;
 
+    // Startup milestones (SDL tick timestamps), reported in a single log line
+    // when the first frame is presented.
+    uint64_t m_startupWindowShownNS = 0;
+    uint64_t m_startupInitDoneNS = 0;
+    bool m_startupReported = false;
+
     // Seek/scrub state
     double m_seekTarget = 0.0;
     uint64_t m_lastSeekTime = 0;
