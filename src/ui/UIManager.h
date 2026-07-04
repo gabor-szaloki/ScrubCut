@@ -6,11 +6,14 @@
 
 class UIManager {
 public:
-    bool Init(SDL_Window* window, SDL_GLContext glContext);
+    bool Init(SDL_Window* window, SDL_GPUDevice* device, SDL_GPUTextureFormat colorTargetFormat);
     void Shutdown();
 
     void BeginFrame();
-    void EndFrame();
+    // Render ImGui into `target` on `cmd`. Pass nulls (e.g. window minimized or
+    // swapchain acquire failed) to still run ImGui::Render() and keep the frame
+    // lifecycle balanced without recording any GPU work.
+    void EndFrame(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target);
     void ResetLayout();
     void DeleteLayoutFile();
     bool IsLayoutResetPending();

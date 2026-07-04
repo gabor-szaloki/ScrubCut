@@ -2,7 +2,7 @@
 
 #include "util/Types.h"
 
-#include <SDL3/SDL_opengl.h>
+#include <SDL3/SDL_gpu.h>
 
 #include <cstdint>
 #include <vector>
@@ -14,86 +14,56 @@
 // through a fragment shader that decodes the transfer, converts BT.2020 -> 709,
 // tone-maps to SDR with the selected operator, and sRGB-encodes the result into
 // an 8-bit texture that the rest of the UI composites like an ordinary SDR frame.
-//
-// All OpenGL 3.x entry points it needs (shaders, FBOs, VAOs) are loaded lazily
-// via SDL_GL_GetProcAddress, since the app otherwise only touches GL 1.1.
 class VideoTonemap {
 public:
     ~VideoTonemap();
 
-    // Compile the shader and allocate GL objects. Requires a current GL
-    // context. Returns false (and leaves the tone-mapper inert) on failure.
-    bool Init();
+    // Create the pipeline from the embedded shader blobs (picking the format
+    // the device accepts). Returns false (and leaves the tone-mapper inert) on
+    // failure.
+    bool Init(SDL_GPUDevice* device);
     void Shutdown();
 
     bool IsReady() const { return m_ready; }
 
-    // Tone-map an HDR source texture (id `srcTex`, `width`x`height`, color
-    // `mode`) into an internally-owned SDR RGBA8 texture, returning that
-    // texture's id. Returns 0 if not ready or on error. The returned id stays
-    // valid until the next Process() call with different dimensions, Shutdown(),
-    // or destruction. GL state touched (bound framebuffer, viewport) is restored.
-    GLuint Process(GLuint srcTex, int width, int height, VideoColorMode mode,
-                   VideoColorPrimaries primaries, Tonemapper tonemapper);
+    // Tone-map an HDR source texture (`srcTex`, `width`x`height`, color `mode`)
+    // into an internally-owned SDR RGBA8 texture, returning that texture.
+    // Returns nullptr if not ready or on error. The returned handle stays valid
+    // until Shutdown() or destruction; the render is submitted on its own
+    // command buffer, so in-order submission makes the result visible to the
+    // frame's later UI submission.
+    SDL_GPUTexture* Process(SDL_GPUTexture* srcTex, int width, int height, VideoColorMode mode,
+                            VideoColorPrimaries primaries, Tonemapper tonemapper);
 
     // Tone-map raw HDR pixel data (10-bit packed AV_PIX_FMT_X2BGR10LE, as
     // produced by FrameConverter for HDR) into a tightly-packed 8-bit RGBA
     // buffer, top row first. Uploads the data itself, so no source texture is
-    // needed — used by the offscreen export path. `outRGBA` is resized to
-    // width*height*4. Returns false if not ready or on error. Requires a current
-    // GL context. Same math as Process(), so exports match the display.
+    // needed — used by the export path. `outRGBA` is resized to width*height*4.
+    // Returns false if not ready or on error. Blocks until the GPU finishes.
+    // Same math as Process(), so exports match the display.
     bool RenderToBuffer(const uint8_t* src, int width, int height, VideoColorMode mode,
                         VideoColorPrimaries primaries, Tonemapper tonemapper,
                         std::vector<uint8_t>& outRGBA);
 
 private:
-    bool LoadProcs();
     bool EnsureTarget(int width, int height);
-    // Render `srcTex` through the shader into the FBO. Assumes the caller has
-    // saved GL state and leaves the FBO bound for a subsequent read-back.
-    void RenderPass(GLuint srcTex, int width, int height, VideoColorMode mode,
-                    VideoColorPrimaries primaries, Tonemapper tonemapper);
+    // Record the fullscreen tone-map pass rendering `srcTex` into m_outTex.
+    void RecordRenderPass(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* srcTex,
+                          VideoColorMode mode, VideoColorPrimaries primaries,
+                          Tonemapper tonemapper);
 
     bool m_ready = false;
-    GLuint m_program = 0;
-    GLuint m_vao = 0;
-    GLuint m_fbo = 0;
-    GLuint m_outTex = 0;
+    SDL_GPUDevice* m_device = nullptr;
+    SDL_GPUGraphicsPipeline* m_pipeline = nullptr;
+    SDL_GPUSampler* m_sampler = nullptr;
+    SDL_GPUTexture* m_outTex = nullptr;
     int m_outW = 0;
     int m_outH = 0;
-    GLuint m_inTex = 0;  // source upload texture for RenderToBuffer
+    SDL_GPUTexture* m_inTex = nullptr;  // source upload texture for RenderToBuffer
     int m_inW = 0;
     int m_inH = 0;
-    GLint m_uTex = -1;
-    GLint m_uTransfer = -1;
-    GLint m_uPrimaries = -1;
-    GLint m_uTonemapper = -1;
-    GLint m_uExposure = -1;
-
-    // GL 3.x entry points (not exported by opengl32.dll on Windows).
-    PFNGLCREATESHADERPROC m_glCreateShader = nullptr;
-    PFNGLSHADERSOURCEPROC m_glShaderSource = nullptr;
-    PFNGLCOMPILESHADERPROC m_glCompileShader = nullptr;
-    PFNGLGETSHADERIVPROC m_glGetShaderiv = nullptr;
-    PFNGLGETSHADERINFOLOGPROC m_glGetShaderInfoLog = nullptr;
-    PFNGLCREATEPROGRAMPROC m_glCreateProgram = nullptr;
-    PFNGLATTACHSHADERPROC m_glAttachShader = nullptr;
-    PFNGLLINKPROGRAMPROC m_glLinkProgram = nullptr;
-    PFNGLGETPROGRAMIVPROC m_glGetProgramiv = nullptr;
-    PFNGLGETPROGRAMINFOLOGPROC m_glGetProgramInfoLog = nullptr;
-    PFNGLDELETESHADERPROC m_glDeleteShader = nullptr;
-    PFNGLDELETEPROGRAMPROC m_glDeleteProgram = nullptr;
-    PFNGLUSEPROGRAMPROC m_glUseProgram = nullptr;
-    PFNGLGETUNIFORMLOCATIONPROC m_glGetUniformLocation = nullptr;
-    PFNGLUNIFORM1IPROC m_glUniform1i = nullptr;
-    PFNGLUNIFORM1FPROC m_glUniform1f = nullptr;
-    PFNGLGENVERTEXARRAYSPROC m_glGenVertexArrays = nullptr;
-    PFNGLBINDVERTEXARRAYPROC m_glBindVertexArray = nullptr;
-    PFNGLDELETEVERTEXARRAYSPROC m_glDeleteVertexArrays = nullptr;
-    PFNGLGENFRAMEBUFFERSPROC m_glGenFramebuffers = nullptr;
-    PFNGLBINDFRAMEBUFFERPROC m_glBindFramebuffer = nullptr;
-    PFNGLFRAMEBUFFERTEXTURE2DPROC m_glFramebufferTexture2D = nullptr;
-    PFNGLCHECKFRAMEBUFFERSTATUSPROC m_glCheckFramebufferStatus = nullptr;
-    PFNGLDELETEFRAMEBUFFERSPROC m_glDeleteFramebuffers = nullptr;
-    PFNGLACTIVETEXTUREPROC m_glActiveTexture = nullptr;
+    SDL_GPUTransferBuffer* m_uploadTB = nullptr;    // sized with m_inTex
+    SDL_GPUTransferBuffer* m_downloadTB = nullptr;  // sized with m_outTex
+    int m_downloadW = 0;
+    int m_downloadH = 0;
 };

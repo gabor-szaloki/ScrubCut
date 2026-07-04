@@ -54,29 +54,18 @@ void Exporter::Cancel() {
 bool Exporter::EnsureTonemap() {
     if (m_tonemap.IsReady())
         return true;
-    if (!m_glCurrent)
-        return false;  // no export GL context available
-    return m_tonemap.Init();
+    if (!m_gpuDevice)
+        return false;  // no GPU device available
+    return m_tonemap.Init(m_gpuDevice);
 }
 
 void Exporter::ExportThread() {
     SetCurrentThreadName(L"ScrubCut Export");
 
-    // Make the offscreen GL context current on this thread so HDR sources can be
-    // tone-mapped via the shader. Released at the end. Harmless for SDR exports.
-    m_glCurrent = false;
-    if (m_glContext && m_glWindow)
-        m_glCurrent = SDL_GL_MakeCurrent(m_glWindow, m_glContext);
-
-    // Tear down GL objects (while the context is still current) and release the
-    // context. Must run on every exit path so the context isn't left current on
-    // a dead thread. Called before every `return` below.
+    // Release the tone-mapper's GPU resources (deferred-safe from this thread).
+    // Must run on every exit path; called before every `return` below.
     auto finish = [&]() {
         m_tonemap.Shutdown();
-        if (m_glCurrent) {
-            SDL_GL_MakeCurrent(nullptr, nullptr);
-            m_glCurrent = false;
-        }
         m_progress.running = false;
     };
 
@@ -926,7 +915,7 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
 
     // HDR frames come back as 10-bit packed X2BGR10LE, which stb would misread
     // as 8-bit RGBA. Tone-map them to SDR RGBA8 through the same shader the
-    // display uses. Requires the export GL context.
+    // display uses. Requires the shared GPU device.
     std::vector<uint8_t> tonemapped;
     if (conv.GetColorMode() != VideoColorMode::SDR) {
         if (!EnsureTonemap()) {

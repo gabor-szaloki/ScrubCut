@@ -81,8 +81,8 @@ void FrameConverter::EnsureContext(AVFrame* frame) {
 
     // HDR (PQ/HLG) is kept in 10-bit BT.2020 and tone-mapped on the GPU. SDR
     // collapses straight to 8-bit sRGB as before. X2BGR10LE packs as
-    // (msb)2X 10B 10G 10R(lsb), which matches GL_RGB10_A2 + RGBA +
-    // GL_UNSIGNED_INT_2_10_10_10_REV (R in the low 10 bits) on little-endian.
+    // (msb)2X 10B 10G 10R(lsb), which matches SDL_GPU_TEXTUREFORMAT_
+    // R10G10B10A2_UNORM (R in the low 10 bits) on little-endian.
     const bool hdr = (m_colorMode != VideoColorMode::SDR);
     m_dstFmt = hdr ? AV_PIX_FMT_X2BGR10LE : AV_PIX_FMT_RGBA;
 

@@ -12,7 +12,7 @@
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
-#include <SDL3/SDL_opengl.h>
+#include <SDL3/SDL_gpu.h>
 #include <string>
 #include <vector>
 
@@ -127,7 +127,11 @@ private:
     void UploadFrame(const uint8_t* rgba, int width, int height);
     void SetFullscreen(bool fullscreen);
     void RestoreFloatingWindowSnapshots();
-    void TakeScreenshot();
+    // Ensure m_sceneTarget matches the swapchain size (recreated on resize).
+    bool EnsureSceneTarget(int width, int height);
+    // Record a scene-target download on `cmd`, submit, wait, and write the PNG.
+    // Called instead of a plain submit when a screenshot is pending.
+    void TakeScreenshot(SDL_GPUCommandBuffer* cmd, int width, int height);
 
     // Initialize m_exportDir for an export-dialog open based on mode:
     //   SameAsVideo → opened video's parent
@@ -144,11 +148,9 @@ private:
     bool IsGifSource() const;
 
     SDL_Window* m_window = nullptr;
-    SDL_GLContext m_glContext = nullptr;
-    // Hidden window + GL context handed to the Exporter so it can run the HDR
-    // tone-map shader on its background thread (see Exporter::SetTonemapContext).
-    SDL_Window* m_exportGLWindow = nullptr;
-    SDL_GLContext m_exportGLContext = nullptr;
+    // One GPU device shared by the UI, the tone-mapper, and the Exporter's
+    // background thread (SDL_GPU command buffers are per-thread).
+    SDL_GPUDevice* m_gpuDevice = nullptr;
     UIManager m_ui;
     Settings m_layoutSettings;
     Settings m_prefSettings;
@@ -250,9 +252,16 @@ private:
     std::string m_currentFilePath;
 
     // Display
-    GLuint m_videoTexture = 0;       // source frame (RGBA8 for SDR, RGB10_A2 for HDR)
-    GLuint m_displayTexture = 0;     // texture ImGui composites: == m_videoTexture for
-                                     // SDR, the tone-mapper's SDR output for HDR
+    SDL_GPUTexture* m_videoTexture = nullptr;    // source frame (RGBA8 for SDR, R10G10B10A2 for HDR)
+    SDL_GPUTexture* m_displayTexture = nullptr;  // texture ImGui composites: == m_videoTexture for
+                                                 // SDR, the tone-mapper's SDR output for HDR
+    SDL_GPUTransferBuffer* m_frameTransfer = nullptr;  // persistent upload staging for video frames
+    // Offscreen scene target the whole UI renders into, blitted to the (write-
+    // only) swapchain each frame — needed for F12 screenshots, and keeps the
+    // ImGui pipeline format independent of the swapchain format.
+    SDL_GPUTexture* m_sceneTarget = nullptr;
+    int m_sceneW = 0;
+    int m_sceneH = 0;
     int m_videoWidth = 0;
     int m_videoHeight = 0;
     VideoColorMode m_videoColorMode = VideoColorMode::SDR;

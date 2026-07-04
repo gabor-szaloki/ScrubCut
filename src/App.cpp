@@ -10,10 +10,6 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
-#ifdef _WIN32
-#include <windows.h>
-#include <shellapi.h>
-#endif
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -32,6 +28,7 @@
 #define NOMCX
 #define NOIME
 #include <windows.h>
+#include <shellapi.h>
 // We only need DwmSetWindowAttribute from dwmapi. Forward-declare instead of
 // including <dwmapi.h>, which transitively pulls in <rpcndr.h> and its
 // `small` macro that collides with our parameter names. Linker resolves the
@@ -264,12 +261,6 @@ bool App::Init() {
         return false;
     }
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-
     const char* windowTitle = "ScrubCut";
 #ifndef NDEBUG
     windowTitle = "ScrubCut - Debug";
@@ -281,7 +272,7 @@ bool App::Init() {
     m_window = SDL_CreateWindow(
         windowTitle,
         1280, 720,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
         SDL_WINDOW_HIDDEN
     );
 
@@ -290,35 +281,42 @@ bool App::Init() {
         return false;
     }
 
-    m_glContext = SDL_GL_CreateContext(m_window);
-    if (!m_glContext) {
-        LOG_ERROR("SDL_GL_CreateContext failed: %s", SDL_GetError());
+    // GPU device. The D3D12 fewer-resource-slots property drops the Tier-2
+    // resource-binding requirement (supports older GPUs like Intel
+    // Haswell/Broadwell); legal because we bind no storage resources.
+    {
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXIL_BOOLEAN, true);
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_MSL_BOOLEAN, true);
+        SDL_SetBooleanProperty(props,
+            SDL_PROP_GPU_DEVICE_CREATE_D3D12_ALLOW_FEWER_RESOURCE_SLOTS_BOOLEAN, true);
+#ifndef NDEBUG
+        SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, true);
+#endif
+        m_gpuDevice = SDL_CreateGPUDeviceWithProperties(props);
+        SDL_DestroyProperties(props);
+    }
+    if (!m_gpuDevice) {
+        LOG_ERROR("SDL_CreateGPUDeviceWithProperties failed: %s", SDL_GetError());
+        return false;
+    }
+    LOG_INFO("GPU driver: %s", SDL_GetGPUDeviceDriver(m_gpuDevice));
+
+    // Claiming defaults to SDR composition + VSYNC present mode.
+    if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
+        LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
         return false;
     }
 
-    SDL_GL_MakeCurrent(m_window, m_glContext);
-    SDL_GL_SetSwapInterval(1);
-
     // GPU HDR->SDR tone-mapper. Non-fatal if it fails to init — SDR playback is
     // unaffected; only HDR videos would then display incorrectly.
-    if (!m_tonemap.Init())
+    if (!m_tonemap.Init(m_gpuDevice))
         LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
 
-    // A second, hidden GL context so the Exporter's background thread can run the
-    // same tone-map shader for HDR re-encode exports (GIF/PNG). It shares no
-    // objects with the main context — the Exporter builds its own. Creating a
-    // context makes it current on this thread, so restore the main one after.
-    // Non-fatal: without it, HDR re-encode exports report an error.
-    m_exportGLWindow = SDL_CreateWindow("ScrubCut Export", 1, 1,
-                                        SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
-    if (m_exportGLWindow) {
-        m_exportGLContext = SDL_GL_CreateContext(m_exportGLWindow);
-        SDL_GL_MakeCurrent(m_window, m_glContext);  // restore main context
-    }
-    if (m_exportGLContext)
-        m_exporter.SetTonemapContext(m_exportGLWindow, m_exportGLContext);
-    else
-        LOG_ERROR("Export GL context unavailable; HDR GIF/PNG export will be disabled");
+    // The Exporter's background thread runs the same tone-map pass for HDR
+    // re-encode exports (GIF/PNG) on its own command buffers of this device.
+    m_exporter.SetTonemapDevice(m_gpuDevice);
 
     // Delete layout files before ImGui loads them
     bool resetLayout = CommandLine::Get().HasFlag("-resetlayout");
@@ -327,7 +325,7 @@ bool App::Init() {
         std::filesystem::remove(GetAppDataDir() / "layout.ini");
     }
 
-    if (!m_ui.Init(m_window, m_glContext)) {
+    if (!m_ui.Init(m_window, m_gpuDevice, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM)) {
         LOG_ERROR("UIManager::Init failed");
         return false;
     }
@@ -548,30 +546,33 @@ void App::Shutdown() {
     }
     SDL_ShowCursor();
 
+    // Stop any in-flight export (joins its thread) before tearing down the GPU
+    // resources it may still be using, then drain the GPU before releasing.
+    m_exporter.Cancel();
+    if (m_gpuDevice)
+        SDL_WaitForGPUIdle(m_gpuDevice);
+
     if (m_videoTexture) {
-        glDeleteTextures(1, &m_videoTexture);
-        m_videoTexture = 0;
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);
+        m_videoTexture = nullptr;
     }
-    m_displayTexture = 0;
+    m_displayTexture = nullptr;
+    if (m_frameTransfer) {
+        SDL_ReleaseGPUTransferBuffer(m_gpuDevice, m_frameTransfer);
+        m_frameTransfer = nullptr;
+    }
     m_tonemap.Shutdown();
 
     m_ui.Shutdown();
 
-    // Stop any in-flight export (joins its thread) before tearing down the
-    // export GL context it may still be using.
-    m_exporter.Cancel();
-    if (m_exportGLContext) {
-        SDL_GL_DestroyContext(m_exportGLContext);
-        m_exportGLContext = nullptr;
+    if (m_sceneTarget) {
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_sceneTarget);
+        m_sceneTarget = nullptr;
     }
-    if (m_exportGLWindow) {
-        SDL_DestroyWindow(m_exportGLWindow);
-        m_exportGLWindow = nullptr;
-    }
-
-    if (m_glContext) {
-        SDL_GL_DestroyContext(m_glContext);
-        m_glContext = nullptr;
+    if (m_gpuDevice) {
+        SDL_ReleaseWindowFromGPUDevice(m_gpuDevice, m_window);
+        SDL_DestroyGPUDevice(m_gpuDevice);
+        m_gpuDevice = nullptr;
     }
     if (m_window) {
         SDL_DestroyWindow(m_window);
@@ -584,8 +585,8 @@ void App::Shutdown() {
 
 void App::RequestOpenFile(const std::string& path) {
     // Always defer to main thread — SDL_ShowOpenFileDialog callback may fire
-    // on a non-main thread, and OpenFile uses OpenGL calls that require
-    // the GL context thread.
+    // on a non-main thread, and OpenFile touches GPU resources and player
+    // state owned by the main thread.
     m_pendingOpenFilePath = path;
     if (m_segments.GetCount() > 0)
         m_showOpenFileConfirm = true;
@@ -597,10 +598,10 @@ void App::OpenFile(const std::string& path) {
     m_player.Close();
 
     if (m_videoTexture) {
-        glDeleteTextures(1, &m_videoTexture);
-        m_videoTexture = 0;
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);  // deferred-safe
+        m_videoTexture = nullptr;
     }
-    m_displayTexture = 0;
+    m_displayTexture = nullptr;
     m_videoWidth = 0;
     m_videoHeight = 0;
 
@@ -1334,11 +1335,6 @@ void App::Render() {
     g_tooltipsEnabled = m_showTooltips;
     m_hoveredSegmentThisFrame = -1;
     m_hoveredFrameThisFrame = -1;
-    int w, h;
-    SDL_GetWindowSizeInPixels(m_window, &w, &h);
-    glViewport(0, 0, w, h);
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
 
     // Keep seek target in sync with player when not actively seeking.
     // Use GetSeekTargetTime() which returns the pending seek position immediately
@@ -1856,9 +1852,8 @@ void App::Render() {
             cursor.x + (avail.x - displayW) * 0.5f,
             cursor.y + (avail.y - displayH) * 0.5f
         ));
-        GLuint tex = m_displayTexture ? m_displayTexture : m_videoTexture;
-        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(tex)),
-                      ImVec2(displayW, displayH));
+        SDL_GPUTexture* tex = m_displayTexture ? m_displayTexture : m_videoTexture;
+        ImGui::Image(reinterpret_cast<ImTextureID>(tex), ImVec2(displayW, displayH));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
         // Click the video to toggle play/pause; double-click to toggle
@@ -3553,8 +3548,10 @@ void App::Render() {
         ImGui::Spacing();
         float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
         if (ImGui::Button("Proceed", ImVec2(btnW, 0))) {
-            OpenFile(m_pendingOpenFilePath);
-            m_pendingOpenFilePath.clear();
+            // Defer to Run()'s between-frames open path: this frame's ImGui
+            // draw list already references the current video texture, so
+            // OpenFile (which releases it) must not run mid-frame.
+            m_pendingOpenImmediate = true;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -3565,17 +3562,55 @@ void App::Render() {
         ImGui::EndPopup();
     }
 
-    m_ui.EndFrame();
-
     m_hoveredSegment = m_hoveredSegmentThisFrame;
     m_hoveredFrame = m_hoveredFrameThisFrame;
 
-    if (m_screenshotPending) {
-        TakeScreenshot();
-        m_screenshotPending = false;
+    // Render ImGui into the offscreen scene target, then blit that to the
+    // (write-only) swapchain. On acquire failure or a zero-size swapchain
+    // (minimized), EndFrame(null) still runs ImGui::Render() to keep the frame
+    // lifecycle balanced.
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_gpuDevice);
+    if (!cmd) {
+        LOG_ERROR("Render: command buffer acquire failed: %s", SDL_GetError());
+        m_ui.EndFrame(nullptr, nullptr);
+        return;
     }
 
-    SDL_GL_SwapWindow(m_window);
+    SDL_GPUTexture* swapchain = nullptr;
+    Uint32 swapW = 0, swapH = 0;
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, m_window, &swapchain, &swapW, &swapH)) {
+        LOG_ERROR("Render: swapchain acquire failed: %s", SDL_GetError());
+        m_ui.EndFrame(nullptr, nullptr);
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+    if (!swapchain || swapW == 0 || swapH == 0 ||
+        !EnsureSceneTarget(static_cast<int>(swapW), static_cast<int>(swapH))) {
+        m_ui.EndFrame(nullptr, nullptr);
+        SDL_SubmitGPUCommandBuffer(cmd);
+        return;
+    }
+
+    m_ui.EndFrame(cmd, m_sceneTarget);
+
+    SDL_GPUBlitInfo blit = {};
+    blit.source.texture = m_sceneTarget;
+    blit.source.w = swapW;
+    blit.source.h = swapH;
+    blit.destination.texture = swapchain;
+    blit.destination.w = swapW;
+    blit.destination.h = swapH;
+    blit.load_op = SDL_GPU_LOADOP_DONT_CARE;
+    blit.filter = SDL_GPU_FILTER_NEAREST;  // always 1:1
+    SDL_BlitGPUTexture(cmd, &blit);
+
+    if (m_screenshotPending) {
+        // Downloads the scene target; submits and waits on `cmd` itself.
+        TakeScreenshot(cmd, static_cast<int>(swapW), static_cast<int>(swapH));
+        m_screenshotPending = false;
+    } else {
+        SDL_SubmitGPUCommandBuffer(cmd);
+    }
 }
 
 void App::BumpUIActivity() {
@@ -3591,34 +3626,92 @@ void App::TogglePlayPauseWithFlash() {
 
 void App::CreateVideoTexture(int width, int height) {
     if (m_videoTexture) {
-        glDeleteTextures(1, &m_videoTexture);
-        m_videoTexture = 0;
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);
+        m_videoTexture = nullptr;
+    }
+    if (m_frameTransfer) {
+        SDL_ReleaseGPUTransferBuffer(m_gpuDevice, m_frameTransfer);
+        m_frameTransfer = nullptr;
     }
 
     // HDR frames are 10-bit packed BT.2020 (still PQ/HLG-encoded) and get
     // tone-mapped on the GPU; SDR frames are ready-to-display 8-bit sRGB.
+    // (X2BGR10LE == R10G10B10A2_UNORM, both 4 bytes/pixel.)
     const bool hdr = (m_videoColorMode != VideoColorMode::SDR);
-    const GLint internalFormat = hdr ? GL_RGB10_A2 : GL_RGBA8;
 
-    glGenTextures(1, &m_videoTexture);
-    glBindTexture(GL_TEXTURE_2D, m_videoTexture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    SDL_GPUTextureCreateInfo texInfo = {};
+    texInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    texInfo.format = hdr ? SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM
+                         : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    texInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    texInfo.width = static_cast<Uint32>(width);
+    texInfo.height = static_cast<Uint32>(height);
+    texInfo.layer_count_or_depth = 1;
+    texInfo.num_levels = 1;
+    m_videoTexture = SDL_CreateGPUTexture(m_gpuDevice, &texInfo);
+    if (!m_videoTexture) {
+        LOG_ERROR("CreateVideoTexture failed: %s", SDL_GetError());
+        return;
+    }
+
+    SDL_GPUTransferBufferCreateInfo tbInfo = {};
+    tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    tbInfo.size = static_cast<Uint32>(width) * height * 4;
+    m_frameTransfer = SDL_CreateGPUTransferBuffer(m_gpuDevice, &tbInfo);
+    if (!m_frameTransfer)
+        LOG_ERROR("CreateVideoTexture: transfer buffer failed: %s", SDL_GetError());
 }
 
 void App::UploadFrame(const uint8_t* rgba, int width, int height) {
-    if (!m_videoTexture) return;
-    // FrameConverter packs HDR as AV_PIX_FMT_X2BGR10LE, which matches RGBA +
-    // GL_UNSIGNED_INT_2_10_10_10_REV; SDR is plain RGBA8.
-    const bool hdr = (m_videoColorMode != VideoColorMode::SDR);
-    const GLenum type = hdr ? GL_UNSIGNED_INT_2_10_10_10_REV : GL_UNSIGNED_BYTE;
-    glBindTexture(GL_TEXTURE_2D, m_videoTexture);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, type, rgba);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    if (!m_videoTexture || !m_frameTransfer) return;
+
+    void* mapped = SDL_MapGPUTransferBuffer(m_gpuDevice, m_frameTransfer, true);
+    if (!mapped) return;
+    std::memcpy(mapped, rgba, static_cast<size_t>(width) * height * 4);
+    SDL_UnmapGPUTransferBuffer(m_gpuDevice, m_frameTransfer);
+
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_gpuDevice);
+    if (!cmd) return;
+    SDL_GPUCopyPass* pass = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo src = {};
+    src.transfer_buffer = m_frameTransfer;
+    src.pixels_per_row = static_cast<Uint32>(width);
+    src.rows_per_layer = static_cast<Uint32>(height);
+    SDL_GPUTextureRegion dst = {};
+    dst.texture = m_videoTexture;
+    dst.w = static_cast<Uint32>(width);
+    dst.h = static_cast<Uint32>(height);
+    dst.d = 1;
+    SDL_UploadToGPUTexture(pass, &src, &dst, true);
+    SDL_EndGPUCopyPass(pass);
+    SDL_SubmitGPUCommandBuffer(cmd);
+}
+
+bool App::EnsureSceneTarget(int width, int height) {
+    if (m_sceneTarget && m_sceneW == width && m_sceneH == height)
+        return true;
+
+    if (m_sceneTarget) {
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_sceneTarget);
+        m_sceneTarget = nullptr;
+    }
+
+    SDL_GPUTextureCreateInfo texInfo = {};
+    texInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    texInfo.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    texInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    texInfo.width = static_cast<Uint32>(width);
+    texInfo.height = static_cast<Uint32>(height);
+    texInfo.layer_count_or_depth = 1;
+    texInfo.num_levels = 1;
+    m_sceneTarget = SDL_CreateGPUTexture(m_gpuDevice, &texInfo);
+    if (!m_sceneTarget) {
+        LOG_ERROR("EnsureSceneTarget failed: %s", SDL_GetError());
+        return false;
+    }
+    m_sceneW = width;
+    m_sceneH = height;
+    return true;
 }
 
 float App::GetEffectiveUiScale() const {
@@ -3718,21 +3811,48 @@ void App::InitExportDir() {
     }
 }
 
-void App::TakeScreenshot() {
-    int w = 0, h = 0;
-    SDL_GetWindowSizeInPixels(m_window, &w, &h);
-    if (w <= 0 || h <= 0) { LOG_WARN("Screenshot: invalid window size"); return; }
+void App::TakeScreenshot(SDL_GPUCommandBuffer* cmd, int w, int h) {
+    // Record a download of the scene target onto the frame's command buffer,
+    // then submit it with a fence and wait — a screenshot is rare enough that
+    // one stalled frame doesn't matter. Rows come back top-first, RGBA8.
+    SDL_GPUTransferBufferCreateInfo tbInfo = {};
+    tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    tbInfo.size = static_cast<Uint32>(w) * h * 4;
+    SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(m_gpuDevice, &tbInfo);
+    if (!tb) {
+        LOG_ERROR("Screenshot: transfer buffer failed: %s", SDL_GetError());
+        SDL_SubmitGPUCommandBuffer(cmd);
+        return;
+    }
 
-    std::vector<uint8_t> raw(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadBuffer(GL_BACK);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+    SDL_GPUCopyPass* pass = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureRegion src = {};
+    src.texture = m_sceneTarget;
+    src.w = static_cast<Uint32>(w);
+    src.h = static_cast<Uint32>(h);
+    src.d = 1;
+    SDL_GPUTextureTransferInfo dst = {};
+    dst.transfer_buffer = tb;
+    dst.pixels_per_row = static_cast<Uint32>(w);
+    dst.rows_per_layer = static_cast<Uint32>(h);
+    SDL_DownloadFromGPUTexture(pass, &src, &dst);
+    SDL_EndGPUCopyPass(pass);
 
-    // OpenGL origin is bottom-left; image formats expect top-left. Flip rows.
-    int stride = w * 4;
-    std::vector<uint8_t> flipped(raw.size());
-    for (int y = 0; y < h; y++)
-        std::memcpy(flipped.data() + y * stride, raw.data() + (h - 1 - y) * stride, stride);
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) {
+        LOG_ERROR("Screenshot: submit failed: %s", SDL_GetError());
+        SDL_ReleaseGPUTransferBuffer(m_gpuDevice, tb);
+        return;
+    }
+    SDL_WaitForGPUFences(m_gpuDevice, true, &fence, 1);
+    SDL_ReleaseGPUFence(m_gpuDevice, fence);
+
+    void* mapped = SDL_MapGPUTransferBuffer(m_gpuDevice, tb, false);
+    if (!mapped) {
+        LOG_ERROR("Screenshot: map failed: %s", SDL_GetError());
+        SDL_ReleaseGPUTransferBuffer(m_gpuDevice, tb);
+        return;
+    }
 
     auto dir = GetAppDataDir() / "screenshots";
     std::filesystem::create_directories(dir);
@@ -3741,10 +3861,13 @@ void App::TakeScreenshot() {
     snprintf(name, sizeof(name), "screenshot_%03d.png", m_screenshotCounter);
     auto path = (dir / name).string();
 
-    if (stbi_write_png(path.c_str(), w, h, 4, flipped.data(), stride))
+    if (stbi_write_png(path.c_str(), w, h, 4, mapped, w * 4))
         LOG_INFO("Screenshot saved: %s", path.c_str());
     else
         LOG_ERROR("Screenshot failed to write: %s", path.c_str());
+
+    SDL_UnmapGPUTransferBuffer(m_gpuDevice, tb);
+    SDL_ReleaseGPUTransferBuffer(m_gpuDevice, tb);
 }
 
 void App::RestoreFloatingWindowSnapshots() {
@@ -3805,11 +3928,10 @@ void App::SetFullscreen(bool fullscreen) {
 #ifdef _WIN32
     // SDL_SetWindowFullscreen uses exclusive fullscreen, which causes screen
     // flashing, slow Alt-Tab, and broken overlays. We want borderless fullscreen
-    // instead. However, simply creating a borderless window at the display
-    // resolution with an OpenGL context also triggers exclusive fullscreen due
-    // to a known SDL3/driver issue. The workaround is to set Win32 window styles
-    // directly, which avoids the driver's exclusive fullscreen detection.
-    // See: https://github.com/libsdl-org/SDL/issues/12791
+    // instead, so set the Win32 window styles directly. (Originally this also
+    // dodged a GL-era driver issue that promoted borderless windows to exclusive
+    // fullscreen — https://github.com/libsdl-org/SDL/issues/12791 — and it
+    // keeps the same proven behavior on the SDL_GPU/D3D12 backend.)
     SDL_PropertiesID props = SDL_GetWindowProperties(m_window);
     HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
 

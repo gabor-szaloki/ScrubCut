@@ -21,7 +21,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin)
 # --- Dependencies via vcpkg ---
 find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
-find_package(OpenGL REQUIRED)
 
 # FFmpeg - vcpkg provides config-mode find modules
 find_package(FFMPEG REQUIRED)
@@ -60,17 +59,108 @@ add_custom_target(generate_version
 )
 add_dependencies(ScrubCut generate_version)
 
-# --- Generated shader header (GLSL sources embedded as raw string literals) ---
+# --- Shaders: HLSL compiled at build time to blobs, embedded into a header ---
+# Windows/Linux: the shadercross CLI (vcpkg host tool sdl3-shadercross)
+# produces SPIRV + DXIL + MSL. macOS: vcpkg can't provision shadercross (no
+# DirectX Shader Compiler port there), so glslang compiles HLSL -> SPIRV and
+# spirv-cross derives MSL from it — verified to produce the same MSL interface
+# as shadercross. DXIL isn't produced on macOS; SDL_GPU only uses MSL there.
 set(_SHADER_DIR "${CMAKE_SOURCE_DIR}/src/ui/shaders")
+set(_SHADER_BLOB_DIR "${_GENERATED_DIR}/shaders")
 set(_SHADER_HEADER "${_GENERATED_DIR}/scrubcut_shaders.h")
+file(MAKE_DIRECTORY "${_SHADER_BLOB_DIR}")
+
+# Only the formats the platform's SDL_GPU backends can consume get embedded:
+# D3D12/Vulkan (Windows) and Vulkan (Linux) never load MSL, and Metal (macOS)
+# never loads SPIRV/DXIL — SPIRV is produced on macOS only as the spirv-cross
+# input. The other formats are embedded as empty Blobs.
+set(_SHADER_BLOBS "")
+if(APPLE)
+    set(_SHADER_EMBED_FORMATS "msl")
+    find_program(GLSLANG_EXECUTABLE
+        NAMES glslang glslangValidator
+        PATHS
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_HOST_TRIPLET}/tools/glslang"
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/glslang"
+    )
+    find_program(SPIRV_CROSS_EXECUTABLE
+        NAMES spirv-cross
+        PATHS
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_HOST_TRIPLET}/tools/spirv-cross"
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/spirv-cross"
+    )
+    if(NOT GLSLANG_EXECUTABLE OR NOT SPIRV_CROSS_EXECUTABLE)
+        message(FATAL_ERROR "glslang / spirv-cross not found — both are needed to "
+            "compile the HLSL shaders on macOS (vcpkg installs them as host tools)")
+    endif()
+    foreach(_stage vert frag)
+        set(_spv "${_SHADER_BLOB_DIR}/tonemap.${_stage}.spv")
+        set(_msl "${_SHADER_BLOB_DIR}/tonemap.${_stage}.msl")
+        list(APPEND _SHADER_BLOBS "${_spv}" "${_msl}")
+        add_custom_command(OUTPUT "${_spv}"
+            COMMAND "${GLSLANG_EXECUTABLE}" -D -S ${_stage} -V
+                --hlsl-iomap --auto-map-bindings -e main
+                "${_SHADER_DIR}/tonemap.${_stage}.hlsl" -o "${_spv}"
+            DEPENDS "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
+            COMMENT "glslang tonemap.${_stage}.spv"
+            VERBATIM)
+        add_custom_command(OUTPUT "${_msl}"
+            COMMAND "${SPIRV_CROSS_EXECUTABLE}" "${_spv}"
+                --msl --msl-version 20100
+                --rename-entry-point main main0 ${_stage}
+                --output "${_msl}"
+            DEPENDS "${_spv}"
+            COMMENT "spirv-cross tonemap.${_stage}.msl"
+            VERBATIM)
+    endforeach()
+else()
+    set(_SHADER_EMBED_FORMATS "spv,dxil")
+    find_program(SHADERCROSS_EXECUTABLE
+        NAMES shadercross
+        PATHS
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_HOST_TRIPLET}/tools/sdl3-shadercross"
+            "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/tools/sdl3-shadercross"
+    )
+    if(NOT SHADERCROSS_EXECUTABLE)
+        message(FATAL_ERROR "shadercross not found — needed to compile the HLSL "
+            "shaders (vcpkg installs it as a host tool on Windows/Linux)")
+    endif()
+    foreach(_stage vert frag)
+        if(_stage STREQUAL "vert")
+            set(_stagearg vertex)
+        else()
+            set(_stagearg fragment)
+        endif()
+        foreach(_fmt spv dxil)
+            set(_blob "${_SHADER_BLOB_DIR}/tonemap.${_stage}.${_fmt}")
+            list(APPEND _SHADER_BLOBS "${_blob}")
+            add_custom_command(OUTPUT "${_blob}"
+                COMMAND "${SHADERCROSS_EXECUTABLE}"
+                    "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
+                    -s HLSL -t ${_stagearg} -o "${_blob}"
+                DEPENDS "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
+                COMMENT "shadercross tonemap.${_stage}.${_fmt}"
+                VERBATIM)
+        endforeach()
+    endforeach()
+endif()
+
 add_custom_target(embed_shaders
     COMMAND ${CMAKE_COMMAND}
-        -DSHADER_DIR=${_SHADER_DIR}
+        -DSHADER_BLOB_DIR=${_SHADER_BLOB_DIR}
+        -DFORMATS=${_SHADER_EMBED_FORMATS}
         -DOUTPUT_FILE=${_SHADER_HEADER}
         -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
     BYPRODUCTS ${_SHADER_HEADER}
-    SOURCES ${_SHADER_DIR}/tonemap.vert.glsl ${_SHADER_DIR}/tonemap.frag.glsl
+    DEPENDS ${_SHADER_BLOBS}
+    SOURCES ${_SHADER_DIR}/tonemap.vert.hlsl ${_SHADER_DIR}/tonemap.frag.hlsl
     VERBATIM
+)
+# Keep the VS generator's built-in FXC rule away from the HLSL sources —
+# shadercross is the only compiler for them.
+set_source_files_properties(
+    ${_SHADER_DIR}/tonemap.vert.hlsl ${_SHADER_DIR}/tonemap.frag.hlsl
+    PROPERTIES HEADER_FILE_ONLY ON VS_TOOL_OVERRIDE "None"
 )
 add_dependencies(ScrubCut embed_shaders)
 
@@ -84,7 +174,6 @@ target_include_directories(ScrubCut PRIVATE
 target_link_libraries(ScrubCut PRIVATE
     SDL3::SDL3
     imgui::imgui
-    OpenGL::GL
     ${FFMPEG_LIBRARIES}
 )
 
@@ -119,9 +208,11 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast video scrubbing, trimming, and expor
 if(WIN32)
     install(TARGETS ScrubCut RUNTIME DESTINATION ".")
 
-    # Bundle vcpkg DLLs (FFmpeg, SDL3)
+    # Bundle vcpkg DLLs (FFmpeg, SDL3), excluding the build-time-only shader
+    # toolchain DLLs that sdl3-shadercross drops into bin/
     set(_VCPKG_BIN "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/bin")
     file(GLOB _VCPKG_DLLS "${_VCPKG_BIN}/*.dll")
+    list(FILTER _VCPKG_DLLS EXCLUDE REGEX "(dxcompiler|dxil|SDL3_shadercross|spirv-cross)[^/]*\\.dll$")
     install(FILES ${_VCPKG_DLLS} DESTINATION ".")
 
     # License and icon

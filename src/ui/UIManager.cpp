@@ -8,13 +8,12 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_impl_sdl3.h>
-#include <imgui_impl_opengl3.h>
+#include <imgui_impl_sdlgpu3.h>
 #include "util/AppPaths.h"
 #include "util/Log.h"
 
-bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
-    (void)glContext;
-
+bool UIManager::Init(SDL_Window* window, SDL_GPUDevice* device,
+                     SDL_GPUTextureFormat colorTargetFormat) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
 
@@ -77,9 +76,13 @@ bool UIManager::Init(SDL_Window* window, SDL_GLContext glContext) {
     // Snapshot the unscaled style so SetUiScale can re-apply it cleanly.
     m_baseStyle = style;
 
-    if (!ImGui_ImplSDL3_InitForOpenGL(window, glContext))
+    if (!ImGui_ImplSDL3_InitForSDLGPU(window))
         return false;
-    if (!ImGui_ImplOpenGL3_Init("#version 150"))
+    ImGui_ImplSDLGPU3_InitInfo initInfo = {};
+    initInfo.Device = device;
+    initInfo.ColorTargetFormat = colorTargetFormat;
+    initInfo.MSAASamples = SDL_GPU_SAMPLECOUNT_1;
+    if (!ImGui_ImplSDLGPU3_Init(&initInfo))
         return false;
 
     return true;
@@ -138,22 +141,38 @@ void UIManager::SetUiScale(float scale) {
 }
 
 void UIManager::Shutdown() {
-    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDLGPU3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
 
 void UIManager::BeginFrame() {
-    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDLGPU3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
     SetupDockspace();
 }
 
-void UIManager::EndFrame() {
+void UIManager::EndFrame(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target) {
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (!cmd || !target)
+        return;
+
+    ImDrawData* drawData = ImGui::GetDrawData();
+    // Uploads vertex/index data; must happen before the render pass begins.
+    ImGui_ImplSDLGPU3_PrepareDrawData(drawData, cmd);
+
+    SDL_GPUColorTargetInfo targetInfo = {};
+    targetInfo.texture = target;
+    targetInfo.load_op = SDL_GPU_LOADOP_CLEAR;
+    targetInfo.clear_color = SDL_FColor{0.1f, 0.1f, 0.1f, 1.0f};
+    targetInfo.store_op = SDL_GPU_STOREOP_STORE;
+    targetInfo.cycle = true;
+
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &targetInfo, 1, nullptr);
+    ImGui_ImplSDLGPU3_RenderDrawData(drawData, cmd, pass);
+    SDL_EndGPURenderPass(pass);
 }
 
 void UIManager::SetupDockspace() {

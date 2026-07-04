@@ -9,7 +9,23 @@
     "sdl3",
     {
       "name": "imgui",
-      "features": ["docking-experimental", "sdl3-binding", "opengl3-binding", "freetype"]
+      "features": ["docking-experimental", "sdl3-binding", "sdlgpu3-binding", "freetype"]
+    },
+    {
+      "name": "sdl3-shadercross",
+      "host": true,
+      "platform": "windows | linux"
+    },
+    {
+      "name": "glslang",
+      "features": ["tools"],
+      "host": true,
+      "platform": "osx"
+    },
+    {
+      "name": "spirv-cross",
+      "host": true,
+      "platform": "osx"
     }
   ]
 }

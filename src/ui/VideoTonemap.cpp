@@ -1,113 +1,112 @@
 #include "ui/VideoTonemap.h"
-#include "scrubcut_shaders.h"  // generated from src/ui/shaders/*.glsl (see EmbedShaders.cmake)
+#include "scrubcut_shaders.h"  // generated from src/ui/shaders/compiled/* (see EmbedShaders.cmake)
 #include "util/Log.h"
 
 #include <SDL3/SDL.h>
 
-using tonemap_shader::kFragmentSrc;
-using tonemap_shader::kVertexSrc;
+#include <cstring>
+
+// Matches cbuffer TonemapParams in tonemap.frag.hlsl (b0, space3).
+struct TonemapParams {
+    int32_t transfer;    // 0 = PQ, 1 = HLG
+    int32_t primaries;   // VideoColorPrimaries
+    int32_t tonemapper;  // Tonemapper
+    float exposure;
+};
 
 VideoTonemap::~VideoTonemap() {
     Shutdown();
 }
 
-bool VideoTonemap::LoadProcs() {
-    bool ok = true;
-    auto load = [&](auto& fn, const char* name) {
-        fn = reinterpret_cast<std::decay_t<decltype(fn)>>(SDL_GL_GetProcAddress(name));
-        if (!fn) {
-            LOG_ERROR("VideoTonemap: missing GL entry point %s", name);
-            ok = false;
-        }
-    };
-    load(m_glCreateShader, "glCreateShader");
-    load(m_glShaderSource, "glShaderSource");
-    load(m_glCompileShader, "glCompileShader");
-    load(m_glGetShaderiv, "glGetShaderiv");
-    load(m_glGetShaderInfoLog, "glGetShaderInfoLog");
-    load(m_glCreateProgram, "glCreateProgram");
-    load(m_glAttachShader, "glAttachShader");
-    load(m_glLinkProgram, "glLinkProgram");
-    load(m_glGetProgramiv, "glGetProgramiv");
-    load(m_glGetProgramInfoLog, "glGetProgramInfoLog");
-    load(m_glDeleteShader, "glDeleteShader");
-    load(m_glDeleteProgram, "glDeleteProgram");
-    load(m_glUseProgram, "glUseProgram");
-    load(m_glGetUniformLocation, "glGetUniformLocation");
-    load(m_glUniform1i, "glUniform1i");
-    load(m_glUniform1f, "glUniform1f");
-    load(m_glGenVertexArrays, "glGenVertexArrays");
-    load(m_glBindVertexArray, "glBindVertexArray");
-    load(m_glDeleteVertexArrays, "glDeleteVertexArrays");
-    load(m_glGenFramebuffers, "glGenFramebuffers");
-    load(m_glBindFramebuffer, "glBindFramebuffer");
-    load(m_glFramebufferTexture2D, "glFramebufferTexture2D");
-    load(m_glCheckFramebufferStatus, "glCheckFramebufferStatus");
-    load(m_glDeleteFramebuffers, "glDeleteFramebuffers");
-    load(m_glActiveTexture, "glActiveTexture");
-    return ok;
-}
-
-static GLuint CompileShader(PFNGLCREATESHADERPROC create,
-                            PFNGLSHADERSOURCEPROC source, PFNGLCOMPILESHADERPROC compile,
-                            PFNGLGETSHADERIVPROC getiv, PFNGLGETSHADERINFOLOGPROC getlog,
-                            GLenum type, const char* src) {
-    GLuint sh = create(type);
-    source(sh, 1, &src, nullptr);
-    compile(sh);
-    GLint ok = GL_FALSE;
-    getiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[1024] = {0};
-        getlog(sh, sizeof(log), nullptr, log);
-        LOG_ERROR("VideoTonemap: shader compile failed: %s", log);
-        return 0;
-    }
-    return sh;
-}
-
-bool VideoTonemap::Init() {
+bool VideoTonemap::Init(SDL_GPUDevice* device) {
     if (m_ready) return true;
-    if (!LoadProcs()) {
-        Shutdown();
+    m_device = device;
+
+    // Pick the shader format the device accepts. A format's blob can be empty
+    // when it isn't compiled on this platform (DXIL on macOS) — skip those.
+    const SDL_GPUShaderFormat avail = SDL_GetGPUShaderFormats(device);
+    SDL_GPUShaderFormat format;
+    tonemap_shader::Blob vertBlob, fragBlob;
+    const char* entrypoint;
+    if ((avail & SDL_GPU_SHADERFORMAT_MSL) && tonemap_shader::kFragMsl.size) {
+        format = SDL_GPU_SHADERFORMAT_MSL;
+        vertBlob = tonemap_shader::kVertMsl;
+        fragBlob = tonemap_shader::kFragMsl;
+        entrypoint = "main0";  // SPIRV-Cross renames `main` when emitting MSL
+    } else if ((avail & SDL_GPU_SHADERFORMAT_DXIL) && tonemap_shader::kFragDxil.size) {
+        format = SDL_GPU_SHADERFORMAT_DXIL;
+        vertBlob = tonemap_shader::kVertDxil;
+        fragBlob = tonemap_shader::kFragDxil;
+        entrypoint = "main";
+    } else if ((avail & SDL_GPU_SHADERFORMAT_SPIRV) && tonemap_shader::kFragSpirv.size) {
+        format = SDL_GPU_SHADERFORMAT_SPIRV;
+        vertBlob = tonemap_shader::kVertSpirv;
+        fragBlob = tonemap_shader::kFragSpirv;
+        entrypoint = "main";
+    } else {
+        LOG_ERROR("VideoTonemap: no embedded shader for the device's formats (0x%x)", avail);
         return false;
     }
 
-    GLuint vs = CompileShader(m_glCreateShader, m_glShaderSource, m_glCompileShader,
-                              m_glGetShaderiv, m_glGetShaderInfoLog, GL_VERTEX_SHADER, kVertexSrc);
-    GLuint fs = CompileShader(m_glCreateShader, m_glShaderSource, m_glCompileShader,
-                              m_glGetShaderiv, m_glGetShaderInfoLog, GL_FRAGMENT_SHADER, kFragmentSrc);
+    SDL_GPUShaderCreateInfo vsInfo = {};
+    vsInfo.code = vertBlob.data;
+    vsInfo.code_size = vertBlob.size;
+    vsInfo.entrypoint = entrypoint;
+    vsInfo.format = format;
+    vsInfo.stage = SDL_GPU_SHADERSTAGE_VERTEX;
+    SDL_GPUShader* vs = SDL_CreateGPUShader(device, &vsInfo);
+
+    SDL_GPUShaderCreateInfo fsInfo = {};
+    fsInfo.code = fragBlob.data;
+    fsInfo.code_size = fragBlob.size;
+    fsInfo.entrypoint = entrypoint;
+    fsInfo.format = format;
+    fsInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+    fsInfo.num_samplers = 1;
+    fsInfo.num_uniform_buffers = 1;
+    SDL_GPUShader* fs = SDL_CreateGPUShader(device, &fsInfo);
+
     if (!vs || !fs) {
-        if (vs) m_glDeleteShader(vs);
-        if (fs) m_glDeleteShader(fs);
+        LOG_ERROR("VideoTonemap: shader creation failed: %s", SDL_GetError());
+        if (vs) SDL_ReleaseGPUShader(device, vs);
+        if (fs) SDL_ReleaseGPUShader(device, fs);
         Shutdown();
         return false;
     }
 
-    m_program = m_glCreateProgram();
-    m_glAttachShader(m_program, vs);
-    m_glAttachShader(m_program, fs);
-    m_glLinkProgram(m_program);
-    GLint linked = GL_FALSE;
-    m_glGetProgramiv(m_program, GL_LINK_STATUS, &linked);
-    m_glDeleteShader(vs);
-    m_glDeleteShader(fs);
-    if (!linked) {
-        char log[1024] = {0};
-        m_glGetProgramInfoLog(m_program, sizeof(log), nullptr, log);
-        LOG_ERROR("VideoTonemap: program link failed: %s", log);
+    // Fullscreen triangle: no vertex input, no cull/depth/blend, one RGBA8 target.
+    SDL_GPUColorTargetDescription colorTarget = {};
+    colorTarget.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+
+    SDL_GPUGraphicsPipelineCreateInfo pipeInfo = {};
+    pipeInfo.vertex_shader = vs;
+    pipeInfo.fragment_shader = fs;
+    pipeInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pipeInfo.target_info.color_target_descriptions = &colorTarget;
+    pipeInfo.target_info.num_color_targets = 1;
+    m_pipeline = SDL_CreateGPUGraphicsPipeline(device, &pipeInfo);
+
+    SDL_ReleaseGPUShader(device, vs);
+    SDL_ReleaseGPUShader(device, fs);
+
+    if (!m_pipeline) {
+        LOG_ERROR("VideoTonemap: pipeline creation failed: %s", SDL_GetError());
         Shutdown();
         return false;
     }
 
-    m_uTex = m_glGetUniformLocation(m_program, "uTex");
-    m_uTransfer = m_glGetUniformLocation(m_program, "uTransfer");
-    m_uPrimaries = m_glGetUniformLocation(m_program, "uPrimaries");
-    m_uTonemapper = m_glGetUniformLocation(m_program, "uTonemapper");
-    m_uExposure = m_glGetUniformLocation(m_program, "uExposure");
-
-    m_glGenVertexArrays(1, &m_vao);
-    m_glGenFramebuffers(1, &m_fbo);
+    SDL_GPUSamplerCreateInfo samplerInfo = {};
+    samplerInfo.min_filter = SDL_GPU_FILTER_LINEAR;
+    samplerInfo.mag_filter = SDL_GPU_FILTER_LINEAR;
+    samplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    m_sampler = SDL_CreateGPUSampler(device, &samplerInfo);
+    if (!m_sampler) {
+        LOG_ERROR("VideoTonemap: sampler creation failed: %s", SDL_GetError());
+        Shutdown();
+        return false;
+    }
 
     m_ready = true;
     return true;
@@ -117,22 +116,22 @@ bool VideoTonemap::EnsureTarget(int width, int height) {
     if (m_outTex && m_outW == width && m_outH == height)
         return true;
 
-    if (!m_outTex)
-        glGenTextures(1, &m_outTex);
-    glBindTexture(GL_TEXTURE_2D, m_outTex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    if (m_outTex) {
+        SDL_ReleaseGPUTexture(m_device, m_outTex);
+        m_outTex = nullptr;
+    }
 
-    m_glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
-    m_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_outTex, 0);
-    GLenum status = m_glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    m_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        LOG_ERROR("VideoTonemap: incomplete framebuffer (0x%x)", status);
+    SDL_GPUTextureCreateInfo texInfo = {};
+    texInfo.type = SDL_GPU_TEXTURETYPE_2D;
+    texInfo.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    texInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    texInfo.width = static_cast<Uint32>(width);
+    texInfo.height = static_cast<Uint32>(height);
+    texInfo.layer_count_or_depth = 1;
+    texInfo.num_levels = 1;
+    m_outTex = SDL_CreateGPUTexture(m_device, &texInfo);
+    if (!m_outTex) {
+        LOG_ERROR("VideoTonemap: target texture creation failed: %s", SDL_GetError());
         return false;
     }
 
@@ -141,54 +140,47 @@ bool VideoTonemap::EnsureTarget(int width, int height) {
     return true;
 }
 
-void VideoTonemap::RenderPass(GLuint srcTex, int width, int height, VideoColorMode mode,
-                              VideoColorPrimaries primaries, Tonemapper tonemapper) {
-    m_glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
-    glViewport(0, 0, width, height);
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_SCISSOR_TEST);
+void VideoTonemap::RecordRenderPass(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* srcTex,
+                                    VideoColorMode mode, VideoColorPrimaries primaries,
+                                    Tonemapper tonemapper) {
+    TonemapParams params = {};
+    params.transfer = (mode == VideoColorMode::HDR_HLG) ? 1 : 0;
+    params.primaries = static_cast<int32_t>(primaries);
+    params.tonemapper = static_cast<int32_t>(tonemapper);
+    params.exposure = 1.0f;
+    SDL_PushGPUFragmentUniformData(cmd, 0, &params, sizeof(params));
 
-    m_glUseProgram(m_program);
-    m_glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, srcTex);
-    if (m_uTex >= 0) m_glUniform1i(m_uTex, 0);
-    if (m_uTransfer >= 0) m_glUniform1i(m_uTransfer, mode == VideoColorMode::HDR_HLG ? 1 : 0);
-    if (m_uPrimaries >= 0) m_glUniform1i(m_uPrimaries, static_cast<int>(primaries));
-    if (m_uTonemapper >= 0) m_glUniform1i(m_uTonemapper, static_cast<int>(tonemapper));
-    if (m_uExposure >= 0) m_glUniform1f(m_uExposure, 1.0f);
+    SDL_GPUColorTargetInfo target = {};
+    target.texture = m_outTex;
+    target.load_op = SDL_GPU_LOADOP_DONT_CARE;  // fullscreen triangle covers everything
+    target.store_op = SDL_GPU_STOREOP_STORE;
+    target.cycle = true;
 
-    m_glBindVertexArray(m_vao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    m_glBindVertexArray(0);
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, nullptr);
+    SDL_BindGPUGraphicsPipeline(pass, m_pipeline);
+    SDL_GPUTextureSamplerBinding binding = {};
+    binding.texture = srcTex;
+    binding.sampler = m_sampler;
+    SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+    SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+    SDL_EndGPURenderPass(pass);
 }
 
-GLuint VideoTonemap::Process(GLuint srcTex, int width, int height, VideoColorMode mode,
-                             VideoColorPrimaries primaries, Tonemapper tonemapper) {
-    if (!m_ready || width <= 0 || height <= 0)
-        return 0;
+SDL_GPUTexture* VideoTonemap::Process(SDL_GPUTexture* srcTex, int width, int height,
+                                      VideoColorMode mode, VideoColorPrimaries primaries,
+                                      Tonemapper tonemapper) {
+    if (!m_ready || !srcTex || width <= 0 || height <= 0)
+        return nullptr;
     if (!EnsureTarget(width, height))
-        return 0;
+        return nullptr;
 
-    // Save the state we touch so the subsequent ImGui pass is undisturbed.
-    GLint prevFbo = 0;
-    GLint prevViewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    GLboolean blend = glIsEnabled(GL_BLEND);
-    GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
-
-    RenderPass(srcTex, width, height, mode, primaries, tonemapper);
-
-    // Restore state.
-    glBindTexture(GL_TEXTURE_2D, 0);
-    m_glUseProgram(0);
-    m_glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-    if (blend) glEnable(GL_BLEND);
-    if (depth) glEnable(GL_DEPTH_TEST);
-    if (scissor) glEnable(GL_SCISSOR_TEST);
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_device);
+    if (!cmd) {
+        LOG_ERROR("VideoTonemap: command buffer acquire failed: %s", SDL_GetError());
+        return nullptr;
+    }
+    RecordRenderPass(cmd, srcTex, mode, primaries, tonemapper);
+    SDL_SubmitGPUCommandBuffer(cmd);
 
     return m_outTex;
 }
@@ -201,69 +193,142 @@ bool VideoTonemap::RenderToBuffer(const uint8_t* src, int width, int height, Vid
     if (!EnsureTarget(width, height))
         return false;
 
-    // Upload the packed 10-bit source into a GL_RGB10_A2 texture — same format
-    // the display path uses for HDR frames (X2BGR10LE == RGBA + REV_2_10_10_10).
-    if (!m_inTex)
-        glGenTextures(1, &m_inTex);
-    glBindTexture(GL_TEXTURE_2D, m_inTex);
-    if (m_inW != width || m_inH != height) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB10_A2, width, height, 0, GL_RGBA,
-                     GL_UNSIGNED_INT_2_10_10_10_REV, src);
+    const Uint32 byteSize = static_cast<Uint32>(width) * height * 4;
+
+    // Source texture + upload transfer buffer for the packed 10-bit data —
+    // same format equivalence the display path uses for HDR frames
+    // (X2BGR10LE == R10G10B10A2_UNORM).
+    if (m_inTex && (m_inW != width || m_inH != height)) {
+        SDL_ReleaseGPUTexture(m_device, m_inTex);
+        m_inTex = nullptr;
+        if (m_uploadTB) {
+            SDL_ReleaseGPUTransferBuffer(m_device, m_uploadTB);
+            m_uploadTB = nullptr;
+        }
+    }
+    if (!m_inTex) {
+        SDL_GPUTextureCreateInfo texInfo = {};
+        texInfo.type = SDL_GPU_TEXTURETYPE_2D;
+        texInfo.format = SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM;
+        texInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        texInfo.width = static_cast<Uint32>(width);
+        texInfo.height = static_cast<Uint32>(height);
+        texInfo.layer_count_or_depth = 1;
+        texInfo.num_levels = 1;
+        m_inTex = SDL_CreateGPUTexture(m_device, &texInfo);
+
+        SDL_GPUTransferBufferCreateInfo tbInfo = {};
+        tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        tbInfo.size = byteSize;
+        m_uploadTB = SDL_CreateGPUTransferBuffer(m_device, &tbInfo);
+
+        if (!m_inTex || !m_uploadTB) {
+            LOG_ERROR("VideoTonemap: source texture/transfer buffer creation failed: %s",
+                      SDL_GetError());
+            return false;
+        }
         m_inW = width;
         m_inH = height;
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
-                        GL_UNSIGNED_INT_2_10_10_10_REV, src);
     }
-    glBindTexture(GL_TEXTURE_2D, 0);
 
-    GLint prevFbo = 0;
-    GLint prevViewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    if (m_downloadTB && (m_downloadW != width || m_downloadH != height)) {
+        SDL_ReleaseGPUTransferBuffer(m_device, m_downloadTB);
+        m_downloadTB = nullptr;
+    }
+    if (!m_downloadTB) {
+        SDL_GPUTransferBufferCreateInfo tbInfo = {};
+        tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+        tbInfo.size = byteSize;
+        m_downloadTB = SDL_CreateGPUTransferBuffer(m_device, &tbInfo);
+        if (!m_downloadTB) {
+            LOG_ERROR("VideoTonemap: download transfer buffer creation failed: %s", SDL_GetError());
+            return false;
+        }
+        m_downloadW = width;
+        m_downloadH = height;
+    }
 
-    RenderPass(m_inTex, width, height, mode, primaries, tonemapper);
+    void* mapped = SDL_MapGPUTransferBuffer(m_device, m_uploadTB, true);
+    if (!mapped) {
+        LOG_ERROR("VideoTonemap: transfer buffer map failed: %s", SDL_GetError());
+        return false;
+    }
+    std::memcpy(mapped, src, byteSize);
+    SDL_UnmapGPUTransferBuffer(m_device, m_uploadTB);
 
-    // Read the SDR result back while the FBO is still bound. The fullscreen
-    // triangle maps image-top to the FBO's bottom row, and glReadPixels returns
-    // bottom-to-top, so the first row read is the image top — no flip needed.
-    outRGBA.resize(static_cast<size_t>(width) * height * 4);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, outRGBA.data());
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_device);
+    if (!cmd) {
+        LOG_ERROR("VideoTonemap: command buffer acquire failed: %s", SDL_GetError());
+        return false;
+    }
 
-    glBindTexture(GL_TEXTURE_2D, 0);
-    m_glUseProgram(0);
-    m_glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    // One command buffer: upload -> tone-map pass -> download.
+    SDL_GPUCopyPass* upload = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo uploadSrc = {};
+    uploadSrc.transfer_buffer = m_uploadTB;
+    uploadSrc.pixels_per_row = static_cast<Uint32>(width);
+    uploadSrc.rows_per_layer = static_cast<Uint32>(height);
+    SDL_GPUTextureRegion uploadDst = {};
+    uploadDst.texture = m_inTex;
+    uploadDst.w = static_cast<Uint32>(width);
+    uploadDst.h = static_cast<Uint32>(height);
+    uploadDst.d = 1;
+    SDL_UploadToGPUTexture(upload, &uploadSrc, &uploadDst, true);
+    SDL_EndGPUCopyPass(upload);
+
+    RecordRenderPass(cmd, m_inTex, mode, primaries, tonemapper);
+
+    SDL_GPUCopyPass* download = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureRegion downloadSrc = {};
+    downloadSrc.texture = m_outTex;
+    downloadSrc.w = static_cast<Uint32>(width);
+    downloadSrc.h = static_cast<Uint32>(height);
+    downloadSrc.d = 1;
+    SDL_GPUTextureTransferInfo downloadDst = {};
+    downloadDst.transfer_buffer = m_downloadTB;
+    downloadDst.pixels_per_row = static_cast<Uint32>(width);
+    downloadDst.rows_per_layer = static_cast<Uint32>(height);
+    SDL_DownloadFromGPUTexture(download, &downloadSrc, &downloadDst);
+    SDL_EndGPUCopyPass(download);
+
+    SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    if (!fence) {
+        LOG_ERROR("VideoTonemap: submit failed: %s", SDL_GetError());
+        return false;
+    }
+    SDL_WaitForGPUFences(m_device, true, &fence, 1);
+    SDL_ReleaseGPUFence(m_device, fence);
+
+    // Rows come back top-first (SDL_GPU standardizes top-left texture origin).
+    mapped = SDL_MapGPUTransferBuffer(m_device, m_downloadTB, false);
+    if (!mapped) {
+        LOG_ERROR("VideoTonemap: download map failed: %s", SDL_GetError());
+        return false;
+    }
+    outRGBA.resize(byteSize);
+    std::memcpy(outRGBA.data(), mapped, byteSize);
+    SDL_UnmapGPUTransferBuffer(m_device, m_downloadTB);
     return true;
 }
 
 void VideoTonemap::Shutdown() {
-    if (m_outTex) {
-        glDeleteTextures(1, &m_outTex);
-        m_outTex = 0;
+    if (m_device) {
+        if (m_uploadTB) SDL_ReleaseGPUTransferBuffer(m_device, m_uploadTB);
+        if (m_downloadTB) SDL_ReleaseGPUTransferBuffer(m_device, m_downloadTB);
+        if (m_inTex) SDL_ReleaseGPUTexture(m_device, m_inTex);
+        if (m_outTex) SDL_ReleaseGPUTexture(m_device, m_outTex);
+        if (m_sampler) SDL_ReleaseGPUSampler(m_device, m_sampler);
+        if (m_pipeline) SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
     }
-    if (m_inTex) {
-        glDeleteTextures(1, &m_inTex);
-        m_inTex = 0;
-    }
+    m_uploadTB = nullptr;
+    m_downloadTB = nullptr;
+    m_inTex = nullptr;
+    m_outTex = nullptr;
+    m_sampler = nullptr;
+    m_pipeline = nullptr;
+    m_device = nullptr;
     m_inW = m_inH = 0;
-    if (m_fbo && m_glDeleteFramebuffers) {
-        m_glDeleteFramebuffers(1, &m_fbo);
-        m_fbo = 0;
-    }
-    if (m_vao && m_glDeleteVertexArrays) {
-        m_glDeleteVertexArrays(1, &m_vao);
-        m_vao = 0;
-    }
-    if (m_program && m_glDeleteProgram) {
-        m_glDeleteProgram(m_program);
-        m_program = 0;
-    }
     m_outW = m_outH = 0;
+    m_downloadW = m_downloadH = 0;
     m_ready = false;
 }
