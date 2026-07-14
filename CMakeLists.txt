@@ -40,6 +40,10 @@ if(WIN32)
         @ONLY
     )
     set(APP_ICON_RC "${CMAKE_BINARY_DIR}/ScrubCut.rc")
+    # UTF-8 active code page manifest (merged into the exe by the manifest
+    # tool) — makes narrow-string path APIs treat the UTF-8 paths we pass
+    # around correctly. See the comment in the manifest itself.
+    list(APPEND APP_ICON_RC "${CMAKE_SOURCE_DIR}/platform/windows/utf8.manifest")
 endif()
 
 add_executable(ScrubCut WIN32 ${SOURCES} ${APP_ICON_RC})
