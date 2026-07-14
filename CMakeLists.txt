@@ -71,6 +71,10 @@ set(_SHADER_BLOB_DIR "${_GENERATED_DIR}/shaders")
 set(_SHADER_HEADER "${_GENERATED_DIR}/scrubcut_shaders.h")
 file(MAKE_DIRECTORY "${_SHADER_BLOB_DIR}")
 
+# <basename>.<stage>.hlsl sources to compile; keep in sync with the symbol
+# list in cmake/EmbedShaders.cmake.
+set(_SHADER_SOURCES tonemap.vert tonemap.frag composite.frag)
+
 # Only the formats the platform's SDL_GPU backends can consume get embedded:
 # D3D12/Vulkan (Windows) and Vulkan (Linux) never load MSL, and Metal (macOS)
 # never loads SPIRV/DXBC — SPIRV is produced on macOS only as the spirv-cross
@@ -94,16 +98,17 @@ if(APPLE)
         message(FATAL_ERROR "glslang / spirv-cross not found — both are needed to "
             "compile the HLSL shaders on macOS (vcpkg installs them as host tools)")
     endif()
-    foreach(_stage vert frag)
-        set(_spv "${_SHADER_BLOB_DIR}/tonemap.${_stage}.spv")
-        set(_msl "${_SHADER_BLOB_DIR}/tonemap.${_stage}.msl")
+    foreach(_shader ${_SHADER_SOURCES})
+        string(REGEX REPLACE ".*\\." "" _stage "${_shader}")
+        set(_spv "${_SHADER_BLOB_DIR}/${_shader}.spv")
+        set(_msl "${_SHADER_BLOB_DIR}/${_shader}.msl")
         list(APPEND _SHADER_BLOBS "${_spv}" "${_msl}")
         add_custom_command(OUTPUT "${_spv}"
             COMMAND "${GLSLANG_EXECUTABLE}" -D -S ${_stage} -V
                 --hlsl-iomap --auto-map-bindings -e main
-                "${_SHADER_DIR}/tonemap.${_stage}.hlsl" -o "${_spv}"
-            DEPENDS "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
-            COMMENT "glslang tonemap.${_stage}.spv"
+                "${_SHADER_DIR}/${_shader}.hlsl" -o "${_spv}"
+            DEPENDS "${_SHADER_DIR}/${_shader}.hlsl"
+            COMMENT "glslang ${_shader}.spv"
             VERBATIM)
         add_custom_command(OUTPUT "${_msl}"
             COMMAND "${SPIRV_CROSS_EXECUTABLE}" "${_spv}"
@@ -111,7 +116,7 @@ if(APPLE)
                 --rename-entry-point main main0 ${_stage}
                 --output "${_msl}"
             DEPENDS "${_spv}"
-            COMMENT "spirv-cross tonemap.${_stage}.msl"
+            COMMENT "spirv-cross ${_shader}.msl"
             VERBATIM)
     endforeach()
 else()
@@ -126,25 +131,31 @@ else()
         message(FATAL_ERROR "shadercross not found — needed to compile the HLSL "
             "shaders (vcpkg installs it as a host tool on Windows/Linux)")
     endif()
-    foreach(_stage vert frag)
+    foreach(_shader ${_SHADER_SOURCES})
+        string(REGEX REPLACE ".*\\." "" _stage "${_shader}")
         if(_stage STREQUAL "vert")
             set(_stagearg vertex)
         else()
             set(_stagearg fragment)
         endif()
         foreach(_fmt spv dxbc)
-            set(_blob "${_SHADER_BLOB_DIR}/tonemap.${_stage}.${_fmt}")
+            set(_blob "${_SHADER_BLOB_DIR}/${_shader}.${_fmt}")
             list(APPEND _SHADER_BLOBS "${_blob}")
             add_custom_command(OUTPUT "${_blob}"
                 COMMAND "${SHADERCROSS_EXECUTABLE}"
-                    "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
+                    "${_SHADER_DIR}/${_shader}.hlsl"
                     -s HLSL -t ${_stagearg} -o "${_blob}"
-                DEPENDS "${_SHADER_DIR}/tonemap.${_stage}.hlsl"
-                COMMENT "shadercross tonemap.${_stage}.${_fmt}"
+                DEPENDS "${_SHADER_DIR}/${_shader}.hlsl"
+                COMMENT "shadercross ${_shader}.${_fmt}"
                 VERBATIM)
         endforeach()
     endforeach()
 endif()
+
+set(_SHADER_HLSL_FILES "")
+foreach(_shader ${_SHADER_SOURCES})
+    list(APPEND _SHADER_HLSL_FILES "${_SHADER_DIR}/${_shader}.hlsl")
+endforeach()
 
 add_custom_target(embed_shaders
     COMMAND ${CMAKE_COMMAND}
@@ -154,13 +165,13 @@ add_custom_target(embed_shaders
         -P ${CMAKE_SOURCE_DIR}/cmake/EmbedShaders.cmake
     BYPRODUCTS ${_SHADER_HEADER}
     DEPENDS ${_SHADER_BLOBS}
-    SOURCES ${_SHADER_DIR}/tonemap.vert.hlsl ${_SHADER_DIR}/tonemap.frag.hlsl
+    SOURCES ${_SHADER_HLSL_FILES}
     VERBATIM
 )
 # Keep the VS generator's built-in FXC rule away from the HLSL sources —
 # shadercross is the only compiler for them.
 set_source_files_properties(
-    ${_SHADER_DIR}/tonemap.vert.hlsl ${_SHADER_DIR}/tonemap.frag.hlsl
+    ${_SHADER_HLSL_FILES}
     PROPERTIES HEADER_FILE_ONLY ON VS_TOOL_OVERRIDE "None"
 )
 add_dependencies(ScrubCut embed_shaders)
@@ -182,9 +193,10 @@ target_link_libraries(ScrubCut PRIVATE
     ${FFMPEG_LIBRARIES}
 )
 
-# Link ws2_32 and friends on Windows (needed by FFmpeg)
+# Link ws2_32 and friends on Windows (needed by FFmpeg), dxgi for the native
+# HDR-state query in App.cpp
 if(WIN32)
-    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi)
 endif()
 
 # FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the

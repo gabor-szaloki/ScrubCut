@@ -12,6 +12,10 @@ struct TonemapParams {
     int32_t primaries;   // VideoColorPrimaries
     int32_t tonemapper;  // Tonemapper
     float exposure;
+    int32_t outputMode;  // 0 = SDR tone-map, 1 = HDR passthrough
+    float headroom;      // display headroom in SDR-white units
+    float sdrWhite;      // OS SDR white in scRGB units (passthrough only)
+    float pad0 = 0.0f;
 };
 
 VideoTonemap::~VideoTonemap() {
@@ -74,7 +78,9 @@ bool VideoTonemap::Init(SDL_GPUDevice* device) {
         return false;
     }
 
-    // Fullscreen triangle: no vertex input, no cull/depth/blend, one RGBA8 target.
+    // Fullscreen triangle: no vertex input, no cull/depth/blend, one color
+    // target. Two pipelines: RGBA8 for SDR tone-mapping, FP16 for HDR
+    // passthrough (the target format is baked into the pipeline).
     SDL_GPUColorTargetDescription colorTarget = {};
     colorTarget.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 
@@ -86,10 +92,13 @@ bool VideoTonemap::Init(SDL_GPUDevice* device) {
     pipeInfo.target_info.num_color_targets = 1;
     m_pipeline = SDL_CreateGPUGraphicsPipeline(device, &pipeInfo);
 
+    colorTarget.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    m_pipelineFP16 = SDL_CreateGPUGraphicsPipeline(device, &pipeInfo);
+
     SDL_ReleaseGPUShader(device, vs);
     SDL_ReleaseGPUShader(device, fs);
 
-    if (!m_pipeline) {
+    if (!m_pipeline || !m_pipelineFP16) {
         LOG_ERROR("VideoTonemap: pipeline creation failed: %s", SDL_GetError());
         Shutdown();
         return false;
@@ -112,8 +121,8 @@ bool VideoTonemap::Init(SDL_GPUDevice* device) {
     return true;
 }
 
-bool VideoTonemap::EnsureTarget(int width, int height) {
-    if (m_outTex && m_outW == width && m_outH == height)
+bool VideoTonemap::EnsureTarget(int width, int height, SDL_GPUTextureFormat format) {
+    if (m_outTex && m_outW == width && m_outH == height && m_outFormat == format)
         return true;
 
     if (m_outTex) {
@@ -123,7 +132,7 @@ bool VideoTonemap::EnsureTarget(int width, int height) {
 
     SDL_GPUTextureCreateInfo texInfo = {};
     texInfo.type = SDL_GPU_TEXTURETYPE_2D;
-    texInfo.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    texInfo.format = format;
     texInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
     texInfo.width = static_cast<Uint32>(width);
     texInfo.height = static_cast<Uint32>(height);
@@ -137,17 +146,22 @@ bool VideoTonemap::EnsureTarget(int width, int height) {
 
     m_outW = width;
     m_outH = height;
+    m_outFormat = format;
     return true;
 }
 
 void VideoTonemap::RecordRenderPass(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* srcTex,
                                     VideoColorMode mode, VideoColorPrimaries primaries,
-                                    Tonemapper tonemapper) {
+                                    Tonemapper tonemapper, bool hdrPassthrough,
+                                    float headroom, float sdrWhite) {
     TonemapParams params = {};
     params.transfer = (mode == VideoColorMode::HDR_HLG) ? 1 : 0;
     params.primaries = static_cast<int32_t>(primaries);
     params.tonemapper = static_cast<int32_t>(tonemapper);
     params.exposure = 1.0f;
+    params.outputMode = hdrPassthrough ? 1 : 0;
+    params.headroom = headroom;
+    params.sdrWhite = sdrWhite;
     SDL_PushGPUFragmentUniformData(cmd, 0, &params, sizeof(params));
 
     SDL_GPUColorTargetInfo target = {};
@@ -157,7 +171,7 @@ void VideoTonemap::RecordRenderPass(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* s
     target.cycle = true;
 
     SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, nullptr);
-    SDL_BindGPUGraphicsPipeline(pass, m_pipeline);
+    SDL_BindGPUGraphicsPipeline(pass, hdrPassthrough ? m_pipelineFP16 : m_pipeline);
     SDL_GPUTextureSamplerBinding binding = {};
     binding.texture = srcTex;
     binding.sampler = m_sampler;
@@ -168,10 +182,13 @@ void VideoTonemap::RecordRenderPass(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* s
 
 SDL_GPUTexture* VideoTonemap::Process(SDL_GPUTexture* srcTex, int width, int height,
                                       VideoColorMode mode, VideoColorPrimaries primaries,
-                                      Tonemapper tonemapper) {
+                                      Tonemapper tonemapper, bool hdrPassthrough,
+                                      float headroom, float sdrWhite) {
     if (!m_ready || !srcTex || width <= 0 || height <= 0)
         return nullptr;
-    if (!EnsureTarget(width, height))
+    if (!EnsureTarget(width, height,
+                      hdrPassthrough ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT
+                                     : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM))
         return nullptr;
 
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_device);
@@ -179,7 +196,8 @@ SDL_GPUTexture* VideoTonemap::Process(SDL_GPUTexture* srcTex, int width, int hei
         LOG_ERROR("VideoTonemap: command buffer acquire failed: %s", SDL_GetError());
         return nullptr;
     }
-    RecordRenderPass(cmd, srcTex, mode, primaries, tonemapper);
+    RecordRenderPass(cmd, srcTex, mode, primaries, tonemapper, hdrPassthrough, headroom,
+                     sdrWhite);
     SDL_SubmitGPUCommandBuffer(cmd);
 
     return m_outTex;
@@ -190,7 +208,7 @@ bool VideoTonemap::RenderToBuffer(const uint8_t* src, int width, int height, Vid
                                   std::vector<uint8_t>& outRGBA) {
     if (!m_ready || !src || width <= 0 || height <= 0)
         return false;
-    if (!EnsureTarget(width, height))
+    if (!EnsureTarget(width, height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM))
         return false;
 
     const Uint32 byteSize = static_cast<Uint32>(width) * height * 4;
@@ -276,7 +294,8 @@ bool VideoTonemap::RenderToBuffer(const uint8_t* src, int width, int height, Vid
     SDL_UploadToGPUTexture(upload, &uploadSrc, &uploadDst, true);
     SDL_EndGPUCopyPass(upload);
 
-    RecordRenderPass(cmd, m_inTex, mode, primaries, tonemapper);
+    RecordRenderPass(cmd, m_inTex, mode, primaries, tonemapper,
+                     /*hdrPassthrough=*/false, /*headroom=*/1.0f, /*sdrWhite=*/1.0f);
 
     SDL_GPUCopyPass* download = SDL_BeginGPUCopyPass(cmd);
     SDL_GPUTextureRegion downloadSrc = {};
@@ -319,6 +338,7 @@ void VideoTonemap::Shutdown() {
         if (m_outTex) SDL_ReleaseGPUTexture(m_device, m_outTex);
         if (m_sampler) SDL_ReleaseGPUSampler(m_device, m_sampler);
         if (m_pipeline) SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipeline);
+        if (m_pipelineFP16) SDL_ReleaseGPUGraphicsPipeline(m_device, m_pipelineFP16);
     }
     m_uploadTB = nullptr;
     m_downloadTB = nullptr;
@@ -328,6 +348,8 @@ void VideoTonemap::Shutdown() {
     m_pipeline = nullptr;
     m_device = nullptr;
     m_inW = m_inH = 0;
+    m_pipelineFP16 = nullptr;
+    m_outFormat = SDL_GPU_TEXTUREFORMAT_INVALID;
     m_outW = m_outH = 0;
     m_downloadW = m_downloadH = 0;
     m_ready = false;

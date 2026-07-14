@@ -4,6 +4,7 @@
 #include "util/CommandLine.h"
 #include "util/AppPaths.h"
 #include "scrubcut_version.h"
+#include "scrubcut_shaders.h"
 
 #include "stb/stb_image_write.h"
 
@@ -30,6 +31,10 @@
 #define NOIME
 #include <windows.h>
 #include <shellapi.h>
+#include <dxgi1_6.h>
+// dxgi pulls in <rpcndr.h> (via <unknwn.h>), whose `small` macro collides
+// with parameter names in this file.
+#undef small
 // We only need DwmSetWindowAttribute from dwmapi. Forward-declare instead of
 // including <dwmapi.h>, which transitively pulls in <rpcndr.h> and its
 // `small` macro that collides with our parameter names. Linker resolves the
@@ -359,6 +364,7 @@ bool App::Init() {
     m_tonemapper = static_cast<Tonemapper>(std::clamp(
         m_prefSettings.GetInt("tonemapper", static_cast<int>(Tonemapper::Uncharted2)),
         0, kTonemapperCount - 1));
+    m_hdrOutputEnabled = m_prefSettings.GetBool("hdr_output", true);
     {
         std::string customDir = m_prefSettings.GetString("export_custom_dir", "");
         snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", customDir.c_str());
@@ -437,22 +443,22 @@ bool App::Init() {
     }
     LOG_INFO("GPU driver: %s", SDL_GetGPUDeviceDriver(m_gpuDevice));
 
-    // Claiming defaults to SDR composition + VSYNC present mode.
+    // Claiming defaults to SDR composition + VSYNC present mode. HDR output
+    // is content-gated, so this stays SDR until an HDR video opens — the call
+    // here just initializes the SDR-white/headroom state.
     if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
         LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
         return false;
     }
+    UpdateHDROutput();
 
-    // GPU HDR->SDR tone-mapper. Non-fatal if it fails to init — SDR playback is
-    // unaffected; only HDR videos would then display incorrectly.
-    if (!m_tonemap.Init(m_gpuDevice))
-        LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
-
-    // The Exporter's background thread runs the same tone-map pass for HDR
-    // re-encode exports (GIF/PNG) on its own command buffers of this device.
+    // The GPU HDR->SDR tone-mapper (m_tonemap) is created lazily when the
+    // first HDR video opens — see fetchFrame in Run(). The Exporter's
+    // background thread runs the same tone-map pass for HDR re-encode exports
+    // (GIF/PNG) on its own command buffers of this device.
     m_exporter.SetTonemapDevice(m_gpuDevice);
 
-    if (!m_ui.Init(m_window, m_gpuDevice, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM)) {
+    if (!m_ui.Init(m_window, m_gpuDevice, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT)) {
         LOG_ERROR("UIManager::Init failed");
         return false;
     }
@@ -478,6 +484,14 @@ void App::Run() {
         ProcessEvents();
         m_player.PollSeekComplete();
 
+        // While HDR output is active, poll the OS HDR state every frame so
+        // the UI tracks the SDR-brightness slider live (cached DXGI reads,
+        // ~6 us; the slider changes without any event SDL forwards). When
+        // inactive, the display-change events and the video-open check in
+        // fetchFrame cover (dis)engagement.
+        if (m_swapchainHDR)
+            UpdateHDROutput();
+
         // Handle deferred file open (from dialog callback, possibly off-thread)
         if (m_pendingOpenImmediate) {
             m_pendingOpenImmediate = false;
@@ -499,20 +513,40 @@ void App::Run() {
             if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
                 VideoColorMode mode = m_player.GetVideoColorMode();
                 if (w != m_videoWidth || h != m_videoHeight || mode != m_videoColorMode) {
+                    const bool modeChanged = (mode != m_videoColorMode);
                     m_videoWidth = w;
                     m_videoHeight = h;
                     m_videoColorMode = mode;
                     CreateVideoTexture(w, h);
+                    // HDR output is content-gated: (dis)engage as the opened
+                    // video's color mode becomes known.
+                    if (modeChanged)
+                        UpdateHDROutput();
                 }
                 UploadFrame(rgba, w, h);
+                // Lazily create the tone-map pipeline the first time an HDR
+                // video shows up. Non-fatal on failure (don't retry per frame)
+                // — SDR playback is unaffected; only HDR videos would then
+                // display incorrectly.
+                if (m_videoColorMode != VideoColorMode::SDR && !m_tonemap.IsReady() &&
+                    !m_tonemapInitFailed && !m_tonemap.Init(m_gpuDevice)) {
+                    m_tonemapInitFailed = true;
+                    LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
+                }
                 // HDR frames carry their PQ/HLG transfer in a 10-bit texture;
-                // tone-map them to an SDR texture before ImGui composites them.
+                // map them before ImGui composites them: tone-mapped to SDR on
+                // SDR output, passthrough at native brightness on HDR output.
                 if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady()) {
                     m_displayTexture = m_tonemap.Process(m_videoTexture, w, h,
                                                          m_videoColorMode,
                                                          m_player.GetVideoColorPrimaries(),
-                                                         m_tonemapper);
+                                                         m_tonemapper,
+                                                         m_swapchainHDR, m_hdrHeadroom,
+                                                         m_sdrWhite);
                     m_lastProcessedTonemapper = m_tonemapper;
+                    m_lastProcessedHDROut = m_swapchainHDR;
+                    m_lastProcessedHeadroom = m_hdrHeadroom;
+                    m_lastProcessedSDRWhite = m_sdrWhite;
                 } else {
                     m_displayTexture = m_videoTexture;
                 }
@@ -523,12 +557,21 @@ void App::Run() {
         // while paused — no new frame arrives then, so fetchFrame() won't.
         auto refreshTonemap = [&]() {
             if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady() &&
-                m_videoTexture && m_tonemapper != m_lastProcessedTonemapper) {
+                m_videoTexture &&
+                (m_tonemapper != m_lastProcessedTonemapper ||
+                 m_swapchainHDR != m_lastProcessedHDROut ||
+                 m_hdrHeadroom != m_lastProcessedHeadroom ||
+                 m_sdrWhite != m_lastProcessedSDRWhite)) {
                 m_displayTexture = m_tonemap.Process(m_videoTexture, m_videoWidth,
                                                      m_videoHeight, m_videoColorMode,
                                                      m_player.GetVideoColorPrimaries(),
-                                                     m_tonemapper);
+                                                     m_tonemapper,
+                                                     m_swapchainHDR, m_hdrHeadroom,
+                                                     m_sdrWhite);
                 m_lastProcessedTonemapper = m_tonemapper;
+                m_lastProcessedHDROut = m_swapchainHDR;
+                m_lastProcessedHeadroom = m_hdrHeadroom;
+                m_lastProcessedSDRWhite = m_sdrWhite;
             }
         };
 
@@ -587,6 +630,7 @@ void App::Shutdown() {
         m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
         m_prefSettings.SetString("export_custom_dir", m_exportCustomDir);
         m_prefSettings.SetInt("tonemapper", static_cast<int>(m_tonemapper));
+        m_prefSettings.SetBool("hdr_output", m_hdrOutputEnabled);
         SaveRecentFiles();
         m_prefSettings.Save();
     }
@@ -614,6 +658,16 @@ void App::Shutdown() {
     if (m_sceneTarget) {
         SDL_ReleaseGPUTexture(m_gpuDevice, m_sceneTarget);
         m_sceneTarget = nullptr;
+    }
+    for (int i = 0; i < kMaxCompositePipelines; i++) {
+        if (m_compositePipelines[i]) {
+            SDL_ReleaseGPUGraphicsPipeline(m_gpuDevice, m_compositePipelines[i]);
+            m_compositePipelines[i] = nullptr;
+        }
+    }
+    if (m_compositeSampler) {
+        SDL_ReleaseGPUSampler(m_gpuDevice, m_compositeSampler);
+        m_compositeSampler = nullptr;
     }
     if (m_gpuDevice) {
         SDL_ReleaseWindowFromGPUDevice(m_gpuDevice, m_window);
@@ -675,6 +729,8 @@ void App::OpenFile(const std::string& path) {
     m_videoHeight = m_player.GetVideoHeight();
     m_videoColorMode = m_player.GetVideoColorMode();
     CreateVideoTexture(m_videoWidth, m_videoHeight);
+    // HDR output is content-gated — (dis)engage for the newly opened video.
+    UpdateHDROutput();
 
     std::string title = "ScrubCut - " + path;
 #ifndef NDEBUG
@@ -715,6 +771,10 @@ void App::ResetSettings() {
     m_useDpiScaling = true;
     m_userUiScale = 1.0f;
     m_tonemapper = Tonemapper::Uncharted2;
+    if (!m_hdrOutputEnabled) {
+        m_hdrOutputEnabled = true;
+        UpdateHDROutput();
+    }
     m_ui.SetUiScale(GetEffectiveUiScale());
 }
 
@@ -827,6 +887,13 @@ void App::CycleSubtitleTrack(int dir) {
 }
 
 void App::CycleTonemapper(int dir) {
+    // On HDR output HDR video is shown natively — the operator has no effect,
+    // so cycling it would be confusing. Flash why instead.
+    if (m_swapchainHDR) {
+        ShowStatus("HDR output active — no tone-mapping");
+        BumpUIActivity();
+        return;
+    }
     int n = kTonemapperCount;
     int next = ((static_cast<int>(m_tonemapper) + dir) % n + n) % n;
     m_tonemapper = static_cast<Tonemapper>(next);
@@ -1075,6 +1142,13 @@ void App::ProcessEvents() {
         if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
             event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED) {
             m_ui.SetUiScale(GetEffectiveUiScale());
+        }
+
+        // Follow the display's HDR capability as the window moves between
+        // monitors or the OS toggles HDR.
+        if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
+            event.type == SDL_EVENT_WINDOW_HDR_STATE_CHANGED) {
+            UpdateHDROutput();
         }
 
         if (event.type == SDL_EVENT_QUIT) {
@@ -1598,11 +1672,12 @@ void App::Render() {
                 SetFullscreen(!m_fullscreen);
             }
             if (ImGui::BeginMenu("HDR")) {
-                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 20.0f);
-                ImGui::TextDisabled(
-                    "ScrubCut doesn't support HDR displays yet. Select below what "
-                    "tonemapper should be used to convert HDR content to SDR");
-                ImGui::PopTextWrapPos();
+                if (ImGui::MenuItem("HDR Output", nullptr, m_hdrOutputEnabled)) {
+                    m_hdrOutputEnabled = !m_hdrOutputEnabled;
+                    UpdateHDROutput();
+                }
+                TooltipFor("Output HDR when the open video is HDR and the window "
+                           "is on an HDR-enabled display.");
                 ImGui::Separator();
                 // Hints mark the operator that T / Shift+T would switch to (next/prev).
                 int cur = static_cast<int>(m_tonemapper);
@@ -1614,14 +1689,36 @@ void App::Render() {
                     if (prevTm == idx) return "Shift+T";
                     return nullptr;
                 };
+                ImGui::BeginDisabled(m_swapchainHDR);
                 for (int i = 0; i < kTonemapperCount; ++i) {
                     Tonemapper t = static_cast<Tonemapper>(i);
                     if (ImGui::MenuItem(TonemapperName(t), tmHint(i), m_tonemapper == t))
                         m_tonemapper = t;
                 }
+                ImGui::EndDisabled();
+                // Status footer: what the current content/output state means
+                // for the settings above.
+                const bool videoIsHDR =
+                    m_player.HasMedia() && m_videoColorMode != VideoColorMode::SDR;
+                const char* statusLine1;
+                const char* statusLine2;
+                if (!videoIsHDR) {
+                    statusLine1 = "SDR video";
+                    statusLine2 = "HDR settings don't apply";
+                } else if (!m_swapchainHDR) {
+                    statusLine1 = m_displayHDR ? "HDR video, HDR output disabled"
+                                               : "HDR video, SDR display";
+                    statusLine2 = "Selected tonemapper is used";
+                } else {
+                    statusLine1 = (m_hdrCompositeMode == 1) ? "HDR output enabled (scRGB)"
+                                                            : "HDR output enabled (HDR10)";
+                    statusLine2 = "Tonemapper options don't apply";
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", statusLine1);
+                ImGui::TextDisabled("%s", statusLine2);
                 ImGui::EndMenu();
             }
-            TooltipFor("Tone-mapping operator used to display HDR videos on this SDR screen.");
             ImGui::SeparatorText("Windows");
             if (ImGui::MenuItem("Timeline", (std::string(kKeys.winModName) + "+T").c_str(), m_showTimeline))
                 m_showTimeline = !m_showTimeline;
@@ -3643,16 +3740,46 @@ void App::Render() {
 
     m_ui.EndFrame(cmd, m_sceneTarget);
 
-    SDL_GPUBlitInfo blit = {};
-    blit.source.texture = m_sceneTarget;
-    blit.source.w = swapW;
-    blit.source.h = swapH;
-    blit.destination.texture = swapchain;
-    blit.destination.w = swapW;
-    blit.destination.h = swapH;
-    blit.load_op = SDL_GPU_LOADOP_DONT_CARE;
-    blit.filter = SDL_GPU_FILTER_NEAREST;  // always 1:1
-    SDL_BlitGPUTexture(cmd, &blit);
+    // Scene -> swapchain. SDR: a plain blit — the scene's encoded values are
+    // the presentable values, and the FP16 -> 8-bit conversion clamps
+    // inherently. HDR (scRGB): a composite pass that decodes to linear and
+    // scales to the OS SDR white level.
+    SDL_GPUGraphicsPipeline* composite = nullptr;
+    if (m_swapchainHDR)
+        composite = EnsureCompositePipeline(
+            SDL_GetGPUSwapchainTextureFormat(m_gpuDevice, m_window));
+    if (composite) {
+        struct CompositeParams {
+            int32_t mode;  // matches m_hdrCompositeMode (1 = scRGB, 2 = HDR10)
+            float sdrWhite;
+            float pad0, pad1;
+        } params = {m_hdrCompositeMode, m_sdrWhite, 0.0f, 0.0f};
+        SDL_PushGPUFragmentUniformData(cmd, 0, &params, sizeof(params));
+
+        SDL_GPUColorTargetInfo target = {};
+        target.texture = swapchain;
+        target.load_op = SDL_GPU_LOADOP_DONT_CARE;  // fullscreen triangle covers everything
+        target.store_op = SDL_GPU_STOREOP_STORE;
+        SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd, &target, 1, nullptr);
+        SDL_BindGPUGraphicsPipeline(pass, composite);
+        SDL_GPUTextureSamplerBinding binding = {};
+        binding.texture = m_sceneTarget;
+        binding.sampler = m_compositeSampler;
+        SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
+        SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+        SDL_EndGPURenderPass(pass);
+    } else {
+        SDL_GPUBlitInfo blit = {};
+        blit.source.texture = m_sceneTarget;
+        blit.source.w = swapW;
+        blit.source.h = swapH;
+        blit.destination.texture = swapchain;
+        blit.destination.w = swapW;
+        blit.destination.h = swapH;
+        blit.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        blit.filter = SDL_GPU_FILTER_NEAREST;  // always 1:1
+        SDL_BlitGPUTexture(cmd, &blit);
+    }
 
     if (m_screenshotPending) {
         // Downloads the scene target; submits and waits on `cmd` itself.
@@ -3748,6 +3875,312 @@ void App::UploadFrame(const uint8_t* rgba, int width, int height) {
     SDL_SubmitGPUCommandBuffer(cmd);
 }
 
+#ifdef _WIN32
+// Query the OS directly for the HDR state of the monitor under `window`:
+// whether the desktop scans out in HDR (PQ colorspace), the SDR white level,
+// and the resulting headroom. SDL exposes the same data as window properties,
+// but only refreshes it on WM_DISPLAYCHANGE — moving the Windows "SDR content
+// brightness" slider doesn't fire that, so SDL's values go stale.
+//
+// Polled every frame while HDR output is active so the app tracks the slider
+// live. The DXGI factory and the resolved output are cached (~6 us per call
+// vs ~0.3 ms with a fresh factory): the factory reports !IsCurrent() on any
+// display topology/mode change (including HDR toggles), invalidating both,
+// and the output is re-resolved when the window moves to another monitor.
+static bool QueryNativeHDRInfo(SDL_Window* window, bool& hdrMode, float& sdrWhite,
+                               float& headroom) {
+    HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+    if (!hwnd)
+        return false;
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor)
+        return false;
+
+    struct DXGICache {
+        IDXGIFactory1* factory = nullptr;
+        IDXGIOutput6* output = nullptr;
+        HMONITOR monitor = nullptr;
+        void ReleaseOutput() {
+            if (output) {
+                output->Release();
+                output = nullptr;
+            }
+            monitor = nullptr;
+        }
+        void ReleaseAll() {
+            ReleaseOutput();
+            if (factory) {
+                factory->Release();
+                factory = nullptr;
+            }
+        }
+        ~DXGICache() { ReleaseAll(); }
+    };
+    static DXGICache cache;
+
+    if (cache.factory && !cache.factory->IsCurrent())
+        cache.ReleaseAll();
+    if (!cache.factory && FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&cache.factory))))
+        return false;
+    if (cache.output && cache.monitor != monitor)
+        cache.ReleaseOutput();
+    if (!cache.output) {
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT a = 0; !cache.output && cache.factory->EnumAdapters1(a, &adapter) == S_OK;
+             a++) {
+            IDXGIOutput* output = nullptr;
+            for (UINT o = 0; !cache.output && adapter->EnumOutputs(o, &output) == S_OK; o++) {
+                IDXGIOutput6* output6 = nullptr;
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6)))) {
+                    DXGI_OUTPUT_DESC1 desc;
+                    if (SUCCEEDED(output6->GetDesc1(&desc)) && desc.Monitor == monitor) {
+                        cache.output = output6;
+                        cache.monitor = monitor;
+                    } else {
+                        output6->Release();
+                    }
+                }
+                output->Release();
+            }
+            adapter->Release();
+        }
+        if (!cache.output)
+            return false;
+    }
+
+    DXGI_OUTPUT_DESC1 desc;
+    if (FAILED(cache.output->GetDesc1(&desc))) {
+        cache.ReleaseOutput();
+        return false;
+    }
+    const bool pq = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+    const float maxLum = desc.MaxLuminance;
+
+    // SDR white level via DisplayConfig, matched by GDI device name.
+    // SDRWhiteLevel is in 80-nit units scaled by 1000.
+    float whiteNits = 200.0f;  // sane default if the query fails
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(monitor, &mi)) {
+        UINT32 numPaths = 0, numModes = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) ==
+                ERROR_SUCCESS && numPaths > 0) {
+            std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+            std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
+                                   &numModes, modes.data(), nullptr) == ERROR_SUCCESS) {
+                for (UINT32 i = 0; i < numPaths; i++) {
+                    DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {};
+                    src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                    src.header.size = sizeof(src);
+                    src.header.adapterId = paths[i].sourceInfo.adapterId;
+                    src.header.id = paths[i].sourceInfo.id;
+                    if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS &&
+                        wcscmp(mi.szDevice, src.viewGdiDeviceName) == 0) {
+                        DISPLAYCONFIG_SDR_WHITE_LEVEL wl = {};
+                        wl.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+                        wl.header.size = sizeof(wl);
+                        wl.header.adapterId = paths[i].targetInfo.adapterId;
+                        wl.header.id = paths[i].targetInfo.id;
+                        if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS &&
+                            wl.SDRWhiteLevel > 0)
+                            whiteNits = wl.SDRWhiteLevel / 1000.0f * 80.0f;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    hdrMode = pq;
+    sdrWhite = whiteNits / 80.0f;
+    headroom = (maxLum > 0.0f && whiteNits > 0.0f) ? maxLum / whiteNits : 1.0f;
+    return true;
+}
+#else
+static bool QueryNativeHDRInfo(SDL_Window*, bool&, float&, float&) {
+    return false;  // non-Windows: use SDL's window properties
+}
+#endif
+
+SDL_GPUGraphicsPipeline* App::EnsureCompositePipeline(SDL_GPUTextureFormat format) {
+    for (int i = 0; i < kMaxCompositePipelines; i++)
+        if (m_compositePipelines[i] && m_compositeFormats[i] == format)
+            return m_compositePipelines[i];
+
+    int slot = -1;
+    for (int i = 0; i < kMaxCompositePipelines; i++)
+        if (!m_compositePipelines[i]) { slot = i; break; }
+    if (slot < 0) {
+        LOG_ERROR("Composite: out of pipeline slots (format %d)", static_cast<int>(format));
+        return nullptr;
+    }
+
+    // Pick the shader blobs the device accepts (mirrors VideoTonemap::Init).
+    const SDL_GPUShaderFormat avail = SDL_GetGPUShaderFormats(m_gpuDevice);
+    SDL_GPUShaderFormat shaderFormat;
+    tonemap_shader::Blob vertBlob, fragBlob;
+    const char* entrypoint;
+    if ((avail & SDL_GPU_SHADERFORMAT_MSL) && tonemap_shader::kCompositeFragMsl.size != 0) {
+        shaderFormat = SDL_GPU_SHADERFORMAT_MSL;
+        vertBlob = tonemap_shader::kVertMsl;
+        fragBlob = tonemap_shader::kCompositeFragMsl;
+        entrypoint = "main0";
+    } else if ((avail & SDL_GPU_SHADERFORMAT_DXBC) && tonemap_shader::kCompositeFragDxbc.size != 0) {
+        shaderFormat = SDL_GPU_SHADERFORMAT_DXBC;
+        vertBlob = tonemap_shader::kVertDxbc;
+        fragBlob = tonemap_shader::kCompositeFragDxbc;
+        entrypoint = "main";
+    } else if ((avail & SDL_GPU_SHADERFORMAT_SPIRV) && tonemap_shader::kCompositeFragSpirv.size != 0) {
+        shaderFormat = SDL_GPU_SHADERFORMAT_SPIRV;
+        vertBlob = tonemap_shader::kVertSpirv;
+        fragBlob = tonemap_shader::kCompositeFragSpirv;
+        entrypoint = "main";
+    } else {
+        LOG_ERROR("Composite: no embedded shader for the device's formats (0x%x)", avail);
+        return nullptr;
+    }
+
+    SDL_GPUShaderCreateInfo vsInfo = {};
+    vsInfo.code = vertBlob.data;
+    vsInfo.code_size = vertBlob.size;
+    vsInfo.entrypoint = entrypoint;
+    vsInfo.format = shaderFormat;
+    vsInfo.stage = SDL_GPU_SHADERSTAGE_VERTEX;
+    SDL_GPUShader* vs = SDL_CreateGPUShader(m_gpuDevice, &vsInfo);
+
+    SDL_GPUShaderCreateInfo fsInfo = {};
+    fsInfo.code = fragBlob.data;
+    fsInfo.code_size = fragBlob.size;
+    fsInfo.entrypoint = entrypoint;
+    fsInfo.format = shaderFormat;
+    fsInfo.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+    fsInfo.num_samplers = 1;
+    fsInfo.num_uniform_buffers = 1;
+    SDL_GPUShader* fs = SDL_CreateGPUShader(m_gpuDevice, &fsInfo);
+
+    SDL_GPUGraphicsPipeline* pipeline = nullptr;
+    if (vs && fs) {
+        SDL_GPUColorTargetDescription colorTarget = {};
+        colorTarget.format = format;
+        SDL_GPUGraphicsPipelineCreateInfo pipeInfo = {};
+        pipeInfo.vertex_shader = vs;
+        pipeInfo.fragment_shader = fs;
+        pipeInfo.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        pipeInfo.target_info.color_target_descriptions = &colorTarget;
+        pipeInfo.target_info.num_color_targets = 1;
+        pipeline = SDL_CreateGPUGraphicsPipeline(m_gpuDevice, &pipeInfo);
+    }
+    if (vs) SDL_ReleaseGPUShader(m_gpuDevice, vs);
+    if (fs) SDL_ReleaseGPUShader(m_gpuDevice, fs);
+    if (!pipeline) {
+        LOG_ERROR("Composite: pipeline creation failed: %s", SDL_GetError());
+        return nullptr;
+    }
+
+    if (!m_compositeSampler) {
+        SDL_GPUSamplerCreateInfo samplerInfo = {};
+        samplerInfo.min_filter = SDL_GPU_FILTER_NEAREST;  // always 1:1
+        samplerInfo.mag_filter = SDL_GPU_FILTER_NEAREST;
+        samplerInfo.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+        samplerInfo.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+        samplerInfo.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+        m_compositeSampler = SDL_CreateGPUSampler(m_gpuDevice, &samplerInfo);
+        if (!m_compositeSampler) {
+            LOG_ERROR("Composite: sampler creation failed: %s", SDL_GetError());
+            SDL_ReleaseGPUGraphicsPipeline(m_gpuDevice, pipeline);
+            return nullptr;
+        }
+    }
+
+    m_compositePipelines[slot] = pipeline;
+    m_compositeFormats[slot] = format;
+    return pipeline;
+}
+
+void App::UpdateHDROutput() {
+    if (!m_gpuDevice || !m_window)
+        return;
+
+    // Prefer the direct OS query (fresh — tracks the Windows SDR-brightness
+    // slider live); fall back to SDL's window properties elsewhere.
+    bool hdrMode = false;
+    float sdrWhite = 1.0f;
+    float headroom = 1.0f;
+    if (!QueryNativeHDRInfo(m_window, hdrMode, sdrWhite, headroom)) {
+        SDL_PropertiesID props = SDL_GetWindowProperties(m_window);
+        hdrMode = SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+        sdrWhite = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.0f);
+        headroom = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.0f);
+    }
+    m_displayHDR = hdrMode;
+
+    // HDR output is content-gated: only while an HDR video is open on a
+    // display that's in HDR mode. SDR videos and the empty app present as a
+    // plain SDR app, letting the OS do the SDR-to-HDR desktop mapping like
+    // for every other window. Headroom is deliberately not part of the gate —
+    // HDR video maps in absolute nits, and the rolloff just compresses harder
+    // when headroom is low.
+    const bool videoIsHDR =
+        m_player.HasMedia() && m_videoColorMode != VideoColorMode::SDR;
+
+    // Prefer scRGB (linear FP16 — what macOS EDR and the Vulkan backend
+    // expose); fall back to HDR10 PQ, which is what stock SDL's D3D12 backend
+    // reaches (its scRGB support check can only pass for a swapchain that
+    // already has the FP16 buffer format). 0 = SDR.
+    int wantMode = 0;
+    if (m_hdrOutputEnabled && hdrMode && videoIsHDR) {
+        if (SDL_WindowSupportsGPUSwapchainComposition(
+                m_gpuDevice, m_window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR))
+            wantMode = 1;
+        else if (SDL_WindowSupportsGPUSwapchainComposition(
+                     m_gpuDevice, m_window, SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084))
+            wantMode = 2;
+    }
+
+    if (wantMode != m_hdrCompositeMode) {
+        static const SDL_GPUSwapchainComposition kComps[3] = {
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+            SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR,
+            SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084,
+        };
+        static const char* kNames[3] = {"SDR", "HDR (scRGB)", "HDR (HDR10 PQ)"};
+        if (SDL_SetGPUSwapchainParameters(m_gpuDevice, m_window, kComps[wantMode],
+                                          SDL_GPU_PRESENTMODE_VSYNC)) {
+            m_hdrCompositeMode = wantMode;
+            m_swapchainHDR = (wantMode != 0);
+            LOG_INFO("Swapchain composition -> %s", kNames[wantMode]);
+        } else {
+            LOG_ERROR("SDL_SetGPUSwapchainParameters failed: %s", SDL_GetError());
+        }
+    }
+
+    // Brightness metadata for the shaders — tracks the OS "SDR content
+    // brightness" slider and the display's headroom.
+    m_sdrWhite = std::max(sdrWhite, 1.0f);
+    m_hdrHeadroom = std::max(headroom, 1.0f);
+
+    // Log state changes at most once per second (the values change every
+    // frame during a slider drag). Comparing against the last *logged* state
+    // rather than the previous frame guarantees the settled value after a
+    // burst still gets reported on a later frame.
+    static bool loggedMode = false;
+    static float loggedWhite = -1.0f;
+    static float loggedHeadroom = -1.0f;
+    static uint64_t lastLogNS = 0;
+    const uint64_t nowNS = SDL_GetTicksNS();
+    if ((hdrMode != loggedMode || m_sdrWhite != loggedWhite || m_hdrHeadroom != loggedHeadroom) &&
+        (lastLogNS == 0 || nowNS - lastLogNS > 1000000000ull)) {
+        loggedMode = hdrMode;
+        loggedWhite = m_sdrWhite;
+        loggedHeadroom = m_hdrHeadroom;
+        lastLogNS = nowNS;
+        LOG_INFO("HDR state: display %s, SDR white %.0f nits, headroom %.2fx",
+                 hdrMode ? "HDR" : "SDR", m_sdrWhite * 80.0f, m_hdrHeadroom);
+    }
+}
+
 bool App::EnsureSceneTarget(int width, int height) {
     if (m_sceneTarget && m_sceneW == width && m_sceneH == height)
         return true;
@@ -3759,7 +4192,7 @@ bool App::EnsureSceneTarget(int width, int height) {
 
     SDL_GPUTextureCreateInfo texInfo = {};
     texInfo.type = SDL_GPU_TEXTURETYPE_2D;
-    texInfo.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    texInfo.format = SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     texInfo.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
     texInfo.width = static_cast<Uint32>(width);
     texInfo.height = static_cast<Uint32>(height);
@@ -3872,13 +4305,44 @@ void App::InitExportDir() {
     }
 }
 
+// Scalar IEEE half -> float conversion for the FP16 scene-target readback.
+static float HalfToFloat(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;  // +-0
+        } else {
+            // Subnormal half -> normalized float.
+            exp = 127 - 15 + 1;
+            while (!(mant & 0x400u)) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FFu;
+            bits = sign | (exp << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13);  // inf / NaN
+    } else {
+        bits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 void App::TakeScreenshot(SDL_GPUCommandBuffer* cmd, int w, int h) {
     // Record a download of the scene target onto the frame's command buffer,
     // then submit it with a fence and wait — a screenshot is rare enough that
-    // one stalled frame doesn't matter. Rows come back top-first, RGBA8.
+    // one stalled frame doesn't matter. Rows come back top-first, FP16 RGBA
+    // (extended-sRGB encoded); clamped to 8-bit for the PNG, which matches
+    // the SDR presentation of the frame.
     SDL_GPUTransferBufferCreateInfo tbInfo = {};
     tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
-    tbInfo.size = static_cast<Uint32>(w) * h * 4;
+    tbInfo.size = static_cast<Uint32>(w) * h * 8;
     SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(m_gpuDevice, &tbInfo);
     if (!tb) {
         LOG_ERROR("Screenshot: transfer buffer failed: %s", SDL_GetError());
@@ -3915,6 +4379,17 @@ void App::TakeScreenshot(SDL_GPUCommandBuffer* cmd, int w, int h) {
         return;
     }
 
+    const uint16_t* halves = static_cast<const uint16_t*>(mapped);
+    std::vector<uint8_t> rgba8(static_cast<size_t>(w) * h * 4);
+    for (size_t i = 0; i < rgba8.size(); i++) {
+        float v = HalfToFloat(halves[i]);
+        v = std::clamp(v, 0.0f, 1.0f);
+        rgba8[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+    }
+    // Opaque alpha — the scene's alpha channel is meaningless after blending.
+    for (size_t i = 3; i < rgba8.size(); i += 4)
+        rgba8[i] = 255;
+
     auto dir = GetAppDataDir() / "screenshots";
     std::filesystem::create_directories(dir);
     m_screenshotCounter++;
@@ -3922,7 +4397,7 @@ void App::TakeScreenshot(SDL_GPUCommandBuffer* cmd, int w, int h) {
     snprintf(name, sizeof(name), "screenshot_%03d.png", m_screenshotCounter);
     auto path = (dir / name).string();
 
-    if (stbi_write_png(path.c_str(), w, h, 4, mapped, w * 4))
+    if (stbi_write_png(path.c_str(), w, h, 4, rgba8.data(), w * 4))
         LOG_INFO("Screenshot saved: %s", path.c_str());
     else
         LOG_ERROR("Screenshot failed to write: %s", path.c_str());

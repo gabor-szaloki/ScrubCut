@@ -133,6 +133,17 @@ private:
     // Called instead of a plain submit when a screenshot is pending.
     void TakeScreenshot(SDL_GPUCommandBuffer* cmd, int width, int height);
 
+    // Re-evaluate the swapchain composition: HDR (scRGB preferred, HDR10 PQ
+    // fallback) while an HDR video is open on an HDR-mode display with the
+    // HDR Output preference on; SDR otherwise. Also refreshes the SDR-white
+    // and headroom values. Called on video open, on display-change/HDR-state
+    // events, from the menu toggle, and every frame while HDR is active (the
+    // OS SDR-brightness slider changes without any event).
+    void UpdateHDROutput();
+    // Composite pipeline for the given swapchain format (created lazily; the
+    // color-target format is baked into a pipeline). Returns nullptr on error.
+    SDL_GPUGraphicsPipeline* EnsureCompositePipeline(SDL_GPUTextureFormat format);
+
     // Initialize m_exportDir for an export-dialog open based on mode:
     //   SameAsVideo → opened video's parent
     //   Custom      → m_exportCustomDir, defaulting to the video's parent if empty
@@ -256,21 +267,49 @@ private:
     SDL_GPUTexture* m_displayTexture = nullptr;  // texture ImGui composites: == m_videoTexture for
                                                  // SDR, the tone-mapper's SDR output for HDR
     SDL_GPUTransferBuffer* m_frameTransfer = nullptr;  // persistent upload staging for video frames
-    // Offscreen scene target the whole UI renders into, blitted to the (write-
-    // only) swapchain each frame — needed for F12 screenshots, and keeps the
-    // ImGui pipeline format independent of the swapchain format.
+    // Offscreen scene target the whole UI renders into, composited to the
+    // (write-only) swapchain each frame — needed for F12 screenshots, keeps
+    // the ImGui pipeline format independent of the swapchain format, and is
+    // where HDR video's extended range lives. FP16, extended-sRGB-encoded,
+    // 1.0 == SDR white.
     SDL_GPUTexture* m_sceneTarget = nullptr;
     int m_sceneW = 0;
     int m_sceneH = 0;
+
+    // Scene -> swapchain composite pass, used only while HDR output is active
+    // (decodes the scene to linear and scales to the OS SDR white; SDR
+    // presentation is a plain blit). Created lazily per swapchain format.
+    static constexpr int kMaxCompositePipelines = 2;
+    SDL_GPUGraphicsPipeline* m_compositePipelines[kMaxCompositePipelines] = {};
+    SDL_GPUTextureFormat m_compositeFormats[kMaxCompositePipelines] = {};
+    SDL_GPUSampler* m_compositeSampler = nullptr;
+
+    // HDR output state. m_hdrOutputEnabled is the user preference (View > HDR,
+    // persisted); m_hdrCompositeMode is the composite shader's mode for the
+    // current swapchain composition (0 = SDR, 1 = scRGB linear, 2 = HDR10 PQ —
+    // scRGB is preferred but stock SDL's D3D12 backend only reaches HDR10);
+    // HDR engages only while an HDR video is open on an HDR-mode display.
+    // SDR white + headroom mirror the OS values.
+    bool m_hdrOutputEnabled = true;
+    int m_hdrCompositeMode = 0;
+    bool m_swapchainHDR = false;  // == (m_hdrCompositeMode != 0)
+    bool m_displayHDR = false;    // the display itself is in HDR mode (menu status)
+    float m_sdrWhite = 1.0f;     // SDR white in scRGB units (80-nit multiples)
+    float m_hdrHeadroom = 1.0f;  // display peak in SDR-white units
+    // Lazy tone-mapper init failed once — don't retry (and spam) every frame.
+    bool m_tonemapInitFailed = false;
     int m_videoWidth = 0;
     int m_videoHeight = 0;
     VideoColorMode m_videoColorMode = VideoColorMode::SDR;
-    VideoTonemap m_tonemap;          // GPU HDR->SDR pass (HDR videos only)
+    VideoTonemap m_tonemap;          // tone-map / HDR-passthrough pass (HDR videos only, lazy init)
     // Selected HDR->SDR tone-mapping operator (View > HDR, persisted in prefs).
     Tonemapper m_tonemapper = Tonemapper::Uncharted2;
-    // Operator last applied to m_displayTexture, so a change while paused (no new
+    // State last applied to m_displayTexture, so a change while paused (no new
     // frame arriving) still triggers a re-tonemap of the held frame.
     Tonemapper m_lastProcessedTonemapper = Tonemapper::Uncharted2;
+    bool m_lastProcessedHDROut = false;
+    float m_lastProcessedHeadroom = 1.0f;
+    float m_lastProcessedSDRWhite = 1.0f;
 
     // Segment hover state (shared between timeline bar and segments panel)
     int m_hoveredSegment = -1;       // last frame's value, used for rendering

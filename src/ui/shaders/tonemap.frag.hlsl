@@ -11,6 +11,10 @@ cbuffer TonemapParams : register(b0, space3) {
     int uPrimaries;   // matches the VideoColorPrimaries enum: 0=709, 1=2020, 2=P3
     int uTonemapper;  // matches the Tonemapper enum
     float uExposure;
+    int uOutputMode;  // 0 = SDR (tone-map to [0,1]), 1 = HDR passthrough
+    float uHeadroom;  // display headroom in SDR-white units (>= 1), passthrough only
+    float uSdrWhite;  // OS SDR white in scRGB units (80-nit multiples), passthrough only
+    float _pad;
 };
 
 // SMPTE ST 2084 (PQ) EOTF: encoded [0,1] -> linear, 1.0 == 10000 nits.
@@ -113,11 +117,18 @@ float3 agx(float3 val) {
     return mul(agx_out, agxInner(val));
 }
 
-float3 srgb(float3 c) {
-    c = clamp(c, 0.0, 1.0);
+// Extended sRGB OETF: the standard piecewise curve, continued monotonically
+// past 1.0. Used unclamped by the HDR passthrough path; the SDR path clamps
+// its input first.
+float3 srgbExt(float3 c) {
+    c = max(c, 0.0);
     float3 lo = 12.92 * c;
     float3 hi = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
     return lerp(hi, lo, step(c, 0.0031308));
+}
+
+float3 srgb(float3 c) {
+    return srgbExt(clamp(c, 0.0, 1.0));
 }
 
 float4 main(float2 vUV : TEXCOORD0) : SV_Target {
@@ -139,8 +150,25 @@ float4 main(float2 vUV : TEXCOORD0) : SV_Target {
     else if (uPrimaries == 2) rgb = mul(p3_to_709, lin);      // Display P3 (D65)
     else                      rgb = mul(bt2020_to_709, lin);  // BT.2020 (and default)
 
+    rgb = max(rgb, 0.0);
+
+    // HDR passthrough (HDR display): absolute-nits mapping — content nits stay
+    // content nits on screen, independent of the OS SDR brightness slider. The
+    // scene's unit is "SDR white", which the composite pass scales by
+    // uSdrWhite, so dividing by it here cancels that out. Highlights that
+    // exceed the display's headroom get a soft rolloff; extended-sRGB encoded
+    // unclamped for the FP16 scene target. No tone-mapping operator applies.
+    if (uOutputMode == 1) {
+        rgb = rgb / (80.0 * uSdrWhite) * uExposure;
+        const float knee = 0.75 * uHeadroom;  // rolloff starts at 75% of peak
+        float hk = max(uHeadroom - knee, 1e-4);
+        float3 excess = max(rgb - knee, 0.0);
+        rgb = min(rgb, knee) + excess * hk / (excess + hk);  // asymptote: uHeadroom
+        return float4(srgbExt(rgb), 1.0);
+    }
+
     // Scale nits into the operators' working range (1.0 ~= SDR diffuse white).
-    rgb = max(rgb, 0.0) / 200.0 * uExposure;
+    rgb = rgb / 200.0 * uExposure;
 
     // AgX outputs display-encoded values; the others output linear and take the
     // sRGB OETF below.
