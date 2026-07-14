@@ -31,6 +31,7 @@ ScrubCut can serve as your basic go-to video player app — you can find most ba
 - **Volume control** -- mute button and volume slider
 - **Audio tracks** -- switch between multiple embedded audio tracks
 - **Subtitles** -- show embedded subtitle tracks, or load an external subtitle file (SRT, ASS/SSA, WebVTT, SUB) via the menu or drag-and-drop; adjustable text size and timing offset
+- **HDR support** -- HDR videos (PQ/HLG) play tone-mapped on SDR displays with a selectable operator, and at native brightness on HDR displays
 - **Input formats** -- MP4, MKV, MOV, AVI, WebM, WMV, FLV, MPG/MPEG, 3GP, TS, M4V, and animated GIF
 
 ## Setup
@@ -161,7 +162,7 @@ Shortcuts are grouped the same way as the in-app help panel (press **?**).
 - **SDL3** -- windowing, audio, events
 - **Dear ImGui** (docking) -- immediate-mode UI
 - **FFmpeg** -- demuxing, decoding, encoding, filtering
-- **OpenGL 3.3+** -- rendering
+- **SDL_GPU** -- rendering (D3D12 on Windows, Metal on macOS, Vulkan fallback)
 - **CMake + vcpkg** -- build system and dependency management
 
 ## License
