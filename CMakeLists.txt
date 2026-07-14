@@ -204,9 +204,11 @@ if(WIN32)
 endif()
 
 # FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the
-# harmless duplicates.
+# harmless duplicates. CoreFoundation backs the NFC path normalization in
+# util/UnicodeNormalize.h.
 if(APPLE)
     target_link_options(ScrubCut PRIVATE LINKER:-no_warn_duplicate_libraries)
+    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation")
 endif()
 
 # Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are

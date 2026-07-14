@@ -3,6 +3,7 @@
 #include "util/Trace.h"
 #include "util/CommandLine.h"
 #include "util/AppPaths.h"
+#include "util/UnicodeNormalize.h"
 #include "scrubcut_version.h"
 #include "scrubcut_shaders.h"
 
@@ -694,7 +695,11 @@ void App::RequestOpenFile(const std::string& path) {
         m_pendingOpenImmediate = true;
 }
 
-void App::OpenFile(const std::string& path) {
+void App::OpenFile(const std::string& rawPath) {
+    // NFC-normalize so the stored/displayed path (title, recent list) uses
+    // precomposed characters — macOS hands us NFD, which ImGui fonts can't draw.
+    const std::string path = NormalizeUtf8NFC(rawPath);
+
     m_player.Close();
 
     if (m_videoTexture) {
@@ -849,8 +854,9 @@ std::string App::ChapterLabel(int index) const {
     return t.empty() ? ("Chapter " + std::to_string(index + 1)) : t;
 }
 
-void App::OpenSubtitleFile(const std::string& path) {
+void App::OpenSubtitleFile(const std::string& rawPath) {
     if (!m_player.HasMedia()) return;
+    const std::string path = NormalizeUtf8NFC(rawPath);
     SubtitleTrackInfo t;
     t.external = true;
     t.textBased = true;
