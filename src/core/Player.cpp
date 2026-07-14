@@ -668,7 +668,14 @@ void Player::StepFrame(int direction) {
         if (targetSec < 0.0) targetSec = 0.0;
         int64_t maxPts = m_lastDisplayedPts;
         SyncSeekAndDecodeBefore(targetSec, maxPts);
-        m_needsResync = false;
+        // SyncSeekAndDecodeBefore decodes several frames past maxPts (its
+        // B-frame reorder margin), so the decoder no longer matches
+        // m_lastDisplayedPts — even on failure (already at the first frame,
+        // where nothing earlier exists but the attempt still flushed and
+        // advanced the pipeline). Defer a reseek to the next forward
+        // operation, same as the cache-hit path above; without this the
+        // next StepFrame(+1) pops a frame ~reorder-depth ahead.
+        m_needsResync = true;
         PopulateCacheAroundCurrent();
         if (m_profileSeek) {
             LOG_INFO("StepFrame -1 cache-miss %.2fms",
