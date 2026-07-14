@@ -176,6 +176,10 @@ private:
     bool m_showTimeline = true;
     bool m_showSegments = false;
     bool m_segmentsClosedManually = false;
+    // One-shot: suppress focus when the Marks panel is auto-opened by a
+    // Ctrl+Drag in progress — a newly appearing window takes focus and ImGui
+    // clears the active ID on focus change, which would drop the drag.
+    bool m_segmentsNoFocusOnOpen = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
     // Reset Layout briefly forces Marks/Help visible so their Begin blocks

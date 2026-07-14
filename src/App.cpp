@@ -2682,8 +2682,10 @@ void App::Render() {
                     if (m_barCtrlSegIdx < 0) {
                         int before = m_segments.GetTotalCount();
                         m_barCtrlSegIdx = m_segments.AddSegment(a, b);
-                        if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually)
+                        if (m_segments.GetTotalCount() > before && !m_showSegments && !m_segmentsClosedManually) {
                             m_showSegments = true;
+                            m_segmentsNoFocusOnOpen = true;
+                        }
                     } else {
                         m_segments.UpdateSegment(m_barCtrlSegIdx, a, b);
                     }
@@ -2779,7 +2781,9 @@ void App::Render() {
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * uiScale, vp->WorkPos.y + 40 * uiScale), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(marksW, marksH), layoutCond);
     bool segmentsWasOpen = m_showSegments;
-    ImGui::Begin("Marks", &m_showSegments);
+    ImGui::Begin("Marks", &m_showSegments,
+                 m_segmentsNoFocusOnOpen ? ImGuiWindowFlags_NoFocusOnAppearing : 0);
+    m_segmentsNoFocusOnOpen = false;
 
     // Pending mark-in indicator
     if (m_segments.HasPendingMarkIn()) {
