@@ -881,6 +881,11 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
                 if (captured) av_frame_free(&captured);
                 captured = av_frame_clone(decFrame);
             } else {
+                // Target precedes the first frame — streams often start
+                // slightly past 0 (e.g. WebM with a 12ms start_time), so a
+                // mark at 0.0s has no frame at-or-before it. Use the first
+                // frame instead of failing.
+                if (!captured) captured = av_frame_clone(decFrame);
                 pastTarget = true;
                 av_frame_unref(decFrame);
                 break;
