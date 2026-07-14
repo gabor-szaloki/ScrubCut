@@ -54,9 +54,16 @@ public:
     // Flush() before sending more packets to it.
     void DrainAtEOF(AVFrame* tmp, const std::function<bool(AVFrame*)>& onFrame);
 
+    // Display dimensions: coded size minus any container-level cropping.
     int GetWidth() const;
     int GetHeight() const;
     AVPixelFormat GetPixelFormat() const;
 private:
+    // Apply container-level (e.g. Matroska PixelCrop*) cropping to a decoded
+    // frame. Codec-level cropping is applied by libavcodec itself; container
+    // cropping is exported as stream side data and is the caller's job.
+    void ApplyContainerCrop(AVFrame* frame);
+
     AVCodecContext* m_codecCtx = nullptr;
+    unsigned m_cropTop = 0, m_cropBottom = 0, m_cropLeft = 0, m_cropRight = 0;
 };
