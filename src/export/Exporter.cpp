@@ -102,8 +102,16 @@ void Exporter::ExportThread() {
             std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
             LOG_INFO("Exporting segment %d/%d (GIF, source params) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
-            // 0/0.0 = "match source W/FPS" — see ExportSegmentGIF.
-            ok = ExportSegmentGIF(m_inputPath, seg, outPath, 0, 0.0);
+            // 0.0/0.0 = "match source scale/FPS" — see ExportSegmentGIF.
+            ok = ExportSegmentGIF(m_inputPath, seg, outPath, 0.0, 0.0);
+        } else if (seg.mode == ExportMode::SourceFormat && seg.crop.Active()) {
+            // Stream copy can't crop — decode, crop, and re-encode to H.264
+            // MP4 instead. (A crop that NormalizeCrop collapses to inactive
+            // just re-encodes uncropped — rare degenerate edit, still correct.)
+            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".mp4");
+            LOG_INFO("Exporting segment %d/%d (crop re-encode) -> %s",
+                     itemsDone + 1, totalItems, outPath.c_str());
+            ok = ExportSegmentReencode(m_inputPath, seg, outPath);
         } else if (seg.mode == ExportMode::SourceFormat) {
             std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, sourceFormatExt);
             LOG_INFO("Exporting segment %d/%d (stream copy) -> %s",
@@ -125,7 +133,7 @@ void Exporter::ExportThread() {
             LOG_INFO("Exporting segment %d/%d (GIF) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentGIF(m_inputPath, seg, outPath,
-                                  m_settings.gifWidth, m_settings.gifFps);
+                                  m_settings.gifScale, m_settings.gifFps);
         }
 
         if (!ok && !m_cancel) {
@@ -398,12 +406,491 @@ cleanup:
 }
 
 // ---------------------------------------------------------------------------
+// Crop re-encode export
+// ---------------------------------------------------------------------------
+// SourceFormat segments with an active crop can't be stream-copied (packets
+// bypass the pixels entirely), so they're decoded, cropped in a filter graph,
+// and re-encoded with libx264 into MP4. Audio is stream-copied alongside when
+// effectively kept (EffectiveKeepAudio is already false at non-1× speed, so
+// audio and speed scaling never co-occur). HDR sources are tone-mapped to SDR
+// per frame via the shared GPU shader, exactly like the GIF path.
+bool Exporter::ExportSegmentReencode(const std::string& inputPath,
+                                      const TimeRange& range,
+                                      const std::string& outputPath) {
+    Demuxer demuxer;
+    if (!demuxer.Open(inputPath, "export")) {
+        m_progress.SetError("Crop: Failed to open input");
+        return false;
+    }
+
+    VideoDecoder decoder;
+    if (!decoder.Open(demuxer.GetVideoCodecParams(), /*quiet=*/true)) {
+        m_progress.SetError("Crop: Failed to open video decoder");
+        return false;
+    }
+
+    AVFormatContext* inFmt = demuxer.GetFormatContext();
+    int srcW = decoder.GetWidth();
+    int srcH = decoder.GetHeight();
+    AVPixelFormat srcFmt = decoder.GetPixelFormat();
+    AVRational srcTimeBase = demuxer.GetVideoTimeBase();
+    double srcFps = demuxer.GetVideoFrameRate();
+
+    AVCodecParameters* vpar = demuxer.GetVideoCodecParams();
+    AVColorSpace colorspace = vpar ? vpar->color_space : AVCOL_SPC_UNSPECIFIED;
+    AVColorRange colorrange = vpar ? vpar->color_range : AVCOL_RANGE_UNSPECIFIED;
+
+    VideoColorMode colorMode = vpar ? FrameConverter::ColorModeForTransfer(vpar->color_trc)
+                                    : VideoColorMode::SDR;
+    VideoColorPrimaries colorPrimaries = vpar ? FrameConverter::PrimariesForTag(vpar->color_primaries)
+                                              : VideoColorPrimaries::BT2020;
+    const bool hdr = (colorMode != VideoColorMode::SDR);
+    if (hdr && !EnsureTonemap()) {
+        m_progress.SetError("Crop: HDR export needs the GPU tone-mapper, which is unavailable");
+        return false;
+    }
+
+    // Effective crop. A crop that NormalizeCrop collapses to inactive (rare
+    // degenerate edit) falls back to the even-snapped full frame — the output
+    // is still a valid re-encode.
+    CropRect crop = NormalizeCrop(range.crop, srcW, srcH);
+    if (!crop.Active())
+        crop = {0, 0, srcW & ~1, srcH & ~1};
+    if (crop.w < 2 || crop.h < 2) {
+        m_progress.SetError("Crop: video too small to crop");
+        return false;
+    }
+
+    const AVCodec* enc = avcodec_find_encoder_by_name("libx264");
+    if (!enc) {
+        m_progress.SetError("H.264 encoder (libx264) not available in this build — "
+                            "cropped Source-format export requires it");
+        return false;
+    }
+
+    // --- Build filter graph: buffer -> crop [-> RGB->YUV] -> yuv420p -> sink ---
+    AVFilterGraph* filterGraph = avfilter_graph_alloc();
+    if (!filterGraph) {
+        m_progress.SetError("Crop: Failed to alloc filter graph");
+        return false;
+    }
+
+    // Buffer source args mirror the GIF path: HDR frames arrive already
+    // tone-mapped to sRGB RGBA, SDR frames pass through in their native
+    // format with colorspace metadata attached.
+    char bufSrcArgs[512];
+    if (hdr) {
+        snprintf(bufSrcArgs, sizeof(bufSrcArgs),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/1",
+                 srcW, srcH, static_cast<int>(AV_PIX_FMT_RGBA),
+                 srcTimeBase.num, srcTimeBase.den,
+                 static_cast<int>(std::round(srcFps)));
+    } else {
+        snprintf(bufSrcArgs, sizeof(bufSrcArgs),
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/1"
+                 ":colorspace=%d:range=%d",
+                 srcW, srcH, static_cast<int>(srcFmt),
+                 srcTimeBase.num, srcTimeBase.den,
+                 static_cast<int>(std::round(srcFps)),
+                 static_cast<int>(colorspace), static_cast<int>(colorrange));
+    }
+
+    AVFilterContext* bufSrcCtx = nullptr;
+    AVFilterContext* bufSinkCtx = nullptr;
+
+    int ret = avfilter_graph_create_filter(&bufSrcCtx, avfilter_get_by_name("buffer"),
+                                            "in", bufSrcArgs, nullptr, filterGraph);
+    if (ret < 0) {
+        m_progress.SetError("Crop: Failed to create buffer source: " + ff::ErrorString(ret));
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    ret = avfilter_graph_create_filter(&bufSinkCtx, avfilter_get_by_name("buffersink"),
+                                        "out", nullptr, nullptr, filterGraph);
+    if (ret < 0) {
+        m_progress.SetError("Crop: Failed to create buffer sink: " + ff::ErrorString(ret));
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    AVFilterInOut* inputs = avfilter_inout_alloc();
+    AVFilterInOut* outputs = avfilter_inout_alloc();
+
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = bufSrcCtx;
+    outputs->pad_idx = 0;
+    outputs->next = nullptr;
+
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = bufSinkCtx;
+    inputs->pad_idx = 0;
+    inputs->next = nullptr;
+
+    char filterDesc[256];
+    if (hdr) {
+        // Tone-mapped sRGB RGBA in: crop, then RGB -> BT.709 limited-range
+        // YUV for the 8-bit encoder.
+        snprintf(filterDesc, sizeof(filterDesc),
+                 "crop=%d:%d:%d:%d,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
+                 crop.w, crop.h, crop.x, crop.y);
+    } else {
+        // format=yuv420p absorbs any source pixel format (incl. 10-bit) into
+        // what libx264 8-bit accepts; the color matrix is untouched.
+        snprintf(filterDesc, sizeof(filterDesc),
+                 "crop=%d:%d:%d:%d,format=yuv420p",
+                 crop.w, crop.h, crop.x, crop.y);
+    }
+
+    ret = avfilter_graph_parse_ptr(filterGraph, filterDesc, &inputs, &outputs, nullptr);
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (ret < 0) {
+        m_progress.SetError("Crop: Failed to parse filter graph: " + ff::ErrorString(ret));
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    ret = avfilter_graph_config(filterGraph, nullptr);
+    if (ret < 0) {
+        m_progress.SetError("Crop: Failed to configure filter graph: " + ff::ErrorString(ret));
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    // --- Set up MP4 output: x264 video + (optionally) stream-copied audio ---
+    AVFormatContext* outFmt = nullptr;
+    ret = avformat_alloc_output_context2(&outFmt, nullptr, nullptr, outputPath.c_str());
+    if (ret < 0 || !outFmt) {
+        m_progress.SetError("Crop: Failed to create output context: " + ff::ErrorString(ret));
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    AVCodecContext* encCtx = avcodec_alloc_context3(enc);
+    encCtx->width = crop.w;
+    encCtx->height = crop.h;
+    encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    encCtx->time_base = {1, 90000};
+    double speed = (range.speed > 0.0) ? range.speed : 1.0;
+    if (srcFps > 0.0)
+        encCtx->framerate = av_d2q(srcFps * speed, 1 << 24);  // metadata only
+    if (vpar && vpar->sample_aspect_ratio.num > 0)
+        encCtx->sample_aspect_ratio = vpar->sample_aspect_ratio;
+    if (hdr) {
+        // Output is tone-mapped SDR; tag it the way the GIF path does
+        // (BT.709 primaries/matrix, sRGB transfer).
+        encCtx->color_range = AVCOL_RANGE_MPEG;
+        encCtx->colorspace = AVCOL_SPC_BT709;
+        encCtx->color_primaries = AVCOL_PRI_BT709;
+        encCtx->color_trc = AVCOL_TRC_IEC61966_2_1;
+    } else if (vpar) {
+        // Crop doesn't touch colors — pass the source tags through so x264
+        // writes matching VUI.
+        encCtx->color_range = vpar->color_range;
+        encCtx->colorspace = vpar->color_space;
+        encCtx->color_primaries = vpar->color_primaries;
+        encCtx->color_trc = vpar->color_trc;
+        encCtx->chroma_sample_location = vpar->chroma_location;
+    }
+    if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
+        encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    AVDictionary* encOpts = nullptr;
+    av_dict_set(&encOpts, "crf", "18", 0);
+    av_dict_set(&encOpts, "preset", "fast", 0);
+    ret = avcodec_open2(encCtx, enc, &encOpts);
+    av_dict_free(&encOpts);
+    if (ret < 0) {
+        m_progress.SetError("Crop: Failed to open H.264 encoder: " + ff::ErrorString(ret));
+        avcodec_free_context(&encCtx);
+        avformat_free_context(outFmt);
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    AVStream* outVideo = avformat_new_stream(outFmt, enc);
+    outVideo->time_base = encCtx->time_base;
+    avcodec_parameters_from_context(outVideo->codecpar, encCtx);
+
+    // Preserve a rotation tag if the source has one: the crop is applied in
+    // coded-frame space (pre-rotation), so carrying the display matrix keeps
+    // orientation consistent with the source in players that honor it.
+    if (vpar) {
+        const AVPacketSideData* dm = av_packet_side_data_get(
+            vpar->coded_side_data, vpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        if (dm) {
+            uint8_t* dup = static_cast<uint8_t*>(av_memdup(dm->data, dm->size));
+            if (dup && !av_packet_side_data_add(&outVideo->codecpar->coded_side_data,
+                                                &outVideo->codecpar->nb_coded_side_data,
+                                                AV_PKT_DATA_DISPLAYMATRIX, dup, dm->size, 0))
+                av_free(dup);
+        }
+    }
+
+    int videoInIdx = demuxer.GetVideoStreamIndex();
+    int audioInIdx = EffectiveKeepAudio(range) ? demuxer.GetAudioStreamIndex() : -1;
+    int audioOutIdx = -1;
+    if (audioInIdx >= 0) {
+        AVStream* outAudio = avformat_new_stream(outFmt, nullptr);
+        if (outAudio) {
+            avcodec_parameters_copy(outAudio->codecpar, inFmt->streams[audioInIdx]->codecpar);
+            outAudio->codecpar->codec_tag = 0;
+            outAudio->time_base = inFmt->streams[audioInIdx]->time_base;
+            audioOutIdx = outAudio->index;
+        }
+    }
+
+    if (!(outFmt->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&outFmt->pb, outputPath.c_str(), AVIO_FLAG_WRITE);
+        if (ret < 0) {
+            m_progress.SetError("Crop: Failed to open output file: " + ff::ErrorString(ret));
+            avcodec_free_context(&encCtx);
+            avformat_free_context(outFmt);
+            avfilter_graph_free(&filterGraph);
+            return false;
+        }
+    }
+
+    ret = avformat_write_header(outFmt, nullptr);
+    if (ret < 0) {
+        // Most likely an MP4-incompatible audio codec (e.g. Vorbis from MKV).
+        m_progress.SetError("Crop: Failed to write header: " + ff::ErrorString(ret));
+        avcodec_free_context(&encCtx);
+        avio_closep(&outFmt->pb);
+        avformat_free_context(outFmt);
+        avfilter_graph_free(&filterGraph);
+        return false;
+    }
+
+    // --- Decode, crop, encode loop ---
+    demuxer.Seek(range.startSec);
+    decoder.Flush();
+
+    auto toPts = [](double sec, AVStream* s) -> int64_t {
+        return static_cast<int64_t>(sec / av_q2d(s->time_base));
+    };
+    int64_t audioStartPts = (audioInIdx >= 0) ? toPts(range.startSec, inFmt->streams[audioInIdx]) : 0;
+    int64_t audioEndPts   = (audioInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[audioInIdx]) : 0;
+    int64_t videoEndPts   = toPts(range.endSec, inFmt->streams[videoInIdx]);
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* decFrame = av_frame_alloc();
+    AVFrame* filtFrame = av_frame_alloc();
+    AVPacket* encPkt = av_packet_alloc();
+
+    // HDR only: converts each decoded frame to packed 10-bit, then the shader
+    // tone-maps it to the SDR RGBA8 that gets fed into the (rgba) filter graph.
+    FrameConverter hdrConv;
+    std::vector<uint8_t> tmRGBA;
+
+    double segDuration = range.endSec - range.startSec;
+    int64_t lastOutPts = -1;
+    bool videoDone = false;   // saw a decoded frame past mark-out
+    bool feedDone = false;    // stopped feeding video packets (DTS margin)
+    bool audioDone = (audioInIdx < 0);
+    bool failed = false;
+
+    // Pull every packet the encoder has ready; flush=true drains it at EOF.
+    auto drainEncoder = [&](bool flush) -> bool {
+        if (flush) avcodec_send_frame(encCtx, nullptr);
+        while (true) {
+            int r = avcodec_receive_packet(encCtx, encPkt);
+            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return true;
+            if (r < 0) {
+                m_progress.SetError("Crop: Encode error: " + ff::ErrorString(r));
+                return false;
+            }
+            av_packet_rescale_ts(encPkt, encCtx->time_base, outVideo->time_base);
+            encPkt->stream_index = outVideo->index;
+            av_interleaved_write_frame(outFmt, encPkt);
+            av_packet_unref(encPkt);
+        }
+    };
+
+    auto encodeFilteredFrames = [&]() -> bool {
+        while (true) {
+            int r = av_buffersink_get_frame(bufSinkCtx, filtFrame);
+            if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return true;
+            if (r < 0) {
+                m_progress.SetError("Crop: Filter error: " + ff::ErrorString(r));
+                return false;
+            }
+            // Trim-rebase and per-segment speed in one step: map the source
+            // frame time onto the zero-based output timeline. (The crop graph
+            // preserves pts in the source time base.)
+            double t = (filtFrame->pts != AV_NOPTS_VALUE)
+                           ? filtFrame->pts * av_q2d(srcTimeBase) : range.startSec;
+            int64_t outPts = static_cast<int64_t>(std::llround((t - range.startSec) / speed * 90000.0));
+            if (outPts <= lastOutPts) outPts = lastOutPts + 1;  // keep monotonic
+            lastOutPts = outPts;
+            filtFrame->pts = outPts;
+            filtFrame->duration = 0;
+            int r2 = avcodec_send_frame(encCtx, filtFrame);
+            av_frame_unref(filtFrame);
+            if (r2 < 0) {
+                m_progress.SetError("Crop: Encode send error: " + ff::ErrorString(r2));
+                return false;
+            }
+            if (!drainEncoder(false)) return false;
+        }
+    };
+
+    // Frame-accurate trim + HDR tone-map + feed into the crop graph. Sets
+    // videoDone once display order passes mark-out; returns false on failure.
+    auto processDecodedFrame = [&](AVFrame* frame) -> bool {
+        double frameTime = static_cast<double>(frame->pts) * av_q2d(srcTimeBase);
+        if (frameTime < range.startSec) return true;  // keyframe pre-roll
+        if (frameTime > range.endSec) { videoDone = true; return true; }
+
+        if (segDuration > 0.0) {
+            float segProgress = static_cast<float>((frameTime - range.startSec) / segDuration);
+            int totalItems = std::max(1, m_progress.totalItems.load());
+            float base = static_cast<float>(m_progress.currentItem - 1) / totalItems;
+            m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalItems;
+        }
+
+        int r;
+        if (hdr) {
+            const uint8_t* packed = hdrConv.Convert(frame);
+            if (!packed || !m_tonemap.RenderToBuffer(packed, hdrConv.GetWidth(),
+                                                     hdrConv.GetHeight(), colorMode,
+                                                     colorPrimaries, m_settings.tonemapper,
+                                                     tmRGBA)) {
+                m_progress.SetError("Crop: HDR tone-map failed");
+                return false;
+            }
+            AVFrame* rgbaFrame = av_frame_alloc();
+            rgbaFrame->format = AV_PIX_FMT_RGBA;
+            rgbaFrame->width = hdrConv.GetWidth();
+            rgbaFrame->height = hdrConv.GetHeight();
+            if (av_frame_get_buffer(rgbaFrame, 0) < 0) {
+                av_frame_free(&rgbaFrame);
+                m_progress.SetError("Crop: Failed to alloc RGBA frame");
+                return false;
+            }
+            for (int y = 0; y < rgbaFrame->height; y++) {
+                memcpy(rgbaFrame->data[0] + static_cast<size_t>(y) * rgbaFrame->linesize[0],
+                       tmRGBA.data() + static_cast<size_t>(y) * rgbaFrame->width * 4,
+                       static_cast<size_t>(rgbaFrame->width) * 4);
+            }
+            rgbaFrame->pts = frame->pts;
+            r = av_buffersrc_add_frame_flags(bufSrcCtx, rgbaFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
+            av_frame_free(&rgbaFrame);
+        } else {
+            r = av_buffersrc_add_frame(bufSrcCtx, frame);
+        }
+        if (r < 0) {
+            m_progress.SetError("Crop: Failed to feed filter: " + ff::ErrorString(r));
+            return false;
+        }
+        return encodeFilteredFrames();
+    };
+
+    while (!failed && !m_cancel) {
+        int r = demuxer.ReadPacket(pkt);
+        if (r == AVERROR_EOF) {
+            av_packet_unref(pkt);
+            break;
+        }
+        if (r < 0) {
+            m_progress.SetError("Crop: Read error: " + ff::ErrorString(r));
+            failed = true;
+            break;
+        }
+
+        if (pkt->stream_index == videoInIdx && !feedDone && !videoDone) {
+            // Stop feeding via DTS (monotonic) with a 1s margin for B-frame
+            // reorder depth — same rule as the stream-copy path, so trailing
+            // B-frames at mark-out aren't lost.
+            int64_t marginTs = static_cast<int64_t>(1.0 / av_q2d(srcTimeBase));
+            if (pkt->dts != AV_NOPTS_VALUE && pkt->dts > videoEndPts + marginTs) {
+                feedDone = true;
+            } else {
+                decoder.SendPacket(pkt);
+                while (!failed && !videoDone) {
+                    int rf = decoder.ReceiveFrame(decFrame);
+                    if (rf == AVERROR(EAGAIN) || rf == AVERROR_EOF) break;
+                    if (rf < 0) {
+                        m_progress.SetError("Crop: Decode error: " + ff::ErrorString(rf));
+                        failed = true;
+                        break;
+                    }
+                    if (!processDecodedFrame(decFrame)) failed = true;
+                    av_frame_unref(decFrame);
+                }
+            }
+        } else if (pkt->stream_index == audioInIdx && !audioDone) {
+            // Stream-copy audio within [mark-in, mark-out], rebased to zero.
+            // Unlike the stream-copy path there's no pre-roll to hide behind
+            // an edit list — the re-encoded video starts exactly at mark-in —
+            // so pre-start audio is dropped instead of emitted with negative
+            // pts (worst-case start misalignment: one audio frame).
+            if (pkt->pts != AV_NOPTS_VALUE && pkt->pts > audioEndPts) {
+                audioDone = true;
+            } else if (pkt->pts != AV_NOPTS_VALUE && pkt->pts >= audioStartPts) {
+                AVStream* inS = inFmt->streams[audioInIdx];
+                AVStream* outS = outFmt->streams[audioOutIdx];
+                pkt->stream_index = audioOutIdx;
+                pkt->pts = av_rescale_q(pkt->pts - audioStartPts, inS->time_base, outS->time_base);
+                pkt->dts = (pkt->dts != AV_NOPTS_VALUE)
+                               ? av_rescale_q(pkt->dts - audioStartPts, inS->time_base, outS->time_base)
+                               : pkt->pts;
+                pkt->duration = av_rescale_q(pkt->duration, inS->time_base, outS->time_base);
+                pkt->pos = -1;
+                int wr = av_interleaved_write_frame(outFmt, pkt);
+                if (wr < 0) {
+                    m_progress.SetError("Crop: Audio write error: " + ff::ErrorString(wr));
+                    failed = true;
+                }
+            }
+        }
+        av_packet_unref(pkt);
+
+        if ((videoDone || feedDone) && audioDone) break;
+    }
+
+    // Drain the decoder's threading pipeline (see VideoDecoder::DrainAtEOF) —
+    // without this the last ~thread_count frames before mark-out are lost.
+    if (!failed && !m_cancel && !videoDone) {
+        decoder.DrainAtEOF(decFrame, [&](AVFrame* f) -> bool {
+            if (m_cancel || videoDone) return false;
+            if (!processDecodedFrame(f)) { failed = true; return false; }
+            return !videoDone;
+        });
+    }
+
+    // Flush filter graph, then the encoder. On cancel we still finalize so
+    // the partial MP4 stays playable (same semantics as the GIF path).
+    if (!failed) {
+        if (av_buffersrc_add_frame(bufSrcCtx, nullptr) < 0 || !encodeFilteredFrames())
+            failed = true;
+    }
+    if (!failed) {
+        if (!drainEncoder(true)) failed = true;
+    }
+
+    av_write_trailer(outFmt);
+
+    av_packet_free(&pkt);
+    av_frame_free(&decFrame);
+    av_frame_free(&filtFrame);
+    av_packet_free(&encPkt);
+    avcodec_free_context(&encCtx);
+    if (!(outFmt->oformat->flags & AVFMT_NOFILE))
+        avio_closep(&outFmt->pb);
+    avformat_free_context(outFmt);
+    avfilter_graph_free(&filterGraph);
+    return !failed;
+}
+
+// ---------------------------------------------------------------------------
 // GIF export
 // ---------------------------------------------------------------------------
 bool Exporter::ExportSegmentGIF(const std::string& inputPath,
                                  const TimeRange& range,
                                  const std::string& outputPath,
-                                 int gifWidth, double gifFps) {
+                                 double gifScale, double gifFps) {
     // Open input
     Demuxer demuxer;
     if (!demuxer.Open(inputPath, "export")) {
@@ -427,7 +914,7 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     // the source itself is a GIF and the user picked SourceFormat — we still
     // have to re-encode (the GIF muxer has no edit-list trim), but we want
     // dimensions and frame rate to match the input.
-    if (gifWidth <= 0) gifWidth = srcW;
+    if (gifScale <= 0.0) gifScale = 1.0;
     if (gifFps <= 0.0) gifFps = (srcFps > 0.0) ? srcFps : 15.0;
 
     // Get color space info from codec params to avoid filter graph warnings
@@ -448,8 +935,15 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
         return false;
     }
 
-    // Compute output height maintaining aspect ratio (must be even)
-    int outH = (gifWidth * srcH / srcW) & ~1;
+    // Output size: the scale multiplier applies to the cropped source dims.
+    // A uniform multiplier preserves aspect by construction; even-snap both
+    // axes (matches the pre-multiplier behavior and keeps sizes codec-safe).
+    CropRect crop = NormalizeCrop(range.crop, srcW, srcH);
+    int baseW = crop.Active() ? crop.w : srcW;
+    int baseH = crop.Active() ? crop.h : srcH;
+    int outW = static_cast<int>(std::lround(baseW * gifScale)) & ~1;
+    int outH = static_cast<int>(std::lround(baseH * gifScale)) & ~1;
+    if (outW < 2) outW = 2;
     if (outH < 2) outH = 2;
 
     // --- Build filter graph ---
@@ -518,25 +1012,30 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     // src_duration/speed: slow-mo gets MORE unique frames (smoother
     // motion) and fast-forward gets FEWER (no redundant duplicates).
     double srcSampleFps = (range.speed > 0.0) ? gifFps / range.speed : gifFps;
-    char filterDesc[512];
+    // Optional crop, first in the chain so its coordinates are in source
+    // pixels and scaling operates on the cropped region.
+    char cropDesc[64] = "";
+    if (crop.Active())
+        snprintf(cropDesc, sizeof(cropDesc), "crop=%d:%d:%d:%d,", crop.w, crop.h, crop.x, crop.y);
+    char filterDesc[576];
     if (hdr) {
         // HDR frames arrive already tone-mapped to sRGB BT.709 RGBA, so the
         // colorspace conversion is skipped — just resample, scale, and palettize.
         snprintf(filterDesc, sizeof(filterDesc),
-                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,format=rgb24,"
+                 "%sfps=fps=%.4f,scale=%d:%d:flags=lanczos,format=rgb24,"
                  "split[a][b];"
                  "[a]palettegen=stats_mode=full[p];"
                  "[b][p]paletteuse=dither=bayer:bayer_scale=3",
-                 srcSampleFps, gifWidth, outH);
+                 cropDesc, srcSampleFps, outW, outH);
     } else {
         snprintf(filterDesc, sizeof(filterDesc),
-                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,"
+                 "%sfps=fps=%.4f,scale=%d:%d:flags=lanczos,"
                  "format=rgb24,colorspace=all=bt709:iall=bt709:fast=1,"
                  "setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1,"
                  "split[a][b];"
                  "[a]palettegen=stats_mode=full[p];"
                  "[b][p]paletteuse=dither=bayer:bayer_scale=3",
-                 srcSampleFps, gifWidth, outH);
+                 cropDesc, srcSampleFps, outW, outH);
     }
 
     ret = avfilter_graph_parse_ptr(filterGraph, filterDesc, &inputs, &outputs, nullptr);
@@ -574,7 +1073,7 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
 
     AVStream* outStream = avformat_new_stream(outFmt, gifCodec);
     AVCodecContext* encCtx = avcodec_alloc_context3(gifCodec);
-    encCtx->width = gifWidth;
+    encCtx->width = outW;
     encCtx->height = outH;
     encCtx->pix_fmt = AV_PIX_FMT_PAL8;
     // GIF stores delays in centiseconds (1/100s), so use that as time_base
@@ -938,7 +1437,16 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
         rgba = tonemapped.data();
     }
 
-    int ok = stbi_write_png(outputPath.c_str(), W, H, 4, rgba, W * 4);
+    // Apply the mark's crop as a pointer offset into the RGBA buffer (stride
+    // stays the full row). NormalizeCrop keeps the PNG pixel-identical to the
+    // segment export paths and the viewport preview.
+    int outX = 0, outY = 0, outW = W, outH = H;
+    CropRect crop = NormalizeCrop(frame.crop, W, H);
+    if (crop.Active()) {
+        outX = crop.x; outY = crop.y; outW = crop.w; outH = crop.h;
+    }
+    int ok = stbi_write_png(outputPath.c_str(), outW, outH, 4,
+                            rgba + (static_cast<size_t>(outY) * W + outX) * 4, W * 4);
     av_frame_free(&captured);
 
     if (!ok) {

@@ -485,6 +485,108 @@ void App::Run() {
         ProcessEvents();
         m_player.PollSeekComplete();
 
+        // Autonomous-test hooks: let scripted runs (agents / CI) set up crop
+        // marks, park the playhead, capture a screenshot of the composited
+        // frame, and exit — all without a human at the keyboard.
+        //   -test-marks             add overlapping cropped segments + a cropped frame mark
+        //   -seek-to <sec>          pause and seek once the file is open
+        //   -screenshot-after <sec> take an F12-style screenshot N sec after launch
+        //   -quit-after <sec>       exit N sec after launch
+        {
+            static bool testMarksPending = CommandLine::Get().HasFlag("-test-marks");
+            static double seekTo = atof(CommandLine::Get().GetValue("-seek-to", "-1").c_str());
+            static double shotAfter = atof(CommandLine::Get().GetValue("-screenshot-after", "0").c_str());
+            static double quitAfter = atof(CommandLine::Get().GetValue("-quit-after", "0").c_str());
+            static bool seekDone = false;
+            static bool shotDone = false;
+            bool mediaReady = m_player.HasMedia() && m_player.GetDuration() > 0.0 &&
+                              m_videoWidth > 0 && m_videoHeight > 0;
+            if (testMarksPending && mediaReady) {
+                testMarksPending = false;
+                double dur = m_player.GetDuration();
+                int s1 = m_segments.AddSegment(0.0, std::min(2.0, dur));
+                m_segments.SetSegmentCrop(s1, {m_videoWidth / 4, m_videoHeight / 4,
+                                               m_videoWidth / 2, m_videoHeight / 2});
+                // Same left/right edges as s1 but shifted vertically, and an
+                // overlapping time range — exercises the multi-color dashes.
+                int s2 = m_segments.AddSegment(std::min(1.0, dur * 0.5), std::min(3.0, dur));
+                m_segments.SetSegmentCrop(s2, {m_videoWidth / 4, m_videoHeight / 8,
+                                               m_videoWidth / 2, m_videoHeight / 2});
+                int f1 = m_segments.AddFrame(0.5);
+                m_segments.SetFrameCrop(f1, {0, 0, m_videoWidth / 2, m_videoHeight / 2});
+                m_showSegments = true;
+            }
+            // Wait for the first frame (m_displayTexture) before pausing and
+            // seeking — pausing pre-first-frame can leave the viewport blank.
+            if (seekTo >= 0.0 && !seekDone && mediaReady && m_displayTexture) {
+                seekDone = true;
+                m_player.Pause();
+                m_player.SeekTo(seekTo);
+                m_seekTarget = seekTo;
+            }
+            // -test-drag vx0:vy0:vx1:vy1 — synthesize a left-button drag from
+            // one video-pixel position to another (one event per frame through
+            // the real SDL/ImGui input path), after -seek-to has parked the
+            // playhead. Exercises crop-rect hit-testing and drag commits.
+            static std::string dragSpec = CommandLine::Get().GetValue("-test-drag", "");
+            static int dragStep = -1;
+            static float dvx0, dvy0, dvx1, dvy1;
+            if (!dragSpec.empty() && seekDone && m_lastImgValid) {
+                if (dragStep < 0) {
+                    if (sscanf(dragSpec.c_str(), "%f:%f:%f:%f", &dvx0, &dvy0, &dvx1, &dvy1) == 4)
+                        dragStep = 0;
+                    else
+                        dragSpec.clear();
+                }
+                const int kMoveSteps = 20;
+                if (dragStep >= 0 && dragStep <= kMoveSteps + 2) {
+                    auto v2s = [&](float vx, float vy) -> ImVec2 {
+                        return ImVec2(
+                            m_lastImgMin.x + vx * (m_lastImgMax.x - m_lastImgMin.x) / m_videoWidth,
+                            m_lastImgMin.y + vy * (m_lastImgMax.y - m_lastImgMin.y) / m_videoHeight);
+                    };
+                    auto pushMotion = [&](ImVec2 p) {
+                        SDL_Event ev = {};
+                        ev.type = SDL_EVENT_MOUSE_MOTION;
+                        ev.motion.windowID = SDL_GetWindowID(m_window);
+                        ev.motion.x = p.x;
+                        ev.motion.y = p.y;
+                        SDL_PushEvent(&ev);
+                    };
+                    auto pushButton = [&](ImVec2 p, bool down) {
+                        SDL_Event ev = {};
+                        ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+                        ev.button.windowID = SDL_GetWindowID(m_window);
+                        ev.button.button = SDL_BUTTON_LEFT;
+                        ev.button.down = down;
+                        ev.button.clicks = 1;
+                        ev.button.x = p.x;
+                        ev.button.y = p.y;
+                        SDL_PushEvent(&ev);
+                    };
+                    if (dragStep == 0) {
+                        pushMotion(v2s(dvx0, dvy0));
+                    } else if (dragStep == 1) {
+                        pushButton(v2s(dvx0, dvy0), true);
+                    } else if (dragStep <= 1 + kMoveSteps) {
+                        float f = static_cast<float>(dragStep - 1) / kMoveSteps;
+                        pushMotion(v2s(dvx0 + (dvx1 - dvx0) * f, dvy0 + (dvy1 - dvy0) * f));
+                    } else {
+                        pushButton(v2s(dvx1, dvy1), false);
+                    }
+                    dragStep++;
+                }
+            }
+
+            double now = static_cast<double>(SDL_GetTicksNS()) * 1e-9;
+            if (shotAfter > 0.0 && !shotDone && now >= shotAfter) {
+                shotDone = true;
+                m_screenshotPending = true;
+            }
+            if (quitAfter > 0.0 && now >= quitAfter)
+                m_running = false;
+        }
+
         // While HDR output is active, poll the OS HDR state every frame so
         // the UI tracks the SDR-brightness slider live (cached DXGI reads,
         // ~6 us; the slider changes without any event SDL forwards). When
@@ -1085,6 +1187,430 @@ void App::RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
     dl->AddText(font, sz, ImVec2(textPos.x + 1, textPos.y + 1),
                 IM_COL32(0, 0, 0, static_cast<int>(210 * alpha)), s);
     dl->AddText(font, sz, textPos, IM_COL32(255, 255, 255, static_cast<int>(240 * alpha)), s);
+}
+
+// ---------------------------------------------------------------------------
+// Viewport crop overlay
+// ---------------------------------------------------------------------------
+
+// Map between source-video pixel coordinates and screen coordinates across
+// the aspect-fit video rect (imgMin..imgMax).
+static ImVec2 VideoToScreen(float vx, float vy, const ImVec2& imgMin, const ImVec2& imgMax,
+                            int vw, int vh) {
+    return ImVec2(imgMin.x + vx * (imgMax.x - imgMin.x) / static_cast<float>(vw),
+                  imgMin.y + vy * (imgMax.y - imgMin.y) / static_cast<float>(vh));
+}
+
+static ImVec2 ScreenToVideo(const ImVec2& p, const ImVec2& imgMin, const ImVec2& imgMax,
+                            int vw, int vh) {
+    return ImVec2((p.x - imgMin.x) * static_cast<float>(vw) / (imgMax.x - imgMin.x),
+                  (p.y - imgMin.y) * static_cast<float>(vh) / (imgMax.y - imgMin.y));
+}
+
+// Contiguous alternating-color dashes from a to b (no gaps): dash k gets
+// cols[k % n], phase anchored at `a`. Hit-testing recomputes the owner of a
+// point along the run with the same floor(d / dashLen) math, so "grab the
+// dash with your segment's color" resolves exactly.
+static void AddMultiColorDashedLine(ImDrawList* dl, const ImVec2& a, const ImVec2& b,
+                                    const ImU32* cols, int n, float dashLen, float thickness) {
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len <= 0.0f || n <= 0 || dashLen <= 0.0f) return;
+    float ux = dx / len, uy = dy / len;
+    int k = 0;
+    for (float d = 0.0f; d < len; d += dashLen, k++) {
+        float e = std::min(d + dashLen, len);
+        dl->AddLine(ImVec2(a.x + ux * d, a.y + uy * d),
+                    ImVec2(a.x + ux * e, a.y + uy * e), cols[k % n], thickness);
+    }
+}
+
+// UI-side crop sanitation: clamp into the frame with a usable minimum size,
+// snap to even coords (mirroring NormalizeCrop so the preview is exactly what
+// exports), and collapse a full-frame rect back to the inactive sentinel.
+static CropRect ClampCropUI(CropRect c, int vw, int vh) {
+    if (vw < 2 || vh < 2) return {};
+    int minW = std::min(16, vw & ~1);
+    int minH = std::min(16, vh & ~1);
+    c.x = std::clamp(c.x, 0, vw - minW) & ~1;
+    c.y = std::clamp(c.y, 0, vh - minH) & ~1;
+    c.w = std::clamp(c.w, minW, vw - c.x) & ~1;
+    c.h = std::clamp(c.h, minH, vh - c.y) & ~1;
+    return NormalizeCrop(c, vw, vh);
+}
+
+bool App::RenderCropOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
+    if (m_videoWidth <= 0 || m_videoHeight <= 0) return false;
+    if (imgMax.x - imgMin.x < 1.0f || imgMax.y - imgMin.y < 1.0f) return false;
+    const int vw = m_videoWidth, vh = m_videoHeight;
+
+    const auto& segs = m_segments.GetSegments();
+    const auto& frames = m_segments.GetFrames();
+    if (segs.empty() && frames.empty()) {
+        m_cropDrag = CropDrag{};
+        return false;
+    }
+
+    // Full-frame rect for marks with no crop yet — its border doubles as the
+    // grab target for starting a crop.
+    auto effectiveRect = [&](const CropRect& c) -> CropRect {
+        CropRect n = NormalizeCrop(c, vw, vh);
+        if (!n.Active()) return {0, 0, vw, vh};
+        return n;
+    };
+
+    // --- Collect marks whose crop rect is visible at the playhead ---
+    double t = m_seekTarget;
+    double frameDur = m_player.GetFrameDuration();
+    if (frameDur <= 0.0) frameDur = 1.0 / 30.0;
+
+    struct ActiveCrop {
+        bool isFrame;
+        int index;
+        uint64_t addSeq;
+        CropRect eff;    // effective rect in video px (full frame when no crop)
+        bool cropped;    // mark has an actual crop set (enables body-move)
+        ImU32 color;
+        ImVec2 p0, p1;   // screen-space corners, inset by half thickness
+    };
+    std::vector<ActiveCrop> active;
+
+    auto isDragged = [&](bool isFrame, int index, uint64_t seq) {
+        return m_cropDrag.active && m_cropDrag.isFrame == isFrame &&
+               m_cropDrag.index == index && m_cropDrag.addSeq == seq;
+    };
+    for (int i = 0; i < static_cast<int>(segs.size()); i++) {
+        bool inRange = segs[i].startSec <= t && t <= segs[i].endSec;
+        // A drag in progress keeps its rect alive even if playback moved on.
+        if (!inRange && !isDragged(false, i, segs[i].addSeq)) continue;
+        active.push_back({false, i, segs[i].addSeq, effectiveRect(segs[i].crop),
+                          NormalizeCrop(segs[i].crop, vw, vh).Active(),
+                          GetSegmentColor(segs[i].colorIndex, m_uiAlpha), ImVec2(), ImVec2()});
+    }
+    for (int i = 0; i < static_cast<int>(frames.size()); i++) {
+        // Frame marks are visible only on their exact frame.
+        bool onFrame = frames[i].timeSec <= t && t < frames[i].timeSec + frameDur;
+        if (!onFrame && !isDragged(true, i, frames[i].addSeq)) continue;
+        active.push_back({true, i, frames[i].addSeq, effectiveRect(frames[i].crop),
+                          NormalizeCrop(frames[i].crop, vw, vh).Active(),
+                          GetSegmentColor(frames[i].colorIndex, m_uiAlpha), ImVec2(), ImVec2()});
+    }
+    if (active.empty()) {
+        m_cropDrag = CropDrag{};
+        return false;
+    }
+    std::sort(active.begin(), active.end(),
+              [](const ActiveCrop& a, const ActiveCrop& b) { return a.addSeq < b.addSeq; });
+
+    float uiScale = m_ui.GetUiScale();
+    ImGuiIO& io = ImGui::GetIO();
+    const float grab = 6.0f * uiScale;
+    const float dashLen = 14.0f * uiScale;
+    const float coincideEps = 3.0f * uiScale;
+    const float clickThreshold = 4.0f * uiScale;
+
+    // --- Process an in-progress drag (updates the model before drawing) ---
+    bool dragActive = false;
+    if (m_cropDrag.active) {
+        // Revalidate: the mark may have been deleted / the file changed.
+        bool valid;
+        if (m_cropDrag.isFrame) {
+            valid = m_cropDrag.index < static_cast<int>(frames.size()) &&
+                    frames[m_cropDrag.index].addSeq == m_cropDrag.addSeq;
+        } else {
+            valid = m_cropDrag.index < static_cast<int>(segs.size()) &&
+                    segs[m_cropDrag.index].addSeq == m_cropDrag.addSeq;
+        }
+        if (!valid || !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            // Release inside a cropped rect without moving = the click-to-pause
+            // the press was withheld from (fires on release instead).
+            if (valid && m_cropDrag.handle == CropHandle::Body && !m_cropDrag.moved)
+                TogglePlayPauseWithFlash();
+            if (valid) {
+                const CropRect& c = m_cropDrag.isFrame ? frames[m_cropDrag.index].crop
+                                                       : segs[m_cropDrag.index].crop;
+                LOG_INFO("CropDrag end: %s idx=%d crop=%d,%d,%d,%d",
+                         m_cropDrag.isFrame ? "frame" : "segment", m_cropDrag.index,
+                         c.x, c.y, c.w, c.h);
+            }
+            m_cropDrag = CropDrag{};
+        } else {
+            dragActive = true;
+            ImVec2 mv = ScreenToVideo(io.MousePos, imgMin, imgMax, vw, vh);
+            float dx = mv.x - m_cropDrag.startMouseVideo.x;
+            float dy = mv.y - m_cropDrag.startMouseVideo.y;
+            float mdx = io.MousePos.x - m_cropDrag.startMouseScreen.x;
+            float mdy = io.MousePos.y - m_cropDrag.startMouseScreen.y;
+            if (mdx * mdx + mdy * mdy > clickThreshold * clickThreshold)
+                m_cropDrag.moved = true;
+
+            // Rebuild from the mouse-down snapshot every frame — no
+            // accumulation drift, and clamping can't walk the rect.
+            const CropRect& sc = m_cropDrag.startCrop;
+            float x0 = static_cast<float>(sc.x), y0 = static_cast<float>(sc.y);
+            float x1 = static_cast<float>(sc.x + sc.w), y1 = static_cast<float>(sc.y + sc.h);
+            CropHandle h = m_cropDrag.handle;
+            bool west  = h == CropHandle::W || h == CropHandle::NW || h == CropHandle::SW;
+            bool east  = h == CropHandle::E || h == CropHandle::NE || h == CropHandle::SE;
+            bool north = h == CropHandle::N || h == CropHandle::NW || h == CropHandle::NE;
+            bool south = h == CropHandle::S || h == CropHandle::SW || h == CropHandle::SE;
+            if (h == CropHandle::Body) {
+                if (m_cropDrag.moved) {
+                    float ox = std::clamp(dx, -x0, static_cast<float>(vw) - x1);
+                    float oy = std::clamp(dy, -y0, static_cast<float>(vh) - y1);
+                    x0 += ox; x1 += ox;
+                    y0 += oy; y1 += oy;
+                }
+            } else {
+                float minW = static_cast<float>(std::min(16, vw & ~1));
+                float minH = static_cast<float>(std::min(16, vh & ~1));
+                if (west)  x0 = std::clamp(x0 + dx, 0.0f, x1 - minW);
+                if (east)  x1 = std::clamp(x1 + dx, x0 + minW, static_cast<float>(vw));
+                if (north) y0 = std::clamp(y0 + dy, 0.0f, y1 - minH);
+                if (south) y1 = std::clamp(y1 + dy, y0 + minH, static_cast<float>(vh));
+            }
+            CropRect out{static_cast<int>(std::lround(x0)), static_cast<int>(std::lround(y0)),
+                         static_cast<int>(std::lround(x1 - x0)), static_cast<int>(std::lround(y1 - y0))};
+            out = ClampCropUI(out, vw, vh);
+            if (m_cropDrag.isFrame) m_segments.SetFrameCrop(m_cropDrag.index, out);
+            else                    m_segments.SetSegmentCrop(m_cropDrag.index, out);
+
+            // Refresh the dragged entry so this frame draws the new rect.
+            for (auto& ac : active) {
+                if (ac.isFrame == m_cropDrag.isFrame && ac.index == m_cropDrag.index) {
+                    ac.eff = effectiveRect(out);
+                    ac.cropped = out.Active();
+                }
+            }
+        }
+    }
+
+    // --- Screen-space rects (inset by half thickness so borders on the frame
+    // edge stay visible) ---
+    const float th = std::max(1.0f, 2.0f * uiScale);
+    for (auto& ac : active) {
+        ImVec2 p0 = VideoToScreen(static_cast<float>(ac.eff.x), static_cast<float>(ac.eff.y),
+                                  imgMin, imgMax, vw, vh);
+        ImVec2 p1 = VideoToScreen(static_cast<float>(ac.eff.x + ac.eff.w),
+                                  static_cast<float>(ac.eff.y + ac.eff.h),
+                                  imgMin, imgMax, vw, vh);
+        ac.p0 = ImVec2(p0.x + th * 0.5f, p0.y + th * 0.5f);
+        ac.p1 = ImVec2(p1.x - th * 0.5f, p1.y - th * 0.5f);
+    }
+
+    // --- Group near-coincident edges for the alternating-dash treatment ---
+    // Edge: 0=N, 1=S, 2=W, 3=E. Horizontal edges have pos=y span=x, vertical
+    // pos=x span=y.
+    struct Edge {
+        int rect;        // index into `active`
+        bool horizontal;
+        float pos, s0, s1;
+    };
+    std::vector<Edge> edges;
+    edges.reserve(active.size() * 4);
+    for (int i = 0; i < static_cast<int>(active.size()); i++) {
+        const ActiveCrop& ac = active[i];
+        edges.push_back({i, true,  ac.p0.y, ac.p0.x, ac.p1.x});  // N
+        edges.push_back({i, true,  ac.p1.y, ac.p0.x, ac.p1.x});  // S
+        edges.push_back({i, false, ac.p0.x, ac.p0.y, ac.p1.y});  // W
+        edges.push_back({i, false, ac.p1.x, ac.p0.y, ac.p1.y});  // E
+    }
+    // Cluster greedily (counts are tiny). A group is a set of edges with the
+    // same orientation, positions within coincideEps, and overlapping spans.
+    struct EdgeGroup {
+        std::vector<int> members;    // indices into `edges`
+        std::vector<int> rects;      // owning rects, addSeq order, deduped
+        float pos = 0.0f;            // mean position
+        float runS0 = 0.0f, runS1 = 0.0f;  // shared interval
+    };
+    std::vector<EdgeGroup> groups;
+    std::vector<int> edgeGroup(edges.size(), -1);
+    for (int e = 0; e < static_cast<int>(edges.size()); e++) {
+        for (int g = 0; g < static_cast<int>(groups.size()); g++) {
+            bool matches = false;
+            for (int m : groups[g].members) {
+                if (edges[m].horizontal == edges[e].horizontal &&
+                    std::fabs(edges[m].pos - edges[e].pos) < coincideEps &&
+                    edges[m].s0 < edges[e].s1 && edges[e].s0 < edges[m].s1 &&
+                    edges[m].rect != edges[e].rect) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (matches) {
+                groups[g].members.push_back(e);
+                edgeGroup[e] = g;
+                break;
+            }
+        }
+        if (edgeGroup[e] < 0) {
+            groups.push_back({{e}, {}, 0.0f, 0.0f, 0.0f});
+            edgeGroup[e] = static_cast<int>(groups.size()) - 1;
+        }
+    }
+    for (auto& g : groups) {
+        if (g.members.size() < 2) continue;
+        g.pos = 0.0f;
+        g.runS0 = -FLT_MAX;
+        g.runS1 = FLT_MAX;
+        for (int m : g.members) {
+            g.pos += edges[m].pos;
+            g.runS0 = std::max(g.runS0, edges[m].s0);
+            g.runS1 = std::min(g.runS1, edges[m].s1);
+            bool seen = false;
+            for (int r : g.rects) seen |= (r == edges[m].rect);
+            if (!seen) g.rects.push_back(edges[m].rect);  // `active` is addSeq-sorted
+        }
+        g.pos /= static_cast<float>(g.members.size());
+    }
+
+    // --- Hit-test (hover classification), unless a drag owns the mouse ---
+    // Manual, not ImGui items: on a shared edge the owner depends on which
+    // dash the mouse is over, which items can't express.
+    int hitRect = -1;
+    CropHandle hitHandle = CropHandle::None;
+    ImVec2 mouse = io.MousePos;
+    bool mouseOverVideo = ImGui::IsWindowHovered() &&
+                          mouse.x >= imgMin.x && mouse.x <= imgMax.x &&
+                          mouse.y >= imgMin.y && mouse.y <= imgMax.y;
+    if (!dragActive && mouseOverVideo && !ImGui::IsAnyItemActive()) {
+        // Corners beat edges beat body.
+        float bestCorner = FLT_MAX, bestEdge = FLT_MAX, bestBodyArea = FLT_MAX;
+        int bestEdgeIdx = -1;
+        for (int i = 0; i < static_cast<int>(active.size()); i++) {
+            const ActiveCrop& ac = active[i];
+            float dx0 = std::fabs(mouse.x - ac.p0.x), dx1 = std::fabs(mouse.x - ac.p1.x);
+            float dy0 = std::fabs(mouse.y - ac.p0.y), dy1 = std::fabs(mouse.y - ac.p1.y);
+            struct { float dx, dy; CropHandle h; } corners[4] = {
+                {dx0, dy0, CropHandle::NW}, {dx1, dy0, CropHandle::NE},
+                {dx0, dy1, CropHandle::SW}, {dx1, dy1, CropHandle::SE},
+            };
+            for (const auto& c : corners) {
+                if (c.dx <= grab && c.dy <= grab) {
+                    float d = std::max(c.dx, c.dy);
+                    // Ties go to the later-added mark (drawn on top).
+                    if (d <= bestCorner) {
+                        bestCorner = d;
+                        hitRect = i;
+                        hitHandle = c.h;
+                    }
+                }
+            }
+        }
+        if (hitRect < 0) {
+            for (int e = 0; e < static_cast<int>(edges.size()); e++) {
+                const Edge& ed = edges[e];
+                float perp = ed.horizontal ? std::fabs(mouse.y - ed.pos)
+                                           : std::fabs(mouse.x - ed.pos);
+                float along = ed.horizontal ? mouse.x : mouse.y;
+                if (perp > grab || along < ed.s0 - grab || along > ed.s1 + grab) continue;
+                const EdgeGroup& g = groups[edgeGroup[e]];
+                int owner = ed.rect;
+                if (g.rects.size() >= 2 && along >= g.runS0 && along <= g.runS1 &&
+                    g.runS1 - g.runS0 > dashLen) {
+                    // Shared run: the colored dash under the mouse owns it —
+                    // same phase math as AddMultiColorDashedLine.
+                    int k = static_cast<int>((along - g.runS0) / dashLen);
+                    owner = g.rects[k % static_cast<int>(g.rects.size())];
+                }
+                bool ownerHoveredInList = active[owner].isFrame
+                    ? (m_hoveredFrame == active[owner].index)
+                    : (m_hoveredSegment == active[owner].index);
+                // Prefer nearest; nudge the Marks-list-hovered mark ahead on
+                // near-ties so the list can disambiguate dense overlaps.
+                float score = perp - (ownerHoveredInList ? 0.5f * uiScale : 0.0f);
+                if (score <= bestEdge) {
+                    bestEdge = score;
+                    bestEdgeIdx = e;
+                    hitRect = owner;
+                    int side = e % 4;  // creation order above: N,S,W,E
+                    hitHandle = (side == 0) ? CropHandle::N
+                              : (side == 1) ? CropHandle::S
+                              : (side == 2) ? CropHandle::W : CropHandle::E;
+                }
+            }
+            (void)bestEdgeIdx;
+        }
+        if (hitRect < 0) {
+            // Body-move only for actually-cropped rects — a full-frame rect's
+            // interior must stay click-to-pause. Nested rects: the smallest
+            // one under the mouse wins (most specific).
+            for (int i = 0; i < static_cast<int>(active.size()); i++) {
+                const ActiveCrop& ac = active[i];
+                if (!ac.cropped) continue;
+                if (mouse.x <= ac.p0.x + grab || mouse.x >= ac.p1.x - grab ||
+                    mouse.y <= ac.p0.y + grab || mouse.y >= ac.p1.y - grab) continue;
+                float area = (ac.p1.x - ac.p0.x) * (ac.p1.y - ac.p0.y);
+                if (area <= bestBodyArea) {
+                    bestBodyArea = area;
+                    hitRect = i;
+                    hitHandle = CropHandle::Body;
+                }
+            }
+        }
+    }
+
+    // --- Cursor, list-hover cross-highlight, drag start ---
+    CropHandle cursorHandle = dragActive ? m_cropDrag.handle : hitHandle;
+    switch (cursorHandle) {
+        case CropHandle::W: case CropHandle::E:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW); break;
+        case CropHandle::N: case CropHandle::S:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS); break;
+        case CropHandle::NW: case CropHandle::SE:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNWSE); break;
+        case CropHandle::NE: case CropHandle::SW:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNESW); break;
+        case CropHandle::Body:
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll); break;
+        default: break;
+    }
+    if (hitRect >= 0 && !dragActive) {
+        const ActiveCrop& ac = active[hitRect];
+        if (ac.isFrame) m_hoveredFrameThisFrame = ac.index;
+        else            m_hoveredSegmentThisFrame = ac.index;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            m_cropDrag.active = true;
+            m_cropDrag.isFrame = ac.isFrame;
+            m_cropDrag.index = ac.index;
+            m_cropDrag.addSeq = ac.addSeq;
+            m_cropDrag.handle = hitHandle;
+            m_cropDrag.startCrop = ac.eff;
+            m_cropDrag.startMouseVideo = ScreenToVideo(mouse, imgMin, imgMax, vw, vh);
+            m_cropDrag.startMouseScreen = mouse;
+            m_cropDrag.moved = false;
+            dragActive = true;
+            LOG_INFO("CropDrag start: %s idx=%d handle=%d",
+                     ac.isFrame ? "frame" : "segment", ac.index,
+                     static_cast<int>(hitHandle));
+        }
+    }
+
+    // --- Draw: solid rects in addSeq order, then dashed shared runs on top ---
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->PushClipRect(imgMin, imgMax, true);
+    for (int i = 0; i < static_cast<int>(active.size()); i++) {
+        const ActiveCrop& ac = active[i];
+        bool emphasized = (dragActive && m_cropDrag.isFrame == ac.isFrame &&
+                           m_cropDrag.index == ac.index) ||
+                          (!dragActive && hitRect == i) ||
+                          (ac.isFrame ? m_hoveredFrame == ac.index
+                                      : m_hoveredSegment == ac.index);
+        dl->AddRect(ac.p0, ac.p1, ac.color, 0.0f, 0, emphasized ? th + 1.0f * uiScale : th);
+    }
+    std::vector<ImU32> dashCols;
+    for (const auto& g : groups) {
+        if (g.rects.size() < 2 || g.runS1 - g.runS0 <= 0.0f) continue;
+        dashCols.clear();
+        for (int r : g.rects) dashCols.push_back(active[r].color);
+        ImVec2 a = edges[g.members[0]].horizontal ? ImVec2(g.runS0, g.pos) : ImVec2(g.pos, g.runS0);
+        ImVec2 b = edges[g.members[0]].horizontal ? ImVec2(g.runS1, g.pos) : ImVec2(g.pos, g.runS1);
+        AddMultiColorDashedLine(dl, a, b, dashCols.data(),
+                                static_cast<int>(dashCols.size()), dashLen, th);
+    }
+    dl->PopClipRect();
+
+    return dragActive || hitRect >= 0;
 }
 
 void App::LoadRecentFiles() {
@@ -2007,11 +2533,18 @@ void App::Render() {
         ImGui::Image(reinterpret_cast<ImTextureID>(m_displayTexture), ImVec2(displayW, displayH));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
+        m_lastImgMin = imgMin;
+        m_lastImgMax = imgMax;
+        m_lastImgValid = true;
+        // Per-mark crop rect overlay. Hot (hovered handle or drag in progress)
+        // suppresses the click handlers below — crop editing chrome, so it
+        // hides with the rest of the UI.
+        bool cropHot = !m_uiHidden && RenderCropOverlay(imgMin, imgMax);
         // Click the video to toggle play/pause; double-click to toggle
         // fullscreen. ImGui fires both single and double click on the second
         // click of a double-click, so the play/pause toggles cancel out and
         // the user sees only a fullscreen change (matches VLC / MPC-HC).
-        if (ImGui::IsItemHovered()) {
+        if (ImGui::IsItemHovered() && !cropHot) {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 TogglePlayPauseWithFlash();
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
@@ -3012,6 +3545,59 @@ void App::Render() {
                     TooltipFor("Snap frame to playhead");
                 }
 
+                // Row 3 (all marks): export crop rect — editable x/y/w/h +
+                // reset. Values are applied live but only clamped/snapped when
+                // a field is deactivated, so typing isn't fought mid-edit.
+                if (m_videoWidth > 0 && m_videoHeight > 0) {
+                    const CropRect& curCrop = row.isFrame ? frames[row.index].crop
+                                                          : segs[row.index].crop;
+                    CropRect norm = NormalizeCrop(curCrop, m_videoWidth, m_videoHeight);
+                    bool hasCrop = norm.Active();
+                    CropRect eff = hasCrop ? norm : CropRect{0, 0, m_videoWidth, m_videoHeight};
+                    auto commitCrop = [&](const CropRect& c) {
+                        if (row.isFrame) m_segments.SetFrameCrop(row.index, c);
+                        else             m_segments.SetSegmentCrop(row.index, c);
+                    };
+
+                    ImGui::TextDisabled("Crop");
+                    int vals[4] = {eff.x, eff.y, eff.w, eff.h};
+                    const char* ids[4]  = {"##cropx", "##cropy", "##cropw", "##croph"};
+                    const char* tips[4] = {"Crop X (px) — drag or double-click to type",
+                                           "Crop Y (px) — drag or double-click to type",
+                                           "Crop width (px) — drag or double-click to type",
+                                           "Crop height (px) — drag or double-click to type"};
+                    int minW = std::min(16, m_videoWidth & ~1);
+                    int minH = std::min(16, m_videoHeight & ~1);
+                    const int mins[4] = {0, 0, minW, minH};
+                    const int maxs[4] = {m_videoWidth - minW, m_videoHeight - minH,
+                                         m_videoWidth, m_videoHeight};
+                    ImGuiStyle& cropStyle = ImGui::GetStyle();
+                    float cropPadBackup = cropStyle.FramePadding.y;
+                    cropStyle.FramePadding.y = 0;
+                    bool valueEdited = false;
+                    bool fieldCommitted = false;
+                    for (int fi = 0; fi < 4; fi++) {
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(44.0f * uiScale);
+                        valueEdited |= ImGui::DragInt(ids[fi], &vals[fi], 1.0f,
+                                                      mins[fi], maxs[fi], "%d",
+                                                      ImGuiSliderFlags_AlwaysClamp);
+                        fieldCommitted |= ImGui::IsItemDeactivatedAfterEdit();
+                        TooltipFor(tips[fi]);
+                    }
+                    cropStyle.FramePadding.y = cropPadBackup;
+                    if (valueEdited)
+                        commitCrop({vals[0], vals[1], vals[2], vals[3]});
+                    if (fieldCommitted)
+                        commitCrop(ClampCropUI({vals[0], vals[1], vals[2], vals[3]},
+                                               m_videoWidth, m_videoHeight));
+                    ImGui::SameLine();
+                    if (!hasCrop) ImGui::BeginDisabled();
+                    if (ImGui::SmallButton("Reset##crop")) commitCrop({});
+                    if (!hasCrop) ImGui::EndDisabled();
+                    TooltipFor("Reset crop to full frame");
+                }
+
                 ImGui::EndGroup();
 
                 ImVec2 cardEnd = ImVec2(ImGui::GetItemRectMax().x + cardPad,
@@ -3229,9 +3815,17 @@ void App::Render() {
                 ? (row.index < static_cast<int>(m_frameExportChecked.size()) && m_frameExportChecked[row.index])
                 : (row.index < static_cast<int>(m_exportChecked.size()) && m_exportChecked[row.index]);
         };
+        // Matches Exporter::ExportThread dispatch: GIF segments (and any
+        // segment of a GIF source) export as .gif; cropped SourceFormat
+        // segments are re-encoded to .mp4; the rest stream-copy as inputExt.
+        auto segExt = [&](const TimeRange& s) -> std::string {
+            if (IsGifSource() || s.mode == ExportMode::GIF) return ".gif";
+            if (s.crop.Active()) return ".mp4";
+            return inputExt;
+        };
         auto extForRow = [&](const Row& row) -> std::string {
             if (row.isFrame) return ".png";
-            return (segs[row.index].mode == ExportMode::GIF) ? std::string(".gif") : inputExt;
+            return segExt(segs[row.index]);
         };
         auto nameForRow = [&](const Row& row) -> const std::string& {
             return row.isFrame ? frames[row.index].name : segs[row.index].name;
@@ -3429,7 +4023,10 @@ void App::Render() {
             if (hasGif) {
                 ImGui::Spacing();
                 if (ImGui::CollapsingHeader("GIF Settings")) {
-                    ImGui::SliderInt("Width", &m_pendingExport.gifWidth, 120, 1920);
+                    // Resolution multiplier on each segment's (cropped) source
+                    // size — segments can have different crops, so a single
+                    // absolute width no longer fits.
+                    ImGui::SliderFloat("Scale", &m_pendingExport.gifScale, 0.1f, 2.0f, "%.2fx");
                     float fps = static_cast<float>(m_pendingExport.gifFps);
                     if (ImGui::SliderFloat("FPS", &fps, 5.0f, 60.0f, "%.0f")) {
                         m_pendingExport.gifFps = static_cast<double>(fps);
@@ -3476,8 +4073,9 @@ void App::Render() {
                 ImGui::TextColored(accent, "HDR video");
                 ImGui::TextWrapped(
                     "GIF and PNG exports will be converted to SDR using the currently "
-                    "selected tonemapper (%s). Source-format segment exports copy the "
-                    "original HDR video untouched.",
+                    "selected tonemapper (%s). Uncropped Source-format segment exports "
+                    "copy the original HDR video untouched; cropped ones are re-encoded "
+                    "and tone-mapped to SDR.",
                     TonemapperName(m_tonemapper));
                 ImGui::EndChild();
                 ImGui::PopStyleColor(2);
@@ -3519,7 +4117,7 @@ void App::Render() {
                 std::string dir = base.parent_path().string();
                 m_conflictingFiles.clear();
                 for (const auto& seg : m_pendingExport.segments) {
-                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                    std::string ext = segExt(seg);
                     std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + seg.name + ext);
                     if (std::filesystem::exists(outPath))
                         m_conflictingFiles.push_back(outPath.filename().string());
@@ -3608,7 +4206,7 @@ void App::Render() {
             ImGui::Spacing();
             ImGui::Text("Exported files:");
             for (const auto& seg : m_pendingExport.segments) {
-                std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                std::string ext = segExt(seg);
                 ImGui::BulletText("%s_%s%s", stem.c_str(), seg.name.c_str(), ext.c_str());
             }
             for (const auto& fm : m_pendingExport.frames) {
@@ -3662,7 +4260,7 @@ void App::Render() {
                 std::string dir = base.parent_path().string();
                 std::vector<TimeRange> filteredSegs;
                 for (const auto& seg : m_pendingExport.segments) {
-                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                    std::string ext = segExt(seg);
                     std::filesystem::path outPath = std::filesystem::path(dir) / (stem + "_" + seg.name + ext);
                     if (!std::filesystem::exists(outPath)) filteredSegs.push_back(seg);
                 }

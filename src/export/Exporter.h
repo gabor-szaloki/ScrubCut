@@ -81,7 +81,13 @@ private:
     bool ExportSegmentGIF(const std::string& inputPath,
                           const TimeRange& range,
                           const std::string& outputPath,
-                          int gifWidth, double gifFps);
+                          double gifScale, double gifFps);
+
+    // Decode → crop → libx264 → MP4. Used for SourceFormat segments with an
+    // active crop, which stream copy can't honor.
+    bool ExportSegmentReencode(const std::string& inputPath,
+                               const TimeRange& range,
+                               const std::string& outputPath);
 
     bool ExportFramePNG(const std::string& inputPath,
                         const FrameMark& frame,

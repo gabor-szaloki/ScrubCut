@@ -98,6 +98,16 @@ public:
             m_segments[index].keepAudio = keepAudio;
     }
 
+    void SetSegmentCrop(int index, const CropRect& crop) {
+        if (index >= 0 && index < static_cast<int>(m_segments.size()))
+            m_segments[index].crop = crop;
+    }
+
+    void SetFrameCrop(int index, const CropRect& crop) {
+        if (index >= 0 && index < static_cast<int>(m_frames.size()))
+            m_frames[index].crop = crop;
+    }
+
     void SetSegmentName(int index, const std::string& name) {
         if (index >= 0 && index < static_cast<int>(m_segments.size()))
             m_segments[index].name = name;

@@ -59,6 +59,12 @@ private:
     void ShowStatus(const std::string& msg);
     void RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
 
+    // Draw crop-rect borders over the video for marks active at the playhead
+    // and handle mouse resize/move of them. Returns true while a crop handle
+    // is hovered or dragged, so the caller suppresses click-to-pause /
+    // double-click-fullscreen for that click.
+    bool RenderCropOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
+
     // Combined subtitle track list: embedded tracks (copied from the Player on
     // open) followed by any externally-opened files. -1 = subtitles off.
     std::vector<SubtitleTrackInfo> m_subtitleTracks;
@@ -327,6 +333,12 @@ private:
     bool m_screenshotPending = false;
     int m_screenshotCounter = 0;
 
+    // Last frame's viewport video rect (ImGui screen coords) — consumed by
+    // the -test-drag autonomous-test hook in Run() to aim synthetic mouse
+    // events at video-pixel coordinates.
+    ImVec2 m_lastImgMin = {0, 0}, m_lastImgMax = {0, 0};
+    bool m_lastImgValid = false;
+
     // Startup milestones (SDL tick timestamps), reported in a single log line
     // when the first frame is presented.
     uint64_t m_startupWindowShownNS = 0;
@@ -354,4 +366,21 @@ private:
     float  m_barCtrlStartX = 0.0f;
     double m_barCtrlStartTime = 0.0;
     int    m_barCtrlSegIdx = -1;
+
+    // Viewport crop-rect drag state (see RenderCropOverlay). Hit-testing is
+    // manual (not ImGui items) because coincident edges of overlapping rects
+    // are owned dash-by-dash by different marks.
+    enum class CropHandle { None, N, S, W, E, NW, NE, SW, SE, Body };
+    struct CropDrag {
+        bool active = false;
+        bool isFrame = false;
+        int index = -1;
+        uint64_t addSeq = 0;       // revalidated each frame; mismatch aborts the drag
+        CropHandle handle = CropHandle::None;
+        CropRect startCrop;        // effective crop at mouse-down (video px)
+        ImVec2 startMouseVideo = {0, 0};   // mouse at mouse-down, in video px
+        ImVec2 startMouseScreen = {0, 0};  // same, in screen px (click-vs-drag threshold)
+        bool moved = false;        // Body drags: exceeded the click-vs-drag threshold
+    };
+    CropDrag m_cropDrag;
 };

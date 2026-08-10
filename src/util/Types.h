@@ -1,10 +1,38 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
 
 enum class ExportMode { SourceFormat, GIF };
+
+// Crop rectangle in source-video coded-pixel coordinates (the same space the
+// decoder/renderer and the FFmpeg `crop` filter operate in).
+// w <= 0 || h <= 0 means "no crop / full frame" (the default).
+struct CropRect {
+    int x = 0, y = 0, w = 0, h = 0;
+    bool Active() const { return w > 0 && h > 0; }
+    bool operator==(const CropRect& o) const {
+        return x == o.x && y == o.y && w == o.w && h == o.h;
+    }
+};
+
+// Clamp a crop into the source frame and snap x/y/w/h to even values
+// (yuv420p chroma alignment + libx264 even-dimension requirements; applied
+// to all export paths so the viewport preview stays pixel-exact WYSIWYG).
+// Returns an inactive rect if the result would be degenerate (< 2x2) or if
+// it covers the full frame (a no-op crop).
+inline CropRect NormalizeCrop(CropRect c, int srcW, int srcH) {
+    if (!c.Active() || srcW <= 0 || srcH <= 0) return {};
+    c.x = std::clamp(c.x, 0, std::max(0, srcW - 2)) & ~1;
+    c.y = std::clamp(c.y, 0, std::max(0, srcH - 2)) & ~1;
+    c.w = std::min(c.w, srcW - c.x) & ~1;
+    c.h = std::min(c.h, srcH - c.y) & ~1;
+    if (c.w < 2 || c.h < 2) return {};
+    if (c.x == 0 && c.y == 0 && c.w == srcW && c.h == srcH) return {};
+    return c;
+}
 
 // Color characteristics of the decoded video, derived from the transfer
 // function. SDR frames go straight to an 8-bit sRGB texture; HDR frames are
@@ -53,6 +81,10 @@ struct TimeRange {
     std::string name;
     int colorIndex = 0;
     uint64_t addSeq = 0;  // monotonic add order, shared counter with FrameMark
+    // Export crop. Inactive (default) = full frame. SourceFormat segments with
+    // an active crop are re-encoded (libx264) instead of stream-copied.
+    // Keep last: SegmentManager aggregate-initializes the leading members.
+    CropRect crop;
 };
 
 // True if `range`'s output format / speed makes keeping audio impossible
@@ -76,6 +108,8 @@ struct FrameMark {
     std::string name;
     int colorIndex = 0;
     uint64_t addSeq = 0;
+    // Export crop. Inactive (default) = full frame. Keep last (see TimeRange).
+    CropRect crop;
 };
 
 struct Chapter {
@@ -118,7 +152,9 @@ struct ExportSettings {
     std::string outputPath;
     std::vector<TimeRange> segments;
     std::vector<FrameMark> frames;
-    int gifWidth = 480;
+    // Resolution multiplier applied to each GIF segment's (cropped) source
+    // dimensions. 1.0 = source size.
+    float gifScale = 1.0f;
     double gifFps = 15.0;
     // HDR->SDR operator used when re-encoding HDR sources (GIF/PNG). Mirrors the
     // user's current display selection so exports match what's on screen.

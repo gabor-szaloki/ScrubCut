@@ -4,7 +4,7 @@
   "dependencies": [
     {
       "name": "ffmpeg",
-      "features": ["avcodec", "avformat", "swscale", "swresample", "avfilter"]
+      "features": ["avcodec", "avformat", "swscale", "swresample", "avfilter", "x264"]
     },
     "sdl3",
     {
