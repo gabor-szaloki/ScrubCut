@@ -136,6 +136,20 @@ private:
     // Wait for any pending async seek to complete.
     void WaitForSeek();
 
+    // Per-frame A/V sync auto-correction (called from PollSeekComplete).
+    // Video (the wall clock) is the master: measure how far the audio
+    // device's actual playout position is from the clock and steer audio to
+    // follow — a fraction-of-a-percent device-rate servo for small errors
+    // (inaudible), DiscardUntil for large audio-behind jumps. Skipped while
+    // the stream is dry (audio starved or ended past the audio track).
+    void SyncAudioToClock();
+
+    // Drop queued audio packets whose content ends before cutoffSec (with
+    // the same 25ms straddle margin used when capturing them). Pipeline must
+    // be parked and the audio queue's interrupt cleared — the pop/re-push
+    // cycle assumes no concurrent consumer. Returns the dropped count.
+    int FilterAudioQueueBefore(double cutoffSec);
+
     // Synchronously decode the next video frame from the current demuxer/decoder state.
     // No seek, no flush. Returns true if a frame was decoded and cached.
     // Used only for the initial-frame decode in Open() — pipeline must be parked.
@@ -182,6 +196,13 @@ private:
     // a seek is from skewed packet pts or from elsewhere.
     std::atomic<int>    m_avsyncLogPackets{0};
     std::atomic<double> m_avsyncSeekTarget{0.0};
+
+    // When set (!= kNoAudioSkip), AudioDecodeThread discards/trims decoded
+    // samples up to this media time before writing to the output — used when
+    // Play() has to rebuild the audio stream at a resume point that packet
+    // granularity alone can't hit exactly.
+    static constexpr double kNoAudioSkip = -1.0e18;
+    std::atomic<double> m_audioSkipUntil{kNoAudioSkip};
 
     // Sticky flag: true when the user intends playback to continue after seeking.
     // Set by SeekTo when playback was active, cleared only when Play() is called.

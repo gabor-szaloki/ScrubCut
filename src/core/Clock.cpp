@@ -1,5 +1,4 @@
 #include "core/Clock.h"
-#include "core/AudioOutput.h"
 
 double Clock::GetTime() const {
     std::lock_guard<std::mutex> lock(m_mutex);

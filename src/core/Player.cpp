@@ -3,6 +3,7 @@
 #include "util/Trace.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #ifdef _WIN32
@@ -188,7 +189,6 @@ bool Player::Open(const std::string& path) {
             if (m_audioOutput.Open(sr, ch)) {
                 SetupResampler();
                 m_hasAudio = true;
-                m_clock.SetAudioOutput(&m_audioOutput);
                 // Apply volume/mute state that may have been set BEFORE
                 // audio existed (e.g. from saved preferences at launch).
                 // Without this, a saved muted=true never reaches the audio
@@ -196,10 +196,6 @@ bool Player::Open(const std::string& path) {
                 SetMuted(m_muted);
             }
         }
-    }
-
-    if (!m_hasAudio) {
-        m_clock.SetAudioOutput(nullptr);
     }
 
     m_hasMedia = true;
@@ -307,8 +303,31 @@ void Player::Play() {
     }
 
     if (m_hasAudio) {
-        m_audioOutput.Flush();
-        m_audioOutput.ResetPosition(resumeTime);
+        // Resume in place. The stream still holds the decoded-ahead audio
+        // that follows the pause point — flushing it here (the old behavior)
+        // discarded that content and made audio resume up to the demux lead
+        // (~2s of content) ahead of video, compounding every pause/resume
+        // cycle. When the clock agrees with the audio position (plain
+        // pause -> play), touch nothing and let the buffer play on.
+        double audioPos = m_audioOutput.GetPlaybackPosition();
+        double gap = resumeTime - audioPos;
+        if (std::fabs(gap) > 0.040) {
+            if (gap > 0.0 && m_audioOutput.DiscardUntil(resumeTime)) {
+                // Clock moved forward within buffered content (frame steps):
+                // the stream head was consumed up to resumeTime, the rest
+                // plays on in sync.
+            } else {
+                // Content at resumeTime isn't in the stream (restart from 0,
+                // or stepped past the buffered end): rebuild from the packet
+                // queue, trimming decoded samples up to the resume point.
+                m_audioDecoder.Flush();
+                m_audioOutput.Flush();
+                m_audioOutput.ResetPosition(resumeTime);
+                m_audioPacketQueue.ClearInterrupt();
+                FilterAudioQueueBefore(resumeTime);
+                m_audioSkipUntil.store(resumeTime, std::memory_order_relaxed);
+            }
+        }
     }
 
     // Don't start the clock yet — wait for the first frame at/after
@@ -493,6 +512,8 @@ void Player::SeekThread() {
 }
 
 void Player::PollSeekComplete() {
+    SyncAudioToClock();
+
     // Pause at end of video
     if (m_playing && m_eof && m_clock.GetTime() >= m_demuxer.GetDuration()) {
         m_clock.SetTime(m_demuxer.GetDuration());
@@ -507,6 +528,60 @@ void Player::PollSeekComplete() {
         m_wantsToPlay = false;
         Play();
     }
+}
+
+void Player::SyncAudioToClock() {
+    if (!m_playing.load(std::memory_order_relaxed) || !m_hasAudio) return;
+    if (m_waitingForResumeFrame || m_clock.IsPaused()) return;
+    if (!m_audioOutput.HasQueuedData()) return; // dry stream: nothing to steer
+
+    double clockSec = m_clock.GetTime();
+    double err = m_audioOutput.GetPlaybackPosition() - clockSec;
+    double baseSpeed = m_clock.GetSpeed();
+
+    if (err < -0.25) {
+        // Audio fell far behind the video clock (e.g. after a long decode
+        // stall) — jump forward through the buffered content instead of
+        // chirping the sample rate for seconds.
+        m_audioOutput.DiscardUntil(clockSec);
+        m_audioOutput.SetSpeed(static_cast<float>(baseSpeed));
+        return;
+    }
+
+    // Rate servo: steer the device's consumption speed by up to ±0.5%
+    // (inaudible) so the audio position converges on the clock. The deadband
+    // avoids hunting on the ~10ms measurement granularity of device pulls.
+    double corr = 0.0;
+    if (std::fabs(err) > 0.010)
+        corr = std::clamp(-err * 0.5, -0.005, 0.005);
+    m_audioOutput.SetSpeed(static_cast<float>(baseSpeed * (1.0 + corr)));
+}
+
+int Player::FilterAudioQueueBefore(double cutoffSec) {
+    double atb_d = av_q2d(m_demuxer.GetAudioTimeBase());
+    int origCount = m_audioPacketQueue.Size();
+    int dropped = 0;
+    AVPacket* drainPkt = av_packet_alloc();
+    std::vector<AVPacket*> keep;
+    for (int i = 0; i < origCount; ++i) {
+        if (!m_audioPacketQueue.Pop(drainPkt)) break;
+        double pktSec = (drainPkt->pts != AV_NOPTS_VALUE)
+            ? static_cast<double>(drainPkt->pts) * atb_d : 0.0;
+        if (pktSec + 0.025 >= cutoffSec) {
+            AVPacket* k = av_packet_alloc();
+            av_packet_move_ref(k, drainPkt);
+            keep.push_back(k);
+        } else {
+            av_packet_unref(drainPkt);
+            dropped++;
+        }
+    }
+    for (AVPacket* k : keep) {
+        if (!m_audioPacketQueue.Push(k)) av_packet_unref(k);
+        av_packet_free(&k);
+    }
+    av_packet_free(&drainPkt);
+    return dropped;
 }
 
 void Player::SeekRelative(double deltaSec) {
@@ -770,12 +845,10 @@ void Player::SetAudioTrack(int streamIndex) {
         }
         SetupResampler();
         m_hasAudio = true;
-        m_clock.SetAudioOutput(&m_audioOutput);
         SetMuted(m_muted);
         m_audioOutput.SetSpeed(static_cast<float>(m_clock.GetSpeed()));
     } else {
         m_hasAudio = false;
-        m_clock.SetAudioOutput(nullptr);
         LOG_WARN("SetAudioTrack: failed to open decoder for stream %d", streamIndex);
     }
 
@@ -874,6 +947,8 @@ bool Player::SyncSeekAndDecode(double targetSec) {
         // Position is reset to the actual landed video pts after decode
         // (long-GOP files can land hundreds of ms past target; aligning
         // audio to target instead of the actual frame would desync them).
+        // Any pending resume-trim is stale — this path re-anchors itself.
+        m_audioSkipUntil.store(kNoAudioSkip, std::memory_order_relaxed);
     }
 
     uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
@@ -1003,32 +1078,7 @@ done:
             // by up to a GOP duration.
             m_audioOutput.ResetPosition(frameSec);
 
-            AVRational atb = m_demuxer.GetAudioTimeBase();
-            double atb_d = av_q2d(atb);
-            int origCount = m_audioPacketQueue.Size();
-            int dropped = 0;
-            AVPacket* drainPkt = av_packet_alloc();
-            // Pop, filter, re-push. Pop won't block here — pipeline workers
-            // are parked, no other consumer.
-            std::vector<AVPacket*> keep;
-            for (int i = 0; i < origCount; ++i) {
-                if (!m_audioPacketQueue.Pop(drainPkt)) break;
-                double pktSec = (drainPkt->pts != AV_NOPTS_VALUE)
-                    ? static_cast<double>(drainPkt->pts) * atb_d : 0.0;
-                if (pktSec + 0.025 >= frameSec) {
-                    AVPacket* k = av_packet_alloc();
-                    av_packet_move_ref(k, drainPkt);
-                    keep.push_back(k);
-                } else {
-                    av_packet_unref(drainPkt);
-                    dropped++;
-                }
-            }
-            for (AVPacket* k : keep) {
-                if (!m_audioPacketQueue.Push(k)) av_packet_unref(k);
-                av_packet_free(&k);
-            }
-            av_packet_free(&drainPkt);
+            int dropped = FilterAudioQueueBefore(frameSec);
             if (m_profileSeek && dropped > 0) {
                 LOG_INFO("AVSync: dropped %d audio packets (< video first frame %.3fs)",
                          dropped, frameSec);
@@ -1076,6 +1126,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     if (m_hasAudio) {
         m_audioOutput.Flush();
         m_audioOutput.ResetPosition(seekSec);
+        m_audioSkipUntil.store(kNoAudioSkip, std::memory_order_relaxed);
     }
 
     int attempt = 0;
@@ -1284,7 +1335,18 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
                              elapsedMs, m_resumeTime, frameSec, m_playDroppedFrames);
                     m_playStartNS = 0;
                 }
-                m_clock.SetTime(frameSec);
+                // Start the clock where the audio content resumes rather
+                // than at this frame's pts — the first queued frame can be
+                // up to one frame ahead of the pause point, and anchoring
+                // there would fast-forward the clock relative to the audio
+                // on every resume, leaving the rate servo a ~frame of lag
+                // to grind away each time.
+                double startSec = frameSec;
+                if (m_hasAudio) {
+                    double audioPos = m_audioOutput.GetPlaybackPosition();
+                    if (std::fabs(audioPos - frameSec) < 0.150) startSec = audioPos;
+                }
+                m_clock.SetTime(startSec);
                 m_clock.SetPaused(false);
                 if (m_hasAudio) m_audioOutput.Resume();
                 break;
@@ -1616,6 +1678,12 @@ void Player::AudioDecodeThread() {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
+            // Media timestamp of the frame's first sample, for pts-anchored
+            // position tracking in AudioOutput (NAN = unknown, continue).
+            double ptsSec = NAN;
+            if (frame->pts != AV_NOPTS_VALUE)
+                ptsSec = static_cast<double>(frame->pts) * av_q2d(m_demuxer.GetAudioTimeBase());
+
             if (m_swrCtx) {
                 int outSamples = swr_get_out_samples(m_swrCtx, frame->nb_samples);
                 int outBytes = outSamples * m_audioOutput.GetChannels() * 2;
@@ -1630,8 +1698,34 @@ void Player::AudioDecodeThread() {
                                              const_cast<const uint8_t**>(frame->data),
                                              frame->nb_samples);
                 if (converted > 0) {
-                    int size = converted * m_audioOutput.GetChannels() * 2;
-                    m_audioOutput.Write(outBuf, size);
+                    int bytesPerSample = m_audioOutput.GetChannels() * 2;
+                    int size = converted * bytesPerSample;
+                    const uint8_t* writePtr = outBuf;
+                    double writePts = ptsSec;
+                    bool drop = false;
+
+                    // Resume-point trim: when Play() rebuilt the stream at a
+                    // position packet granularity can't hit, discard/trim
+                    // samples so the first written one lands exactly there.
+                    double skip = m_audioSkipUntil.load(std::memory_order_relaxed);
+                    if (skip != kNoAudioSkip && ptsSec == ptsSec) {
+                        int rate = m_audioOutput.GetSampleRate();
+                        if (ptsSec + static_cast<double>(converted) / rate <= skip) {
+                            drop = true; // wholly before the resume point
+                        } else {
+                            if (ptsSec < skip) {
+                                int trim = static_cast<int>(std::lround((skip - ptsSec) * rate));
+                                trim = std::clamp(trim, 0, converted - 1);
+                                writePtr += trim * bytesPerSample;
+                                size -= trim * bytesPerSample;
+                                writePts = ptsSec + static_cast<double>(trim) / rate;
+                            }
+                            m_audioSkipUntil.store(kNoAudioSkip, std::memory_order_relaxed);
+                        }
+                    }
+
+                    if (!drop)
+                        m_audioOutput.Write(writePtr, size, writePts);
                 }
             }
 
