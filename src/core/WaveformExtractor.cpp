@@ -2,6 +2,7 @@
 #include "core/Demuxer.h"
 #include "core/AudioDecoder.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -37,6 +38,9 @@ void WaveformExtractor::Reset() {
 }
 
 void WaveformExtractor::Worker(std::string path, double durationSec) {
+    PROFILE_THREAD("Waveform Scan");
+    PROFILE_SCOPE();
+    Profiler::ScopedSection section(Profiler::kSectionJobs, "Waveform scan");
     Demuxer demux;
     if (!demux.Open(path, "waveform scan")) {
         LOG_WARN("Waveform: failed to open %s", path.c_str());

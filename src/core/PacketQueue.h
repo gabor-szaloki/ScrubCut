@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/FFmpegUtils.h"
+#include "util/Profiler.h"
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
@@ -19,8 +20,13 @@ public:
     // contents preserved on interrupt, caller should re-check external state
     // (e.g. pipeline-active flag) and retry or park.
     bool Push(AVPacket* pkt) {
+        PROFILE_SCOPE_N("PacketQueue::Push");
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_condPush.wait(lock, [&] { return m_queue.size() < static_cast<size_t>(m_maxSize) || m_abort || m_interrupt; });
+        {
+            // Blocking here = queue-full backpressure.
+            PROFILE_WAIT_SCOPE_N("WaitQueueFull");
+            m_condPush.wait(lock, [&] { return m_queue.size() < static_cast<size_t>(m_maxSize) || m_abort || m_interrupt; });
+        }
         if (m_abort || m_interrupt) return false;
 
         AVPacket* copy = av_packet_alloc();

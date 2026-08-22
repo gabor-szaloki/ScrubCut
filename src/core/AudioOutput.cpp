@@ -1,5 +1,6 @@
 #include "core/AudioOutput.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 AudioOutput::~AudioOutput() {
     Close();
@@ -101,6 +102,7 @@ void AudioOutput::ResetPosition(double startTime) {
 }
 
 bool AudioOutput::DiscardUntil(double targetPts) {
+    PROFILE_SCOPE();
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_stream) return false;
     int bytesPerSample = 2 * m_channels;

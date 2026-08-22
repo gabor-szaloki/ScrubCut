@@ -5,6 +5,7 @@
 #include "core/FrameConverter.h"
 #include "util/Log.h"
 #include "util/FFmpegUtils.h"
+#include "util/Profiler.h"
 
 #include <SDL3/SDL.h>
 
@@ -61,15 +62,21 @@ bool Exporter::EnsureTonemap() {
 
 void Exporter::ExportThread() {
     SetCurrentThreadName(L"ScrubCut Export");
+    PROFILE_THREAD("Export");
+    PROFILE_SCOPE();
+
+    int totalItems = static_cast<int>(m_settings.segments.size() + m_settings.frames.size());
+    const uint32_t profSection = PROFILE_SECTION_ENTER(Profiler::kSectionJobs,
+                                                       "Export: %d item(s)", totalItems);
 
     // Release the tone-mapper's GPU resources (deferred-safe from this thread).
     // Must run on every exit path; called before every `return` below.
     auto finish = [&]() {
         m_tonemap.Shutdown();
         m_progress.running = false;
+        PROFILE_SECTION_LEAVE(profSection);
     };
 
-    int totalItems = static_cast<int>(m_settings.segments.size() + m_settings.frames.size());
     int itemsDone = 0;
     std::string srcExt = std::filesystem::path(m_inputPath).extension().string();
 
@@ -188,6 +195,7 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, const std::st
 bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
                                         const TimeRange& range,
                                         const std::string& outputPath) {
+    PROFILE_SCOPE();
     Demuxer demuxer;
     if (!demuxer.Open(inputPath, "export")) {
         m_progress.SetError("Failed to open input: " + inputPath);
@@ -404,6 +412,7 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
                                  const TimeRange& range,
                                  const std::string& outputPath,
                                  int gifWidth, double gifFps) {
+    PROFILE_SCOPE();
     // Open input
     Demuxer demuxer;
     if (!demuxer.Open(inputPath, "export")) {
@@ -637,6 +646,7 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     int64_t frameCount = 0;
 
     auto encodeFilteredFrames = [&]() -> bool {
+        PROFILE_SCOPE_N("GIF::EncodeFilteredFrames");
         while (true) {
             ret = av_buffersink_get_frame(bufSinkCtx, filtFrame);
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
@@ -820,6 +830,7 @@ gif_cleanup:
 bool Exporter::ExportFramePNG(const std::string& inputPath,
                                const FrameMark& frame,
                                const std::string& outputPath) {
+    PROFILE_SCOPE();
     Demuxer demuxer;
     if (!demuxer.Open(inputPath, "export")) {
         m_progress.SetError("Failed to open input: " + inputPath);

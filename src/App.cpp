@@ -1,6 +1,6 @@
 #include "App.h"
 #include "util/Log.h"
-#include "util/Trace.h"
+#include "util/Profiler.h"
 #include "util/CommandLine.h"
 #include "util/AppPaths.h"
 #include "util/UnicodeNormalize.h"
@@ -261,11 +261,15 @@ static bool SpeedCombo(const char* id, double currentSpeed, double& outSpeed, bo
 }
 
 bool App::Init() {
+    PROFILE_SCOPE();
     LogFile::Get().Open();
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) {
-        LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
-        return false;
+    {
+        PROFILE_SCOPE_N("SDL_Init(video)");
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            LOG_ERROR("SDL_Init failed: %s", SDL_GetError());
+            return false;
+        }
     }
 
     // Kick off GPU device creation on a worker thread as early as possible —
@@ -283,6 +287,7 @@ bool App::Init() {
     // another ~250 ms on the same drivers. With DXBC + fewer-resource-slots,
     // the probe is skipped entirely on Windows 11.
     std::future<SDL_GPUDevice*> deviceFuture = std::async(std::launch::async, []() {
+        PROFILE_SCOPE_N("CreateGPUDevice");
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
         SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_DXBC_BOOLEAN, true);
@@ -297,9 +302,12 @@ bool App::Init() {
         return device;
     });
 
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        LOG_ERROR("SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
-        return false;
+    {
+        PROFILE_SCOPE_N("SDL_Init(audio)");
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+            LOG_ERROR("SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
+            return false;
+        }
     }
 
     const char* windowTitle = "ScrubCut";
@@ -311,12 +319,15 @@ bool App::Init() {
     // size / position before we apply the saved geometry (and optional
     // maximize). SDL_ShowWindow is called as soon as the geometry is settled —
     // before the GPU init, so the window appears without waiting for it.
-    m_window = SDL_CreateWindow(
-        windowTitle,
-        1280, 720,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
-        SDL_WINDOW_HIDDEN
-    );
+    {
+        PROFILE_SCOPE_N("CreateWindow");
+        m_window = SDL_CreateWindow(
+            windowTitle,
+            1280, 720,
+            SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+            SDL_WINDOW_HIDDEN
+        );
+    }
 
     if (!m_window) {
         LOG_ERROR("SDL_CreateWindow failed: %s", SDL_GetError());
@@ -336,17 +347,11 @@ bool App::Init() {
         std::filesystem::remove(GetAppDataDir() / "layout.ini");
     }
 
-    if (CommandLine::Get().HasFlag("-trace")) {
-        auto tracePath = (GetAppDataDir() / "logs" / "scrubcut_trace.csv").string();
-        TraceFile::Get().Open(tracePath.c_str());
-        LOG_INFO("Tracing enabled -> %s", tracePath.c_str());
+    {
+        PROFILE_SCOPE_N("LoadSettings");
+        m_layoutSettings.Load(GetAppDataDir() / "layout.ini");
+        m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
     }
-    if (CommandLine::Get().HasFlag("-profileseek")) {
-        m_player.SetProfileSeek(true);
-        LOG_INFO("Seek profiling enabled");
-    }
-    m_layoutSettings.Load(GetAppDataDir() / "layout.ini");
-    m_prefSettings.Load(GetAppDataDir() / "preferences.ini");
 
     // Preferences always load
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
@@ -419,7 +424,10 @@ bool App::Init() {
     }
 
     // Reveal the window — at the correct geometry and maximize state.
-    SDL_ShowWindow(m_window);
+    {
+        PROFILE_SCOPE_N("ShowWindow");
+        SDL_ShowWindow(m_window);
+    }
 
     // During the GPU init below the freshly shown window would sit solid
     // black (SDL's WM_ERASEBKGND fill). Paint it with the UI background color
@@ -427,6 +435,7 @@ bool App::Init() {
     // the app frame immediately. The surface is destroyed right away; the
     // window is claimed for the GPU device below.
     if (SDL_Surface* surface = SDL_GetWindowSurface(m_window)) {
+        PROFILE_SCOPE_N("PrepaintWindow");
         // What's visible once the UI is up isn't the raw 0.1f clear color but
         // the Viewport window's WindowBg (0.06, alpha 0.94) composited over
         // it: 0.06*0.94 + 0.1*0.06 = 0.0624 -> RGB(15,15,15).
@@ -437,7 +446,10 @@ bool App::Init() {
     m_startupWindowShownNS = SDL_GetTicksNS();
 
     // Join the GPU device creation started at the top of Init.
-    m_gpuDevice = deviceFuture.get();
+    {
+        PROFILE_WAIT_SCOPE_N("WaitGpuDevice");
+        m_gpuDevice = deviceFuture.get();
+    }
     if (!m_gpuDevice) {
         LOG_ERROR("SDL_CreateGPUDeviceWithProperties failed: %s", SDL_GetError());
         return false;
@@ -447,9 +459,12 @@ bool App::Init() {
     // Claiming defaults to SDR composition + VSYNC present mode. HDR output
     // is content-gated, so this stays SDR until an HDR video opens — the call
     // here just initializes the SDR-white/headroom state.
-    if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
-        LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
-        return false;
+    {
+        PROFILE_SCOPE_N("ClaimWindowForGPU");
+        if (!SDL_ClaimWindowForGPUDevice(m_gpuDevice, m_window)) {
+            LOG_ERROR("SDL_ClaimWindowForGPUDevice failed: %s", SDL_GetError());
+            return false;
+        }
     }
     UpdateHDROutput();
 
@@ -481,9 +496,10 @@ bool App::Init() {
 
 void App::Run() {
     while (m_running) {
-        TRACE_EVENT("Frame");
+        PROFILE_SCOPE_N("Frame");
         ProcessEvents();
         m_player.PollSeekComplete();
+        m_player.EmitProfilerPlots();
 
         // While HDR output is active, poll the OS HDR state every frame so
         // the UI tracks the SDR-brightness slider live (cached DXGI reads,
@@ -509,6 +525,7 @@ void App::Run() {
         // Fetch frame before render (for async playback)
         // and after render (for sync seeks triggered by UI during Render)
         auto fetchFrame = [&]() {
+            PROFILE_SCOPE_N("FetchFrame");
             const uint8_t* rgba = nullptr;
             int w = 0, h = 0;
             if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
@@ -576,10 +593,7 @@ void App::Run() {
             }
         };
 
-        {
-            TRACE_EVENT("TryGetVideoFrame");
-            fetchFrame();
-        }
+        fetchFrame();
         refreshTonemap();
 
         Render();
@@ -588,6 +602,8 @@ void App::Run() {
         fetchFrame();
         // Apply a tone-mapper change made via the View > HDR menu this frame.
         refreshTonemap();
+
+        PROFILE_FRAME();
     }
 }
 
@@ -696,6 +712,7 @@ void App::RequestOpenFile(const std::string& path) {
 }
 
 void App::OpenFile(const std::string& rawPath) {
+    PROFILE_SCOPE();
     // NFC-normalize so the stored/displayed path (title, recent list) uses
     // precomposed characters — macOS hands us NFD, which ImGui fonts can't draw.
     const std::string path = NormalizeUtf8NFC(rawPath);
@@ -964,6 +981,7 @@ void App::FlashVolume() {
 }
 
 void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
+    PROFILE_SCOPE();
     if (m_activeSubtitle < 0) return;
     ImFont* font = m_ui.GetSubtitleFont();
     if (!font) return;
@@ -1116,6 +1134,7 @@ void App::AddToRecent(const std::string& path) {
 }
 
 void App::ProcessEvents() {
+    PROFILE_SCOPE();
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         ImGui_ImplSDL3_ProcessEvent(&event);
@@ -1458,6 +1477,7 @@ void App::ProcessEvents() {
 }
 
 void App::Render() {
+    PROFILE_SCOPE();
     g_tooltipsEnabled = m_showTooltips;
     m_hoveredSegmentThisFrame = -1;
     m_hoveredFrameThisFrame = -1;
@@ -1603,6 +1623,7 @@ void App::Render() {
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(bg.x, bg.y, bg.z, 0.85f * m_uiAlpha));
     }
     if (showMenuBar && ImGui::BeginMainMenuBar()) {
+        PROFILE_SCOPE_N("MainMenuBar");
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open...", (std::string(kKeys.cmdName) + "+O").c_str())) {
                 static const SDL_DialogFileFilter videoFilters[] = {
@@ -1957,6 +1978,18 @@ void App::Render() {
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str())) {
                 m_showHelpPanel = !m_showHelpPanel;
             }
+            ImGui::Separator();
+            // Same switch -profile arms at launch; records only while a
+            // Tracy viewer/capture is connected (see util/Profiler.h).
+            bool profilerOn = Profiler::IsEnabled();
+            if (ImGui::MenuItem("Enable Tracy Instrumentation", nullptr, profilerOn))
+                Profiler::SetEnabled(!profilerOn);
+            if (profilerOn) {
+                ImGui::MenuItem(Profiler::IsConnected()
+                                    ? "   profiler connected"
+                                    : "   waiting for viewer (localhost:8086)",
+                                nullptr, false, false);
+            }
             ImGui::EndMenu();
         }
 
@@ -1992,6 +2025,7 @@ void App::Render() {
     // has undefined contents (pink garbage on Metal) until the first decoded
     // frame is uploaded, and m_displayTexture is only set after that upload.
     if (m_displayTexture && m_player.HasMedia()) {
+        PROFILE_SCOPE_N("Viewport panel");
         ImVec2 avail = ImGui::GetContentRegionAvail();
         float aspectRatio = static_cast<float>(m_videoWidth) / static_cast<float>(m_videoHeight);
         float displayW = avail.x;
@@ -2103,6 +2137,7 @@ void App::Render() {
 
     // Timeline panel (unified controls + timeline bar)
     if (m_showTimeline && !m_uiHidden) {
+    PROFILE_SCOPE_N("Timeline panel");
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float uiScale = m_ui.GetUiScale();
@@ -2780,6 +2815,7 @@ void App::Render() {
 
     // Segments panel
     if (m_showSegments && !m_uiHidden) {
+    PROFILE_SCOPE_N("Marks panel");
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float uiScale = m_ui.GetUiScale();
@@ -3073,6 +3109,7 @@ void App::Render() {
 
     // Help panel (toggled with ?)
     if (m_showHelpPanel && !m_uiHidden) {
+        PROFILE_SCOPE_N("Help panel");
         ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
         // Default position: top-left of the workspace. layoutCond is
@@ -3746,7 +3783,14 @@ void App::Render() {
 
     SDL_GPUTexture* swapchain = nullptr;
     Uint32 swapW = 0, swapH = 0;
-    if (!SDL_WaitAndAcquireGPUSwapchainTexture(cmd, m_window, &swapchain, &swapW, &swapH)) {
+    bool swapAcquired;
+    {
+        // The wait in here is the vsync/present throttle.
+        PROFILE_WAIT_SCOPE_N("WaitAndAcquireSwapchain");
+        swapAcquired = SDL_WaitAndAcquireGPUSwapchainTexture(cmd, m_window,
+                                                             &swapchain, &swapW, &swapH);
+    }
+    if (!swapAcquired) {
         LOG_ERROR("Render: swapchain acquire failed: %s", SDL_GetError());
         m_ui.EndFrame(nullptr, nullptr);
         SDL_CancelGPUCommandBuffer(cmd);
@@ -3807,6 +3851,7 @@ void App::Render() {
         TakeScreenshot(cmd, static_cast<int>(swapW), static_cast<int>(swapH));
         m_screenshotPending = false;
     } else {
+        PROFILE_SCOPE_N("SubmitFrame");
         SDL_SubmitGPUCommandBuffer(cmd);
     }
 
@@ -3831,6 +3876,7 @@ void App::TogglePlayPauseWithFlash() {
 }
 
 void App::CreateVideoTexture(int width, int height) {
+    PROFILE_SCOPE();
     if (m_videoTexture) {
         SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);
         m_videoTexture = nullptr;
@@ -3872,6 +3918,7 @@ void App::CreateVideoTexture(int width, int height) {
 }
 
 void App::UploadFrame(const uint8_t* rgba, int width, int height) {
+    PROFILE_SCOPE();
     if (!m_videoTexture || !m_frameTransfer) return;
 
     void* mapped = SDL_MapGPUTransferBuffer(m_gpuDevice, m_frameTransfer, true);
@@ -4356,6 +4403,7 @@ static float HalfToFloat(uint16_t h) {
 }
 
 void App::TakeScreenshot(SDL_GPUCommandBuffer* cmd, int w, int h) {
+    PROFILE_SCOPE();
     // Record a download of the scene target onto the frame's command buffer,
     // then submit it with a fence and wait — a screenshot is rare enough that
     // one stalled frame doesn't matter. Rows come back top-first, FP16 RGBA

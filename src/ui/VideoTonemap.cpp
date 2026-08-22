@@ -1,6 +1,7 @@
 #include "ui/VideoTonemap.h"
 #include "scrubcut_shaders.h"  // generated from src/ui/shaders/compiled/* (see EmbedShaders.cmake)
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 #include <SDL3/SDL.h>
 
@@ -184,6 +185,7 @@ SDL_GPUTexture* VideoTonemap::Process(SDL_GPUTexture* srcTex, int width, int hei
                                       VideoColorMode mode, VideoColorPrimaries primaries,
                                       Tonemapper tonemapper, bool hdrPassthrough,
                                       float headroom, float sdrWhite) {
+    PROFILE_SCOPE();
     if (!m_ready || !srcTex || width <= 0 || height <= 0)
         return nullptr;
     if (!EnsureTarget(width, height,
@@ -206,6 +208,7 @@ SDL_GPUTexture* VideoTonemap::Process(SDL_GPUTexture* srcTex, int width, int hei
 bool VideoTonemap::RenderToBuffer(const uint8_t* src, int width, int height, VideoColorMode mode,
                                   VideoColorPrimaries primaries, Tonemapper tonemapper,
                                   std::vector<uint8_t>& outRGBA) {
+    PROFILE_SCOPE();
     if (!m_ready || !src || width <= 0 || height <= 0)
         return false;
     if (!EnsureTarget(width, height, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM))

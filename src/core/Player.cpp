@@ -1,6 +1,6 @@
 #include "core/Player.h"
 #include "util/Log.h"
-#include "util/Trace.h"
+#include "util/Profiler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -68,6 +68,7 @@ Player::~Player() {
 }
 
 bool Player::Open(const std::string& path) {
+    PROFILE_SCOPE();
     Close();
 
     if (!m_demuxer.Open(path))
@@ -222,10 +223,29 @@ bool Player::Open(const std::string& path) {
     // Pipeline is parked, so this owns the demuxer + video decoder.
     SyncDecodeNextFrame();
 
+    // Profiler phases: what's open, and the initial (paused) transport state.
+    size_t nameAt = path.find_last_of("/\\");
+    m_profMediaSectionId = PROFILE_SECTION_ENTER(Profiler::kSectionMedia, "Video: %s",
+        path.c_str() + (nameAt == std::string::npos ? 0 : nameAt + 1));
+    SetTransportSection("Paused");
+
     return true;
 }
 
+// Switch the profiler's transport section (nullptr = none). Main thread only;
+// unchanged labels are skipped so repeated Pause calls don't split it.
+void Player::SetTransportSection(const char* label) {
+    if (m_profTransportLabel && label && strcmp(m_profTransportLabel, label) == 0)
+        return;
+    m_profTransportLabel = label;
+    PROFILE_SECTION_LEAVE(m_profTransportSectionId);
+    m_profTransportSectionId = label
+        ? PROFILE_SECTION_ENTER(Profiler::kSectionTransport, "%s", label)
+        : 0;
+}
+
 void Player::Close() {
+    PROFILE_SCOPE();
     // Stop seek thread first (it may park/unpark the pipeline).
     if (m_seekThreadRunning) {
         m_stopSeekThread = true;
@@ -249,6 +269,10 @@ void Player::Close() {
     m_audioPacketQueue.Flush();
     m_videoFrameQueue.Flush();
 
+    SetTransportSection(nullptr);
+    PROFILE_SECTION_LEAVE(m_profMediaSectionId);
+    m_profMediaSectionId = 0;
+
     m_hasMedia = false;
     m_hasAudio = false;
     m_videoColorMode = VideoColorMode::SDR;
@@ -264,7 +288,7 @@ void Player::Close() {
 }
 
 void Player::Play() {
-    TRACE_EVENT("Player::Play");
+    PROFILE_SCOPE();
     if (!m_hasMedia) return;
     WaitForSeek();
 
@@ -337,22 +361,18 @@ void Player::Play() {
     m_resumeTime = resumeTime;
     m_playing = true;
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
-    if (m_profileSeek) {
-        m_playStartNS = SDL_GetTicksNS();
-        m_playDroppedFrames = 0;
-        LOG_INFO("Play: resume=%.3fs", resumeTime);
-    }
 
     // Unpark workers — they were idle since the last Pause/Seek, with
     // queues + decoder state intact. No flush, no seek. TryGetVideoFrame
     // picks up the first frame at-or-past resumeTime.
     UnparkPipeline();
     // Clock stays paused; TryGetVideoFrame will unpause it when ready.
+
+    SetTransportSection("Playing");
 }
 
 void Player::Pause() {
-    TRACE_EVENT("Player::Pause");
-    uint64_t t0 = m_profileSeek ? SDL_GetTicksNS() : 0;
+    PROFILE_SCOPE();
     m_playing = false;
     m_wantsToPlay = false;
     m_waitingForResumeFrame = false;
@@ -363,9 +383,8 @@ void Player::Pause() {
     // intact — they'll resume on the next Play. Held packet inside
     // DemuxThread (if any) survives via the pipeline-flush-gen check.
     ParkPipeline();
-    if (m_profileSeek) {
-        LOG_INFO("Pause: %.2fms", (SDL_GetTicksNS() - t0) / 1e6);
-    }
+
+    SetTransportSection("Paused");
 }
 
 void Player::TogglePlayPause() {
@@ -374,7 +393,7 @@ void Player::TogglePlayPause() {
 }
 
 void Player::SeekTo(double seconds, bool resumeAfter) {
-    TRACE_EVENT("Player::SeekTo");
+    PROFILE_SCOPE();
     if (!m_hasMedia) return;
     double duration = m_demuxer.GetDuration();
     seconds = std::clamp(seconds, 0.0, duration);
@@ -392,6 +411,8 @@ void Player::SeekTo(double seconds, bool resumeAfter) {
     m_waitingForResumeFrame = false;
     m_clock.SetPaused(true);
     if (m_hasAudio) m_audioOutput.Pause();
+    // Stopped for the duration of the seek; a resume re-enters "Playing".
+    SetTransportSection("Paused");
 
     // Clear stale completion — a new seek supersedes any previous result.
     m_seekDone = false;
@@ -407,6 +428,7 @@ void Player::SeekTo(double seconds, bool resumeAfter) {
 
 void Player::SeekThread() {
     SetCurrentThreadName(L"ScrubCut Seek");
+    PROFILE_THREAD("Player Seek");
 
     while (!m_stopSeekThread) {
         double target;
@@ -421,6 +443,8 @@ void Player::SeekThread() {
         }
 
         m_seekBusy = true;
+        PROFILE_SCOPE_N("Player::SeekOp");
+        Profiler::ScopedSection seekSection(Profiler::kSectionTransport, "Seeking");
 
         // Drain any further seek requests that arrived while we were waking up
         // (take the latest one — skip intermediate positions)
@@ -448,7 +472,6 @@ void Player::SeekThread() {
             double delta = target - currentSec;
             double frameDur = GetFrameDuration();
             if (!wasPlayingOrResume && delta > -frameDur && delta <= 0.0) {
-                if (m_profileSeek) LOG_INFO("Seek: REUSE delta=%.3f", delta);
                 goto seekDone;
             }
         }
@@ -457,27 +480,13 @@ void Player::SeekThread() {
         {
             std::lock_guard<std::mutex> lock(m_seekMutex);
             if (m_seekRequest >= 0.0) {
-                if (m_profileSeek) LOG_INFO("Seek: SKIPPED (newer request)");
                 m_seekBusy = false;
                 continue;
             }
         }
 
-        if (m_profileSeek) LOG_INFO("Seek: FULL scrub=%d", scrubbing);
         SyncSeekAndDecode(target);
         m_needsResync = false;
-
-        if (m_profileSeek) {
-            // Arm A/V sync diagnostics: AudioDecodeThread + VideoDecodeThread
-            // log the next few packet/frame ptss vs this seek target.
-            AVRational vtb = m_demuxer.GetVideoTimeBase();
-            double videoFirstSec = (m_lastDisplayedPts != AV_NOPTS_VALUE)
-                ? static_cast<double>(m_lastDisplayedPts) * av_q2d(vtb) : 0.0;
-            LOG_INFO("AVSync: seek target=%.3fs video first frame pts=%.3fs (delta=%+.3fs)",
-                     target, videoFirstSec, videoFirstSec - target);
-            m_avsyncSeekTarget.store(target, std::memory_order_relaxed);
-            m_avsyncLogPackets.store(5, std::memory_order_relaxed);
-        }
 
     seekDone:
         // Check if a newer seek request arrived while we were decoding
@@ -557,10 +566,10 @@ void Player::SyncAudioToClock() {
     m_audioOutput.SetSpeed(static_cast<float>(baseSpeed * (1.0 + corr)));
 }
 
-int Player::FilterAudioQueueBefore(double cutoffSec) {
+void Player::FilterAudioQueueBefore(double cutoffSec) {
+    PROFILE_SCOPE();
     double atb_d = av_q2d(m_demuxer.GetAudioTimeBase());
     int origCount = m_audioPacketQueue.Size();
-    int dropped = 0;
     AVPacket* drainPkt = av_packet_alloc();
     std::vector<AVPacket*> keep;
     for (int i = 0; i < origCount; ++i) {
@@ -573,7 +582,6 @@ int Player::FilterAudioQueueBefore(double cutoffSec) {
             keep.push_back(k);
         } else {
             av_packet_unref(drainPkt);
-            dropped++;
         }
     }
     for (AVPacket* k : keep) {
@@ -581,7 +589,6 @@ int Player::FilterAudioQueueBefore(double cutoffSec) {
         av_packet_free(&k);
     }
     av_packet_free(&drainPkt);
-    return dropped;
 }
 
 void Player::SeekRelative(double deltaSec) {
@@ -595,10 +602,8 @@ void Player::SeekRelative(double deltaSec) {
 }
 
 void Player::StepFrame(int direction) {
-    TRACE_EVENT("Player::StepFrame");
+    PROFILE_SCOPE();
     if (!m_hasMedia) return;
-    uint64_t stepStartNS = m_profileSeek ? SDL_GetTicksNS() : 0;
-    const char* stepKind = "unknown";
 
     WaitForSeek();
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
@@ -624,10 +629,6 @@ void Player::StepFrame(int direction) {
                 m_cachedWidth = cached->width;
                 m_cachedHeight = cached->height;
                 m_hasCachedFrame = true;
-                if (m_profileSeek) {
-                    LOG_INFO("StepFrame +1 cache-hit %.2fms",
-                             (SDL_GetTicksNS() - stepStartNS) / 1e6);
-                }
                 return;
             }
         }
@@ -636,7 +637,6 @@ void Player::StepFrame(int direction) {
         // do it now — we're about to produce the next frame from the
         // decoder pipeline and need it aligned with m_lastDisplayedPts.
         if (m_needsResync) {
-            stepKind = "+1 resync";
             FlushPipelineState();
             AVRational tb = m_demuxer.GetVideoTimeBase();
             double seekSec = (m_lastDisplayedPts + 0.5) * av_q2d(tb);
@@ -653,7 +653,6 @@ void Player::StepFrame(int direction) {
         // immediately after m_lastDisplayedPts — use it.
         AVFrame* frame = av_frame_alloc();
         if (m_videoFrameQueue.TryPop(frame)) {
-            stepKind = "+1 queue";
             AVRational tb = m_demuxer.GetVideoTimeBase();
             double frameSec = static_cast<double>(frame->pts) * av_q2d(tb);
             m_clock.SetTime(frameSec);
@@ -665,10 +664,6 @@ void Player::StepFrame(int direction) {
             if (m_hasCachedFrame)
                 m_frameCache.Put(frame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
             av_frame_free(&frame);
-            if (m_profileSeek) {
-                LOG_INFO("StepFrame %s %.2fms", stepKind,
-                         (SDL_GetTicksNS() - stepStartNS) / 1e6);
-            }
             return;
         }
         av_frame_free(&frame);
@@ -678,7 +673,6 @@ void Player::StepFrame(int direction) {
         // This handles both "queue exhausted but decoder pipeline buffered"
         // and "needs new packets" cases without us touching demuxer/decoder
         // directly — the worker threads own that.
-        if (strcmp(stepKind, "unknown") == 0) stepKind = "+1 tick";
         if (TickPipelineOneFrame(500)) {
             AVFrame* tickFrame = av_frame_alloc();
             if (m_videoFrameQueue.TryPop(tickFrame)) {
@@ -695,17 +689,13 @@ void Player::StepFrame(int direction) {
             }
             av_frame_free(&tickFrame);
         }
-        if (m_profileSeek) {
-            LOG_INFO("StepFrame %s %.2fms", stepKind,
-                     (SDL_GetTicksNS() - stepStartNS) / 1e6);
-        }
     } else {
         // Backward: check frame cache first (instant).
         bool cacheHit = false;
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
             const auto* cached = m_frameCache.FindBefore(m_lastDisplayedPts);
             if (cached) {
-                TRACE_LOG("StepBack_CacheHit");
+                PROFILE_MARK("StepBack cache hit");
                 AVRational tb = m_demuxer.GetVideoTimeBase();
                 double frameSec = static_cast<double>(cached->pts) * av_q2d(tb);
                 m_clock.SetTime(frameSec);
@@ -727,16 +717,12 @@ void Player::StepFrame(int direction) {
             // would cost a full GOP catchup decode (hundreds of ms on a
             // 4-second GOP), defeating the cache entirely.
             m_needsResync = true;
-            if (m_profileSeek) {
-                LOG_INFO("StepFrame -1 cache-hit %.2fms",
-                         (SDL_GetTicksNS() - stepStartNS) / 1e6);
-            }
             return;
         }
 
         // Cache miss — seek back and decode the frame immediately before
         // the current one.
-        TRACE_LOG("StepBack_CacheMiss");
+        PROFILE_MARK("StepBack cache miss");
         FlushPipelineState();
         double frameDur = GetFrameDuration();
         double targetSec = m_clock.GetTime() - frameDur;
@@ -752,10 +738,6 @@ void Player::StepFrame(int direction) {
         // next StepFrame(+1) pops a frame ~reorder-depth ahead.
         m_needsResync = true;
         PopulateCacheAroundCurrent();
-        if (m_profileSeek) {
-            LOG_INFO("StepFrame -1 cache-miss %.2fms",
-                     (SDL_GetTicksNS() - stepStartNS) / 1e6);
-        }
     }
 }
 
@@ -860,7 +842,7 @@ void Player::SetAudioTrack(int streamIndex) {
 // --- Synchronous decode (used when paused) ---
 
 bool Player::SyncDecodeNextFrame() {
-    TRACE_EVENT("SyncDecodeNextFrame");
+    PROFILE_SCOPE();
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     bool found = false;
@@ -922,8 +904,7 @@ bool Player::SyncDecodeNextFrame() {
 }
 
 bool Player::SyncSeekAndDecode(double targetSec) {
-    TRACE_EVENT("SyncSeekAndDecode");
-    uint64_t t0 = m_profileSeek ? SDL_GetTicksNS() : 0;
+    PROFILE_SCOPE();
 
     // Flush decoder state — we're seeking to a new position
     m_videoDecoder.Flush();
@@ -951,7 +932,6 @@ bool Player::SyncSeekAndDecode(double targetSec) {
         m_audioSkipUntil.store(kNoAudioSkip, std::memory_order_relaxed);
     }
 
-    uint64_t tFlush = m_profileSeek ? SDL_GetTicksNS() : 0;
     // Seek demuxer to keyframe at or before target
     m_demuxer.Seek(targetSec);
     m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
@@ -961,12 +941,10 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     AVRational tb = m_demuxer.GetVideoTimeBase();
     int64_t targetPts = static_cast<int64_t>(targetSec / av_q2d(tb));
 
-    uint64_t tSeek = m_profileSeek ? SDL_GetTicksNS() : 0;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     AVFrame* bestFrame = nullptr;
     int maxPackets = 5000;
-    int videoFrames = 0;
     bool eofHit = false;
 
     while (maxPackets-- > 0) {
@@ -1017,7 +995,6 @@ bool Player::SyncSeekAndDecode(double targetSec) {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
-            videoFrames++;
             if (!bestFrame) {
                 bestFrame = av_frame_alloc();
             } else {
@@ -1036,7 +1013,6 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     // pre-tail frame instead of the actual one.
     if (eofHit) {
         m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
-            videoFrames++;
             if (!bestFrame) bestFrame = av_frame_alloc();
             else av_frame_unref(bestFrame);
             av_frame_move_ref(bestFrame, f);
@@ -1048,8 +1024,6 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     }
 
 done:
-    uint64_t tDecode = m_profileSeek ? SDL_GetTicksNS() : 0;
-
     av_packet_free(&pkt);
     av_frame_free(&frame);
 
@@ -1077,12 +1051,7 @@ done:
             // before video catches up, manifesting as audio-leads-video
             // by up to a GOP duration.
             m_audioOutput.ResetPosition(frameSec);
-
-            int dropped = FilterAudioQueueBefore(frameSec);
-            if (m_profileSeek && dropped > 0) {
-                LOG_INFO("AVSync: dropped %d audio packets (< video first frame %.3fs)",
-                         dropped, frameSec);
-            }
+            FilterAudioQueueBefore(frameSec);
         }
 
         // Only convert the final target frame to RGBA (skip intermediates for speed)
@@ -1097,13 +1066,6 @@ done:
             m_hasCachedFrame = true;
         }
 
-        if (m_profileSeek) {
-            uint64_t tConvert = SDL_GetTicksNS();
-            LOG_INFO("SyncSeek: flush=%.1fms seek=%.1fms decode=%.1fms(%d frm) rgba=%.1fms total=%.1fms",
-                     (tFlush-t0)/1e6, (tSeek-tFlush)/1e6, (tDecode-tSeek)/1e6,
-                     videoFrames, (tConvert-tDecode)/1e6, (tConvert-t0)/1e6);
-        }
-
         av_frame_free(&bestFrame);
         return m_hasCachedFrame;
     }
@@ -1114,7 +1076,7 @@ done:
 }
 
 bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
-    TRACE_EVENT("SyncSeekAndDecodeBefore");
+    PROFILE_SCOPE();
 
     // Flush state (same as SyncSeekAndDecode — we're repositioning).
     m_videoDecoder.Flush();
@@ -1220,7 +1182,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
 }
 
 void Player::PopulateCacheAroundCurrent(std::function<bool()> shouldAbort) {
-    TRACE_EVENT("PopulateCacheAroundCurrent");
+    PROFILE_SCOPE();
     if (!m_hasMedia) return;
     if (m_playing) return; // only when paused
     // Cache decoder failed to open — skip cache population.
@@ -1255,7 +1217,7 @@ void Player::PopulateCacheAroundCurrent(std::function<bool()> shouldAbort) {
 
     while (maxPackets-- > 0) {
         if (shouldAbort && shouldAbort()) {
-            TRACE_LOG("PopulateCache_Aborted");
+            PROFILE_MARK("PopulateCache aborted");
             goto cacheDone;
         }
         int ret = m_cacheDemuxer.ReadPacket(pkt);
@@ -1298,6 +1260,7 @@ cacheDone:
 
 bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHeight) {
     if (!m_hasMedia) return false;
+    PROFILE_SCOPE();
 
     // Return cached frame from synchronous decode
     if (m_hasCachedFrame) {
@@ -1329,12 +1292,6 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
             if (frameSec >= m_resumeTime - frameDur) {
                 // This frame is at or near our resume point — start playback
                 m_waitingForResumeFrame = false;
-                if (m_profileSeek && m_playStartNS) {
-                    double elapsedMs = (SDL_GetTicksNS() - m_playStartNS) / 1e6;
-                    LOG_INFO("Play: ready in %.1fms (resume=%.3fs first=%.3fs catchup=%d frames)",
-                             elapsedMs, m_resumeTime, frameSec, m_playDroppedFrames);
-                    m_playStartNS = 0;
-                }
                 // Start the clock where the audio content resumes rather
                 // than at this frame's pts — the first queued frame can be
                 // up to one frame ahead of the pause point, and anchoring
@@ -1354,7 +1311,6 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
             // Drop this frame — it's before our resume point
             if (!m_videoFrameQueue.TryPop(frame)) break;
             av_frame_unref(frame);
-            if (m_profileSeek) m_playDroppedFrames++;
         }
         av_frame_free(&frame);
         if (m_waitingForResumeFrame) return false;
@@ -1415,6 +1371,7 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 // --- Thread management ---
 
 void Player::WaitForSeek() {
+    PROFILE_WAIT_SCOPE();
     // Spin-wait for the seek thread to finish its current operation.
     // This is only called for operations that need decoder consistency
     // (StepFrame, PopulateCacheAroundCurrent).
@@ -1424,7 +1381,7 @@ void Player::WaitForSeek() {
 }
 
 void Player::SpawnPipelineThreads() {
-    TRACE_EVENT("SpawnPipelineThreads");
+    PROFILE_SCOPE();
     {
         std::lock_guard<std::mutex> lk(m_pipelineMutex);
         m_pipelineActive = false;
@@ -1444,7 +1401,7 @@ void Player::SpawnPipelineThreads() {
 }
 
 void Player::StopPipelineThreads() {
-    TRACE_EVENT("StopPipelineThreads");
+    PROFILE_SCOPE();
     {
         std::lock_guard<std::mutex> lk(m_pipelineMutex);
         m_pipelineExit = true;
@@ -1461,7 +1418,7 @@ void Player::StopPipelineThreads() {
 }
 
 void Player::ParkPipeline() {
-    TRACE_EVENT("ParkPipeline");
+    PROFILE_SCOPE();
     {
         std::lock_guard<std::mutex> lk(m_pipelineMutex);
         if (!m_pipelineActive && m_pipelineParkedCount == m_pipelineThreadCount) {
@@ -1479,6 +1436,8 @@ void Player::ParkPipeline() {
     m_audioPacketQueue.Interrupt();
     m_videoFrameQueue.Interrupt();
 
+    // Wait for all workers to reach their park gate.
+    PROFILE_WAIT_SCOPE_N("WaitWorkersParked");
     std::unique_lock<std::mutex> lk(m_pipelineMutex);
     m_pipelineParkedCv.wait(lk, [&] {
         return m_pipelineParkedCount == m_pipelineThreadCount || m_pipelineExit;
@@ -1486,7 +1445,7 @@ void Player::ParkPipeline() {
 }
 
 void Player::UnparkPipeline() {
-    TRACE_EVENT("UnparkPipeline");
+    PROFILE_SCOPE();
     m_videoPacketQueue.ClearInterrupt();
     m_audioPacketQueue.ClearInterrupt();
     m_videoFrameQueue.ClearInterrupt();
@@ -1511,6 +1470,7 @@ bool Player::WorkerParkOrExit() {
 
 void Player::DemuxThread() {
     SetCurrentThreadName(L"ScrubCut Demux");
+    PROFILE_THREAD("Player Demux");
     AVPacket* pkt = av_packet_alloc();
     AVPacket* held = nullptr;          // packet awaiting push (preserved across pause)
     uint64_t  heldGen = 0;
@@ -1593,6 +1553,7 @@ void Player::DemuxThread() {
 
 void Player::VideoDecodeThread() {
     SetCurrentThreadName(L"ScrubCut VideoDecode");
+    PROFILE_THREAD("Player VideoDecode");
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     bool drainedEof = false;
@@ -1646,6 +1607,7 @@ void Player::VideoDecodeThread() {
 
 void Player::AudioDecodeThread() {
     SetCurrentThreadName(L"ScrubCut AudioDecode");
+    PROFILE_THREAD("Player AudioDecode");
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     uint8_t* outBuf = nullptr;
@@ -1655,19 +1617,6 @@ void Player::AudioDecodeThread() {
         if (!WorkerParkOrExit()) break;
 
         if (!m_audioPacketQueue.PopWithTimeout(pkt, 50)) continue;
-
-        if (m_avsyncLogPackets.load(std::memory_order_relaxed) > 0) {
-            int n = m_avsyncLogPackets.fetch_sub(1, std::memory_order_relaxed);
-            if (n > 0) {
-                AVRational atb = m_demuxer.GetAudioTimeBase();
-                double pktSec = (pkt->pts != AV_NOPTS_VALUE)
-                    ? static_cast<double>(pkt->pts) * av_q2d(atb) : -1.0;
-                double tgt = m_avsyncSeekTarget.load(std::memory_order_relaxed);
-                double pos = m_audioOutput.GetPlaybackPosition();
-                LOG_INFO("AVSync: audio pkt pts=%.3fs target=%.3fs (delta=%+.3fs) audio_clock=%.3fs",
-                         pktSec, tgt, pktSec - tgt, pos);
-            }
-        }
 
         int ret = m_audioDecoder.SendPacket(pkt);
         av_packet_unref(pkt);
@@ -1685,6 +1634,7 @@ void Player::AudioDecodeThread() {
                 ptsSec = static_cast<double>(frame->pts) * av_q2d(m_demuxer.GetAudioTimeBase());
 
             if (m_swrCtx) {
+                PROFILE_SCOPE_N("AudioResampleWrite");
                 int outSamples = swr_get_out_samples(m_swrCtx, frame->nb_samples);
                 int outBytes = outSamples * m_audioOutput.GetChannels() * 2;
                 if (outBytes > outBufSize) {
@@ -1738,6 +1688,13 @@ void Player::AudioDecodeThread() {
     av_frame_free(&frame);
 }
 
+void Player::EmitProfilerPlots() {
+    if (!Profiler::IsEnabled() || !m_hasMedia) return;
+    PROFILE_PLOT("Video packet queue", static_cast<int64_t>(m_videoPacketQueue.Size()));
+    PROFILE_PLOT("Audio packet queue", static_cast<int64_t>(m_audioPacketQueue.Size()));
+    PROFILE_PLOT("Video frame queue", static_cast<int64_t>(m_videoFrameQueue.Size()));
+}
+
 void Player::FlushPipelineState() {
     m_videoDecoder.Flush();
     if (m_hasAudio) m_audioDecoder.Flush();
@@ -1748,8 +1705,13 @@ void Player::FlushPipelineState() {
 }
 
 bool Player::TickPipelineOneFrame(int timeoutMs) {
+    PROFILE_SCOPE();
     UnparkPipeline();
-    bool got = m_videoFrameQueue.WaitForOne(timeoutMs);
+    bool got;
+    {
+        PROFILE_WAIT_SCOPE_N("WaitFrameReady");
+        got = m_videoFrameQueue.WaitForOne(timeoutMs);
+    }
     ParkPipeline();
     return got;
 }

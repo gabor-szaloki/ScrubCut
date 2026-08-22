@@ -1,11 +1,13 @@
 #include "App.h"
 #include "util/CommandLine.h"
+#include "util/Profiler.h"
 #include "export/Exporter.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 
@@ -49,6 +51,25 @@ static int RunExportSegment(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+    // Arm the Tracy profiler before anything else runs so a waiting viewer
+    // (tracy-profiler -a 127.0.0.1) can catch the startup flow. The on-demand
+    // handshake still races the first ~100 ms; -profile-wait closes that by
+    // blocking (bounded) until a viewer attaches. Also toggleable at runtime
+    // via Help > Enable Tracy Instrumentation.
+    bool profileWait = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-profile") == 0) {
+            Profiler::SetEnabled(true);
+        } else if (std::strcmp(argv[i], "-profile-wait") == 0) {
+            Profiler::SetEnabled(true);
+            profileWait = true;
+        }
+    }
+    if (profileWait) {
+        for (int i = 0; i < 1000 && !Profiler::IsConnected(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
 #ifdef _WIN32
     SetThreadDescription(GetCurrentThread(), L"ScrubCut Main");
 #endif
@@ -64,8 +85,11 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    if (CommandLine::Get().HasFlag("-export-segment"))
-        return RunExportSegment(argc, argv);
+    if (CommandLine::Get().HasFlag("-export-segment")) {
+        int rc = RunExportSegment(argc, argv);
+        Profiler::Shutdown();
+        return rc;
+    }
 
     App app;
 
@@ -74,6 +98,7 @@ int main(int argc, char* argv[]) {
 
     app.Run();
     app.Shutdown();
+    Profiler::Shutdown();
 
     return 0;
 }

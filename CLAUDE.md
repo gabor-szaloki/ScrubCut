@@ -1,6 +1,6 @@
 # ScrubCut
 
-Cross-platform desktop video player for fast frame-accurate scrubbing, trimming, and frame export. C++17 / CMake / SDL3 / Dear ImGui (docking) / FFmpeg / SDL_GPU (D3D12/Metal/Vulkan), deps via vcpkg (submodule). Windows is the primary target; macOS supported. No Linux build.
+Cross-platform desktop video player for fast frame-accurate scrubbing, trimming, and frame export. C++17 / CMake / SDL3 / Dear ImGui (docking) / FFmpeg / SDL_GPU (D3D12/Metal/Vulkan), deps via vcpkg (submodule + overlay ports in `vcpkg-overlays/`). Windows is the primary target; macOS supported. No Linux build.
 
 ## Build, install, package
 
@@ -25,10 +25,12 @@ src/core/           # playback pipeline (Player, Demuxer, decoders, queues, cloc
 src/ui/UIManager    # ImGui + SDL3 + SDLGPU3 backends, fonts, DPI, dockspace
 src/ui/shaders/     # HLSL, compiled at build time (shadercross; glslang+spirv-cross on macOS) and embedded per-platform
 src/export/         # background segment/frame export
-src/util/           # AppPaths, Settings (INI), Log, Trace, Types (shared structs), FFmpegUtils
+src/util/           # AppPaths, Settings (INI), Log, Profiler (Tracy wrappers), Types (shared structs), FFmpegUtils
 platform/{windows,macos}/  # icons, manifest, plist template, NSIS bits
 cmake/              # GenerateVersion.cmake, EmbedShaders.cmake (shader blob embedding)
 third_party/stb/    # vendored stb_image_write
+vcpkg-overlays/     # tracy client port, pinned newer than the vcpkg submodule ships
+
 ```
 
 ## Architectural patterns worth knowing up front
@@ -43,6 +45,7 @@ These are invariants that grep won't tell you in five minutes:
 - **Timeline overlays** in `App::Render` all share one mapping: `x = barPos.x + (timeSec / duration) * barWidth`. Pick the right draw order between background → waveform → segments → frame marks → playhead so user marks stay on top.
 - **A/V sync**: the wall `Clock` (video) is the master — `Player::SyncAudioToClock` steers the audio device rate each frame so the pts-anchored audio position follows it. Pause/resume keeps the audio stream's buffered content; never flush the audio output on a transport path without re-anchoring it to real packet ptss.
 - **Cross-platform shortcuts**: the `kKeys` struct in `App.cpp` exposes platform-aware modifiers (`cmdMod`, `winMod`, etc.) and display names (`cmdName`, `altKeyName`). Use these instead of hard-coding Cmd vs Ctrl.
+- **Profiling**: Tracy instrumentation is compiled into all builds but inert until armed (`-profile` / `-profile-wait` / Help menu). Always use the `PROFILE_*` macros and helpers in `util/Profiler.h` — raw Tracy calls crash before `StartupProfiler` runs (manual lifetime). Wait-dominated scopes use gray `PROFILE_WAIT_SCOPE`; program phases (open file, transport, jobs) are Tracy sections; `LOG_*` lines mirror into the trace.
 - **Rendering & HDR**: everything draws into an FP16 offscreen scene target (extended-sRGB encoded, 1.0 = SDR white); a plain blit (SDR) or a composite pass (HDR) presents it to the swapchain. HDR output is content-gated in `App::UpdateHDROutput` — it engages only while an HDR video is open on an HDR-mode display (scRGB preferred, HDR10 PQ fallback). `ui/VideoTonemap` maps HDR frames for display and export: tone-mapping for SDR output, absolute-nits passthrough for HDR.
 
 ## Conventions

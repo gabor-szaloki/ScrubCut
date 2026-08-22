@@ -1,5 +1,6 @@
 #include "core/FrameConverter.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 VideoColorMode FrameConverter::ColorModeForTransfer(int colorTrc) {
     switch (colorTrc) {
@@ -26,6 +27,7 @@ FrameConverter::~FrameConverter() {
 }
 
 const uint8_t* FrameConverter::Convert(AVFrame* frame) {
+    PROFILE_SCOPE();
     if (!frame)
         return nullptr;
 
@@ -56,6 +58,8 @@ void FrameConverter::EnsureContext(AVFrame* frame) {
     if (m_swsCtx && m_width == width && m_height == height &&
         m_srcFmt == srcFmt && m_srcTrc == trc)
         return;
+
+    PROFILE_SCOPE_N("FrameConverter::RebuildContext");
 
     if (m_swsCtx) {
         sws_freeContext(m_swsCtx);

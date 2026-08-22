@@ -1,5 +1,6 @@
 #include "core/VideoDecoder.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 extern "C" {
 #include <libavutil/intreadwrite.h>
@@ -10,6 +11,7 @@ VideoDecoder::~VideoDecoder() {
 }
 
 bool VideoDecoder::Open(AVCodecParameters* codecParams, bool quiet) {
+    PROFILE_SCOPE();
     Close();
 
     const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
@@ -78,11 +80,13 @@ void VideoDecoder::Close() {
 }
 
 int VideoDecoder::SendPacket(AVPacket* pkt) {
+    PROFILE_SCOPE();
     if (!m_codecCtx) return AVERROR(EINVAL);
     return avcodec_send_packet(m_codecCtx, pkt);
 }
 
 int VideoDecoder::ReceiveFrame(AVFrame* frame) {
+    PROFILE_SCOPE();
     if (!m_codecCtx) return AVERROR(EINVAL);
     int ret = avcodec_receive_frame(m_codecCtx, frame);
     if (ret == 0)
@@ -105,6 +109,7 @@ void VideoDecoder::Flush() {
 }
 
 void VideoDecoder::DrainAtEOF(AVFrame* tmp, const std::function<bool(AVFrame*)>& onFrame) {
+    PROFILE_SCOPE();
     if (!m_codecCtx) return;
     avcodec_send_packet(m_codecCtx, nullptr);
     while (true) {

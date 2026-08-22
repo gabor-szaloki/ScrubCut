@@ -11,9 +11,11 @@
 #include <imgui_impl_sdlgpu3.h>
 #include "util/AppPaths.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 bool UIManager::Init(SDL_Window* window, SDL_GPUDevice* device,
                      SDL_GPUTextureFormat colorTargetFormat) {
+    PROFILE_SCOPE();
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
 
@@ -37,6 +39,7 @@ bool UIManager::Init(SDL_Window* window, SDL_GPUDevice* device,
     // demand, so no glyph-range table is needed. If a file is missing,
     // GetSubtitleFont() falls back to the default UI font.
     {
+        PROFILE_SCOPE_N("LoadSubtitleFonts");
         constexpr float kSubtitleBaseSize = 32.0f;
         const char* base = SDL_GetBasePath();
         std::filesystem::path dir(base ? base : "");
@@ -147,6 +150,7 @@ void UIManager::Shutdown() {
 }
 
 void UIManager::BeginFrame() {
+    PROFILE_SCOPE();
     ImGui_ImplSDLGPU3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -155,6 +159,7 @@ void UIManager::BeginFrame() {
 }
 
 void UIManager::EndFrame(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target) {
+    PROFILE_SCOPE();
     ImGui::Render();
     if (!cmd || !target)
         return;

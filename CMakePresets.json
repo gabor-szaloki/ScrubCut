@@ -7,7 +7,8 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Debug",
-        "VCPKG_USE_LEGACY_APPLOCAL": "ON"
+        "VCPKG_USE_LEGACY_APPLOCAL": "ON",
+        "VCPKG_OVERLAY_PORTS": "${sourceDir}/vcpkg-overlays"
       }
     },
     {
@@ -16,7 +17,8 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
-        "VCPKG_USE_LEGACY_APPLOCAL": "ON"
+        "VCPKG_USE_LEGACY_APPLOCAL": "ON",
+        "VCPKG_OVERLAY_PORTS": "${sourceDir}/vcpkg-overlays"
       }
     }
   ],

@@ -1,5 +1,6 @@
 #include "core/SubtitleExtractor.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 #include <algorithm>
 #include <cstring>
@@ -109,6 +110,9 @@ std::string SubtitleExtractor::ActiveText(double t) const {
 }
 
 void SubtitleExtractor::Worker(std::string path, int streamIndex) {
+    PROFILE_THREAD("Subtitle Scan");
+    PROFILE_SCOPE();
+    Profiler::ScopedSection section(Profiler::kSectionJobs, "Subtitle scan");
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
         LOG_WARN("Subtitle: failed to open %s", path.c_str());

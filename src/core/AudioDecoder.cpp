@@ -1,5 +1,6 @@
 #include "core/AudioDecoder.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 AudioDecoder::~AudioDecoder() {
     Close();
@@ -36,10 +37,12 @@ void AudioDecoder::Close() {
 }
 
 int AudioDecoder::SendPacket(AVPacket* pkt) {
+    PROFILE_SCOPE();
     return avcodec_send_packet(m_codecCtx, pkt);
 }
 
 int AudioDecoder::ReceiveFrame(AVFrame* frame) {
+    PROFILE_SCOPE();
     return avcodec_receive_frame(m_codecCtx, frame);
 }
 

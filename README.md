@@ -151,10 +151,10 @@ Shortcuts are grouped the same way as the in-app help panel (press **?**).
 | Argument         | Description                                                     |
 |------------------|-----------------------------------------------------------------|
 | `<path>`         | Open the given video file at launch                             |
-| `-trace`         | Write performance traces to `scrubcut_trace.csv` in the app data dir |
+| `-profile`       | Arm the [Tracy](https://github.com/wolfpld/tracy) profiler instrumentation. |
+| `-profile-wait`  | Like `-profile`, but block at launch until a Tracy viewer connects so the startup flow is fully captured. |
 | `-log`           | Allocate a console for stdout/stderr (Windows only)             |
 | `-resetlayout`   | Reset the docked panel layout to defaults                       |
-| `-profileseek`   | Enable seek-performance profiling                               |
 | `-export-segment <startSec> <endSec> <input> [outputBase]` | Headless stream-copy export of a single segment; no UI. Defaults `outputBase` to the input's directory and stem. Output is `<outputBase>_001.<input_ext>`. |
 
 ## Tech stack
@@ -163,6 +163,7 @@ Shortcuts are grouped the same way as the in-app help panel (press **?**).
 - **Dear ImGui** (docking) -- immediate-mode UI
 - **FFmpeg** -- demuxing, decoding, encoding, filtering
 - **SDL_GPU** -- rendering (D3D12 on Windows, Metal on macOS, Vulkan fallback)
+- **Tracy** -- instrumented profiling, opt-in via `-profile`
 - **CMake + vcpkg** -- build system and dependency management
 
 ## License

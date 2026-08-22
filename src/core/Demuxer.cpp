@@ -1,11 +1,13 @@
 #include "core/Demuxer.h"
 #include "util/Log.h"
+#include "util/Profiler.h"
 
 Demuxer::~Demuxer() {
     Close();
 }
 
 bool Demuxer::Open(const std::string& path, const char* purpose) {
+    PROFILE_SCOPE();
     Close();
 
     int ret = avformat_open_input(&m_fmtCtx, path.c_str(), nullptr, nullptr);
@@ -54,10 +56,12 @@ void Demuxer::Close() {
 }
 
 int Demuxer::ReadPacket(AVPacket* pkt) {
+    PROFILE_SCOPE();
     return av_read_frame(m_fmtCtx, pkt);
 }
 
 bool Demuxer::Seek(double seconds) {
+    PROFILE_SCOPE();
     if (!m_fmtCtx || m_videoStreamIdx < 0)
         return false;
 

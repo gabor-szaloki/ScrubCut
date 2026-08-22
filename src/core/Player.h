@@ -51,6 +51,9 @@ public:
     // Called from the main thread each frame. Handles post-seek resume.
     void PollSeekComplete();
 
+    // Per-frame queue-depth plots for the profiler (no-op unless enabled).
+    void EmitProfilerPlots();
+
     bool IsPlaying() const { return m_playing.load(std::memory_order_relaxed); }
     bool IsSeekBusy() const { return m_seekBusy.load(std::memory_order_relaxed); }
     bool HasMedia() const { return m_hasMedia; }
@@ -94,8 +97,6 @@ public:
 
     void SetSpeed(double speed);
     double GetSpeed() const { return m_clock.GetSpeed(); }
-
-    void SetProfileSeek(bool enable) { m_profileSeek = enable; }
 
     void SetScrubbing(bool scrubbing) {
         m_scrubbing.store(scrubbing, std::memory_order_relaxed);
@@ -147,8 +148,8 @@ private:
     // Drop queued audio packets whose content ends before cutoffSec (with
     // the same 25ms straddle margin used when capturing them). Pipeline must
     // be parked and the audio queue's interrupt cleared — the pop/re-push
-    // cycle assumes no concurrent consumer. Returns the dropped count.
-    int FilterAudioQueueBefore(double cutoffSec);
+    // cycle assumes no concurrent consumer.
+    void FilterAudioQueueBefore(double cutoffSec);
 
     // Synchronously decode the next video frame from the current demuxer/decoder state.
     // No seek, no flush. Returns true if a frame was decoded and cached.
@@ -188,14 +189,13 @@ private:
     std::atomic<bool> m_stopSeekThread{false};
     std::atomic<bool> m_scrubbing{false};    // true during timeline drag (keyframe-only mode)
     bool m_seekThreadRunning = false;
-    bool m_profileSeek = false;
 
-    // A/V sync diagnostics. When -profileseek is on, a counter is set after
-    // each seek so the next few audio packets and video frames log their
-    // pts vs the seek target — lets us see whether audio/video drift after
-    // a seek is from skewed packet pts or from elsewhere.
-    std::atomic<int>    m_avsyncLogPackets{0};
-    std::atomic<double> m_avsyncSeekTarget{0.0};
+    // Profiler program-phase sections: the open video (Open/Close) and the
+    // transport state (Playing/Paused). Main thread only.
+    void SetTransportSection(const char* label);  // nullptr = leave only
+    uint32_t m_profMediaSectionId = 0;
+    uint32_t m_profTransportSectionId = 0;
+    const char* m_profTransportLabel = nullptr;
 
     // When set (!= kNoAudioSkip), AudioDecodeThread discards/trims decoded
     // samples up to this media time before writing to the output — used when
@@ -289,12 +289,6 @@ private:
     // threads arrives at or after m_resumeTime. Prevents fast-forward on Play.
     bool m_waitingForResumeFrame = false;
     double m_resumeTime = 0.0;
-
-    // Profiling: timestamp of last Play() entry, and counters that tally
-    // the catchup work done between Play() and the first playable frame.
-    // Logged when -profileseek is enabled.
-    uint64_t m_playStartNS = 0;
-    int m_playDroppedFrames = 0;
 
     // Volume
     float m_volume = 1.0f;

@@ -34,6 +34,11 @@ endif()
 # FFmpeg - vcpkg provides config-mode find modules
 find_package(FFMPEG REQUIRED)
 
+# Tracy client (instrumented profiling — see util/Profiler.h). Built from the
+# overlay port in vcpkg-overlays/; the TRACY_* behavior flags are baked in
+# there and propagate as PUBLIC compile definitions of this target.
+find_package(Tracy CONFIG REQUIRED)
+
 # --- Sources ---
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
@@ -203,6 +208,7 @@ target_include_directories(ScrubCut SYSTEM PRIVATE
 target_link_libraries(ScrubCut PRIVATE
     SDL3::SDL3
     imgui::imgui
+    Tracy::TracyClient
     ${FFMPEG_LIBRARIES}
 )
 
