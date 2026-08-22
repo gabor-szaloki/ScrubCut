@@ -3,7 +3,7 @@ build/
 out/
 cmake-build-*/
 _CPack_Packages/
-
+*.dmg
 
 # IDE
 .vs/
