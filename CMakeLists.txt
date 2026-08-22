@@ -22,6 +22,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin)
 find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 
+# The vcpkg imgui port both uncomments IMGUI_ENABLE_FREETYPE* in imconfig.h and
+# exports them as PUBLIC compile definitions, which triggers C4005 (macro
+# redefinition) in every TU. The header defines suffice, so drop the duplicates.
+get_target_property(_imgui_defs imgui::imgui INTERFACE_COMPILE_DEFINITIONS)
+if(_imgui_defs)
+    list(REMOVE_ITEM _imgui_defs IMGUI_ENABLE_FREETYPE IMGUI_ENABLE_FREETYPE_PLUTOSVG)
+    set_target_properties(imgui::imgui PROPERTIES INTERFACE_COMPILE_DEFINITIONS "${_imgui_defs}")
+endif()
+
 # FFmpeg - vcpkg provides config-mode find modules
 find_package(FFMPEG REQUIRED)
 
