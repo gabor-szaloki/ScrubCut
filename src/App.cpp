@@ -1703,26 +1703,27 @@ void App::Render() {
                 }
                 ImGui::EndDisabled();
                 // Status footer: what the current content/output state means
-                // for the settings above.
-                const bool videoIsHDR =
-                    m_player.HasMedia() && m_videoColorMode != VideoColorMode::SDR;
-                const char* statusLine1;
-                const char* statusLine2;
-                if (!videoIsHDR) {
-                    statusLine1 = "SDR video";
-                    statusLine2 = "HDR settings don't apply";
-                } else if (!m_swapchainHDR) {
-                    statusLine1 = m_displayHDR ? "HDR video, HDR output disabled"
-                                               : "HDR video, SDR display";
-                    statusLine2 = "Selected tonemapper is used";
-                } else {
-                    statusLine1 = (m_hdrCompositeMode == 1) ? "HDR output enabled (scRGB)"
-                                                            : "HDR output enabled (HDR10)";
-                    statusLine2 = "Tonemapper options don't apply";
+                // for the settings above. Omitted with no video open.
+                if (m_player.HasMedia()) {
+                    const bool videoIsHDR = m_videoColorMode != VideoColorMode::SDR;
+                    const char* statusLine1;
+                    const char* statusLine2;
+                    if (!videoIsHDR) {
+                        statusLine1 = "SDR video";
+                        statusLine2 = "HDR settings don't apply";
+                    } else if (!m_swapchainHDR) {
+                        statusLine1 = m_displayHDR ? "HDR video, HDR output disabled"
+                                                   : "HDR video, SDR display";
+                        statusLine2 = "Selected tonemapper is used";
+                    } else {
+                        statusLine1 = (m_hdrCompositeMode == 1) ? "HDR output enabled (scRGB)"
+                                                                : "HDR output enabled (HDR10)";
+                        statusLine2 = "Tonemapper options don't apply";
+                    }
+                    ImGui::Separator();
+                    ImGui::TextDisabled("%s", statusLine1);
+                    ImGui::TextDisabled("%s", statusLine2);
                 }
-                ImGui::Separator();
-                ImGui::TextDisabled("%s", statusLine1);
-                ImGui::TextDisabled("%s", statusLine2);
                 ImGui::EndMenu();
             }
             ImGui::SeparatorText("Windows");
@@ -3475,10 +3476,20 @@ void App::Render() {
                                   ImGuiWindowFlags_NoScrollbar);
                 ImGui::TextColored(accent, "HDR video");
                 ImGui::TextWrapped(
-                    "GIF and PNG exports will be converted to SDR using the currently "
-                    "selected tonemapper (%s). Source-format segment exports copy the "
-                    "original HDR video untouched.",
-                    TonemapperName(m_tonemapper));
+                    "Source-format segment exports copy the original HDR video untouched. "
+                    "GIF and PNG exports will be converted to SDR using the selected tonemapper:");
+                // Binds to the same operator as View > HDR, so SDR display mode
+                // live-previews the choice; on HDR output this is the only place
+                // the operator matters.
+                //ImGui::SetNextItemWidth(ImGui::GetFontSize() * 10.0f);
+                if (ImGui::BeginCombo("##Tonemapper", TonemapperName(m_tonemapper))) {
+                    for (int i = 0; i < kTonemapperCount; ++i) {
+                        Tonemapper t = static_cast<Tonemapper>(i);
+                        if (ImGui::Selectable(TonemapperName(t), m_tonemapper == t))
+                            m_tonemapper = t;
+                    }
+                    ImGui::EndCombo();
+                }
                 ImGui::EndChild();
                 ImGui::PopStyleColor(2);
             }
