@@ -70,7 +70,7 @@ The same four commands work on both platforms — each platform's tooling produc
 | Configure  | `cmake --preset release`                     | configures `build/release/`                            | configures `build/release/`                                 |
 | Build      | `cmake --build --preset release`             | exe in `build/release/bin/`                            | binary in `build/release/bin/`                              |
 | Install    | `cmake --install build/release`              | `C:/Program Files/ScrubCut/` (admin)                   | `/Applications/ScrubCut.app` (signed)                       |
-| Package    | `cpack --config build/release/CPackConfig.cmake` | `build/release/ScrubCut-<version>-win64.exe`     | `build/release/ScrubCut-<version>-mac.dmg`                  |
+| Package    | `cpack --config build/release/CPackConfig.cmake` | `ScrubCut-<version>-win64.exe`                     | `ScrubCut-<version>-mac.dmg`                                |
 
 Notes:
 
