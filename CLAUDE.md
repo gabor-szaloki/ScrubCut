@@ -48,6 +48,24 @@ These are invariants that grep won't tell you in five minutes:
 - **Profiling**: Tracy instrumentation is compiled into all builds but inert until armed (`-profile` / `-profile-wait` / Help menu). Always use the `PROFILE_*` macros and helpers in `util/Profiler.h` — raw Tracy calls crash before `StartupProfiler` runs (manual lifetime). Wait-dominated scopes use gray `PROFILE_WAIT_SCOPE`; program phases (open file, transport, jobs) are Tracy sections; `LOG_*` lines mirror into the trace.
 - **Rendering & HDR**: everything draws into an FP16 offscreen scene target (extended-sRGB encoded, 1.0 = SDR white); a plain blit (SDR) or a composite pass (HDR) presents it to the swapchain. HDR output is content-gated in `App::UpdateHDROutput` — it engages only while an HDR video is open on an HDR-mode display (scRGB preferred, HDR10 PQ fallback). `ui/VideoTonemap` maps HDR frames for display and export: tone-mapping for SDR output, absolute-nits passthrough for HDR.
 
+## Profiling workflow
+
+Tools (`tracy-capture`, `tracy-csvexport`, `tracy-profiler`) come prebuilt from the
+[Tracy release](https://github.com/wolfpld/tracy/releases) matching the client version
+pinned in `vcpkg-overlays/tracy/vcpkg.json` — mismatched versions refuse to connect.
+
+```
+tracy-capture -o out.tracy -a 127.0.0.1 -s 10 -f    # start first — it waits for the client
+ScrubCut -profile-wait                              # -profile-wait = full startup in the trace
+tracy-csvexport out.tracy                           # per-zone stats CSV
+tracy-csvexport -u out.tracy                        # every zone instance (thread, start, duration)
+tracy-csvexport -m out.tracy                        # messages (mirrored LOG_* lines + PROFILE_MARKs)
+```
+
+Interactive: `tracy-profiler -a 127.0.0.1` (auto-connects, GUI). Sections (Media/Transport/Jobs
+bars) are visible only in the GUI — csvexport doesn't export them. Recording only happens while
+a viewer/capture is connected, so trigger the interesting action during the capture window.
+
 ## Conventions
 
 - Windows is primary — list Windows first in if/elseif branches, README tables, etc.
