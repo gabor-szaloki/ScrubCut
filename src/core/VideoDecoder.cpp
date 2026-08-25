@@ -33,8 +33,11 @@ bool VideoDecoder::Open(AVCodecParameters* codecParams, bool quiet) {
         return false;
     }
 
-    // Enable multi-threaded decoding
-    m_codecCtx->thread_count = 0;  // auto-detect (typically number of CPU cores)
+    // Enable multi-threaded decoding: auto = min(cores + 1, 16). Note the 16
+    // cap (MAX_AUTO_THREADS) bounds frame-threaded throughput to
+    // 16 / per-frame-decode-latency, which is what limits high-speed playback
+    // of heavy files on >16-core machines.
+    m_codecCtx->thread_count = 0;
     m_codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
     // Container-level cropping (Matroska PixelCrop* elements — e.g. WebM VP9

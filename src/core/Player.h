@@ -7,6 +7,7 @@
 #include "core/FrameConverter.h"
 #include "core/Clock.h"
 #include "core/PacketQueue.h"
+#include "core/DecodedFrameQueue.h"
 #include "core/FrameQueue.h"
 #include "core/FrameCache.h"
 #include "util/Types.h"
@@ -30,20 +31,16 @@ public:
     void Close();
 
     void Play();
-    void Pause();
+    // Pause playback. By default also kicks off an async fill of the
+    // step-back frame cache around the pause point (on the seek thread, same
+    // as after a seek). Internal callers that immediately seek or manage the
+    // cache themselves pass populateCache = false.
+    void Pause(bool populateCache = true);
     void TogglePlayPause();
 
     void SeekTo(double seconds, bool resumeAfter = false);
     void SeekRelative(double deltaSec);
     void StepFrame(int direction); // +1 forward, -1 backward
-
-    // Populate frame cache around the current position (for backward stepping).
-    // Called after a seek drag is released. Runs synchronously but only does
-    // RGBA conversion of frames not already in cache. If `shouldAbort` is
-    // provided, it's polled per packet — return true to bail early (used by
-    // SeekThread to abort if a fresh seek arrives while we're still building
-    // cache from a now-stale position).
-    void PopulateCacheAroundCurrent(std::function<bool()> shouldAbort = nullptr);
 
     // Called from the main thread each render frame.
     bool TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHeight);
@@ -110,6 +107,7 @@ public:
 private:
     void DemuxThread();
     void VideoDecodeThread();
+    void ConvertThread();
     void AudioDecodeThread();
 
     // Spawn worker threads (parked). Called from Open.
@@ -141,15 +139,36 @@ private:
     // Video (the wall clock) is the master: measure how far the audio
     // device's actual playout position is from the clock and steer audio to
     // follow — a fraction-of-a-percent device-rate servo for small errors
-    // (inaudible), DiscardUntil for large audio-behind jumps. Skipped while
-    // the stream is dry (audio starved or ended past the audio track).
+    // (inaudible), DiscardUntil for large audio-behind jumps, and a hold
+    // brake (device paused until the clock catches up) for large audio-ahead
+    // drift when video delivery can't sustain the requested speed. Skipped
+    // while the stream is dry (audio starved or ended past the audio track).
     void SyncAudioToClock();
+    bool m_audioHold = false;  // runaway brake: device paused until the clock catches up
 
     // Drop queued audio packets whose content ends before cutoffSec (with
     // the same 25ms straddle margin used when capturing them). Pipeline must
     // be parked and the audio queue's interrupt cleared — the pop/re-push
     // cycle assumes no concurrent consumer.
     void FilterAudioQueueBefore(double cutoffSec);
+
+    // Recycling pool for converted-frame buffers (full-res 4 B/px, so worth
+    // reusing). A frame is free for reuse when the pool holds the only
+    // reference. Shared between ConvertThread (playing), the seek thread's
+    // cache maintenance, and the sync decode paths (parked), hence the mutex.
+    ConvertedFramePtr AcquirePooledFrame();
+    ConvertedFramePtr ConvertToPooledFrame(FrameConverter& conv, AVFrame* frame);
+    std::vector<ConvertedFramePtr> m_framePool;
+    std::mutex m_framePoolMutex;
+
+    // Staged-frame handoff: the sync decode/step paths (main or seek thread)
+    // stage one frame; TryGetVideoFrame (main thread) consumes it. The mutex
+    // makes the shared_ptr handoff safe across those threads.
+    bool StageFrame(ConvertedFramePtr frame, bool putInCache);
+    ConvertedFramePtr TakeStagedFrame();
+    void ClearStagedFrame();
+    ConvertedFramePtr m_stagedFrame;
+    std::mutex m_stagedFrameMutex;
 
     // Synchronously decode the next video frame from the current demuxer/decoder state.
     // No seek, no flush. Returns true if a frame was decoded and cached.
@@ -165,6 +184,25 @@ private:
     // snapping back to the current frame when B-frame reordering or keyframe
     // alignment causes the first decoded pts to already be >= the target.
     bool SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts);
+
+    // GOP-window frame cache. The cache holds one contiguous run spanning
+    // kCacheGopsBehind + kCacheGopsAhead full GOPs around the resting
+    // playhead. Every rest-point change (pause, seek landing, step) posts a
+    // maintenance request; the seek thread rebuilds/extends the window one
+    // GOP at a time toward the violated edge and trims the far side, so
+    // stepping rarely hits a synchronous decode.
+    static constexpr int kCacheGopsBehind = 1;
+    static constexpr int kCacheGopsAhead = 1;
+    static constexpr int kMaxCacheFrames = 256;  // hard memory safety cap
+    void PostCacheWindowRequest(int64_t centerPts);
+    // One increment of maintenance; returns true while more work may remain.
+    bool MaintainCacheWindow(int64_t centerPts, const std::function<bool()>& shouldAbort);
+    // PTS of the keyframe at/before `sec` (probes the cache demuxer without
+    // decoding). AV_NOPTS_VALUE on failure.
+    int64_t ProbeCacheKeyframeBefore(double sec);
+    std::atomic<int64_t> m_cacheWindowCenter{AV_NOPTS_VALUE};
+    int64_t m_cacheBofKf = AV_NOPTS_VALUE;  // window start is the file's first keyframe (seek thread only)
+    bool m_cacheEofSeen = false;            // window end reached EOF (seek thread only)
 
     // Tick the pipeline once: unpark, wait until at least one frame lands in
     // m_videoFrameQueue, then re-park. Used by StepFrame(+1) when the queue
@@ -182,6 +220,7 @@ private:
     std::mutex m_seekMutex;
     std::condition_variable m_seekCv;
     double m_seekRequest = -1.0;          // pending seek target, -1 = none
+    bool m_cacheRequest = false;          // cache-window maintenance pending
     std::atomic<bool> m_seekBusy{false};   // seek thread is working
     std::atomic<double> m_pendingSeekTarget{-1.0}; // for UI: immediate seek target display
     std::atomic<bool> m_seekDone{false};   // seek completed, main thread should check
@@ -196,6 +235,7 @@ private:
     uint32_t m_profMediaSectionId = 0;
     uint32_t m_profTransportSectionId = 0;
     const char* m_profTransportLabel = nullptr;
+    double m_profTransportSpeed = 0.0;  // speed baked into the current Playing label
 
     // When set (!= kNoAudioSkip), AudioDecodeThread discards/trims decoded
     // samples up to this media time before writing to the output — used when
@@ -212,6 +252,9 @@ private:
     VideoDecoder m_videoDecoder;
     AudioDecoder m_audioDecoder;
     AudioOutput m_audioOutput;
+    // Owned by ConvertThread while playing (frames convert off the main
+    // thread); the parked sync paths reuse it — same exclusivity rule as the
+    // decoder, guaranteed by ParkPipeline.
     FrameConverter m_frameConverter;
     Clock m_clock;
 
@@ -233,10 +276,12 @@ private:
 
     PacketQueue m_videoPacketQueue{64};
     PacketQueue m_audioPacketQueue{64};
+    DecodedFrameQueue m_decodedFrameQueue{4};
     FrameQueue m_videoFrameQueue{4};
 
     std::thread m_demuxThread;
     std::thread m_videoDecodeThread;
+    std::thread m_convertThread;
     std::thread m_audioDecodeThread;
 
     std::atomic<bool> m_playing{false};
@@ -276,14 +321,19 @@ private:
     // frames. Cleared the moment a resync runs.
     bool m_needsResync = false;
 
-    // Cached RGBA frame from synchronous decode (single frame, consumed on read)
-    const uint8_t* m_cachedFrame = nullptr;
-    int m_cachedWidth = 0;
-    int m_cachedHeight = 0;
-    bool m_hasCachedFrame = false;
+    // Currently displayed frame — keeps the buffer TryGetVideoFrame handed to
+    // the renderer alive until the next frame replaces it. Main thread only.
+    ConvertedFramePtr m_displayedFrame;
 
-    // Frame cache for instant backward stepping
-    FrameCache m_frameCache{128};
+    // ConvertThread skips frames whose content time is before this (they'd
+    // be dropped by TryGetVideoFrame's catch-up anyway). Updated
+    // by the main thread; kNeverDrop while paused/stepping so every frame
+    // converts.
+    static constexpr double kNeverDrop = -1.0e300;
+    std::atomic<double> m_dropFramesBeforeSec{kNeverDrop};
+
+    // Frame cache for instant stepping around the resting playhead
+    FrameCache m_frameCache;
 
     // When true, the clock is held paused until the first frame from decode
     // threads arrives at or after m_resumeTime. Prevents fast-forward on Play.

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ConvertedFrame.h"
 #include "util/FFmpegUtils.h"
 #include "util/Types.h"
 #include <cstdint>
@@ -23,6 +24,11 @@ public:
     // decode at draw time.
     const uint8_t* Convert(AVFrame* frame);
 
+    // Like Convert, but writes into a caller-owned ConvertedFrame (resized,
+    // width/height filled in; pts is the caller's business). Used by the
+    // playback pipeline to convert straight into pooled buffers.
+    bool ConvertInto(AVFrame* frame, ConvertedFrame& dst);
+
     int GetWidth() const { return m_width; }
     int GetHeight() const { return m_height; }
 
@@ -40,6 +46,8 @@ public:
 
 private:
     void EnsureContext(AVFrame* frame);
+    int OutputSize() const;                       // bytes for the current context
+    void ScaleInto(AVFrame* frame, uint8_t* dst); // shared sws_scale core
     void FreeBuffer();
 
     SwsContext* m_swsCtx = nullptr;

@@ -522,8 +522,10 @@ void App::Run() {
             OpenSubtitleFile(p);
         }
 
-        // Fetch frame before render (for async playback)
-        // and after render (for sync seeks triggered by UI during Render)
+        // Fetch + upload the next due video frame before Render samples the
+        // texture. Frames arriving later (e.g. a seek landing mid-Render)
+        // are picked up here on the next iteration — nothing displays after
+        // Render, so a post-Render fetch would buy no latency.
         auto fetchFrame = [&]() {
             PROFILE_SCOPE_N("FetchFrame");
             const uint8_t* rgba = nullptr;
@@ -597,11 +599,6 @@ void App::Run() {
         refreshTonemap();
 
         Render();
-
-        // Pick up frames from seeks triggered during Render (timeline/slider drags)
-        fetchFrame();
-        // Apply a tone-mapper change made via the View > HDR menu this frame.
-        refreshTonemap();
 
         PROFILE_FRAME();
     }
@@ -2602,9 +2599,9 @@ void App::Render() {
             if (!ImGui::IsItemActive() && ImGui::IsItemDeactivated() && m_isTimelineSeeking) {
                 m_player.SetScrubbing(false);
                 // SeekTo on release in both cases: when was-playing it
-                // resumes playback; when was-paused the SeekThread's
-                // REUSE fast-path runs PopulateCacheAroundCurrent (cache
-                // population is skipped during drag when scrubbing=true).
+                // resumes playback; when was-paused the SeekThread queues
+                // the cache-window build around the landing point (skipped
+                // during the drag while scrubbing=true).
                 m_player.SeekTo(m_seekTarget, m_wasPlayingBeforeTimelineSeek);
                 m_isTimelineSeeking = false;
             }

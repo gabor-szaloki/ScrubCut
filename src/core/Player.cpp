@@ -7,6 +7,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 static void SetCurrentThreadName(const wchar_t* name) {
     SetThreadDescription(GetCurrentThread(), name);
@@ -202,7 +205,7 @@ bool Player::Open(const std::string& path) {
     m_hasMedia = true;
     m_eof = false;
     m_lastDisplayedPts = AV_NOPTS_VALUE;
-    m_hasCachedFrame = false;
+    ClearStagedFrame();
     m_clock.SetTime(0.0);
     m_clock.SetPaused(true);
 
@@ -233,15 +236,25 @@ bool Player::Open(const std::string& path) {
 }
 
 // Switch the profiler's transport section (nullptr = none). Main thread only;
-// unchanged labels are skipped so repeated Pause calls don't split it.
+// unchanged states are skipped so repeated Pause calls don't split it. The
+// playback speed is part of the Playing label ("Playing 2x"), so a speed
+// change during playback starts a new section segment.
 void Player::SetTransportSection(const char* label) {
-    if (m_profTransportLabel && label && strcmp(m_profTransportLabel, label) == 0)
+    const bool playing = label && strcmp(label, "Playing") == 0;
+    const double speed = playing ? m_clock.GetSpeed() : 0.0;
+    if (m_profTransportLabel && label && strcmp(m_profTransportLabel, label) == 0 &&
+        speed == m_profTransportSpeed)
         return;
     m_profTransportLabel = label;
+    m_profTransportSpeed = speed;
     PROFILE_SECTION_LEAVE(m_profTransportSectionId);
-    m_profTransportSectionId = label
-        ? PROFILE_SECTION_ENTER(Profiler::kSectionTransport, "%s", label)
-        : 0;
+    if (!label) {
+        m_profTransportSectionId = 0;
+        return;
+    }
+    m_profTransportSectionId = (playing && speed != 1.0)
+        ? PROFILE_SECTION_ENTER(Profiler::kSectionTransport, "Playing %gx", speed)
+        : PROFILE_SECTION_ENTER(Profiler::kSectionTransport, "%s", label);
 }
 
 void Player::Close() {
@@ -267,6 +280,7 @@ void Player::Close() {
 
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
+    m_decodedFrameQueue.Flush();
     m_videoFrameQueue.Flush();
 
     SetTransportSection(nullptr);
@@ -281,7 +295,18 @@ void Player::Close() {
     m_playing = false;
     m_eof = false;
     m_lastDisplayedPts = AV_NOPTS_VALUE;
-    m_hasCachedFrame = false;
+    ClearStagedFrame();
+    m_displayedFrame.reset();
+    m_dropFramesBeforeSec.store(kNeverDrop, std::memory_order_relaxed);
+    m_cacheWindowCenter.store(AV_NOPTS_VALUE, std::memory_order_relaxed);
+    m_cacheRequest = false;  // seek thread already joined above
+    m_cacheBofKf = AV_NOPTS_VALUE;
+    m_cacheEofSeen = false;
+    m_audioHold = false;
+    {
+        std::lock_guard<std::mutex> lock(m_framePoolMutex);
+        m_framePool.clear();
+    }
     m_chapters.clear();
     m_audioTracks.clear();
     m_subtitleTracks.clear();
@@ -312,7 +337,7 @@ void Player::Play() {
     m_eof = false;
 
     double resumeTime = m_clock.GetTime();
-    m_hasCachedFrame = false;
+    ClearStagedFrame();
 
     // If the last operation left the decoder out of sync with what's
     // displayed (backward-step cache hit), re-seek now so the threads
@@ -359,6 +384,11 @@ void Player::Play() {
     m_clock.SetTime(resumeTime);
     m_waitingForResumeFrame = true;
     m_resumeTime = resumeTime;
+    // Frames before the resume point get dropped on arrival — let the
+    // convert stage skip them (mirrors the resume gate in TryGetVideoFrame,
+    // which keeps frames >= resumeTime - frameDur).
+    m_dropFramesBeforeSec.store(resumeTime - GetFrameDuration(), std::memory_order_relaxed);
+    m_audioHold = false;
     m_playing = true;
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
@@ -371,9 +401,11 @@ void Player::Play() {
     SetTransportSection("Playing");
 }
 
-void Player::Pause() {
+void Player::Pause(bool populateCache) {
     PROFILE_SCOPE();
     m_playing = false;
+    m_dropFramesBeforeSec.store(kNeverDrop, std::memory_order_relaxed);
+    m_audioHold = false;      // device gets paused below anyway
     m_wantsToPlay = false;
     m_waitingForResumeFrame = false;
     m_clock.SetPaused(true);
@@ -384,7 +416,18 @@ void Player::Pause() {
     // DemuxThread (if any) survives via the pipeline-flush-gen check.
     ParkPipeline();
 
+    // Freeze exactly on the frame being shown. The playhead already tracks
+    // delivered frames during playback (TryGetVideoFrame clamps the clock),
+    // so this is at most a sub-frame alignment.
+    if (m_hasMedia && m_lastDisplayedPts != AV_NOPTS_VALUE)
+        m_clock.SetTime(static_cast<double>(m_lastDisplayedPts) *
+                        av_q2d(m_demuxer.GetVideoTimeBase()));
+
     SetTransportSection("Paused");
+
+    // Build the step cache window around the pause point on the seek thread.
+    if (populateCache)
+        PostCacheWindowRequest(m_lastDisplayedPts);
 }
 
 void Player::TogglePlayPause() {
@@ -408,6 +451,7 @@ void Player::SeekTo(double seconds, bool resumeAfter) {
     // Signal that we want to stop playing (the seek thread handles
     // actually stopping/starting threads to avoid races).
     m_playing = false;
+    m_dropFramesBeforeSec.store(kNeverDrop, std::memory_order_relaxed);
     m_waitingForResumeFrame = false;
     m_clock.SetPaused(true);
     if (m_hasAudio) m_audioOutput.Pause();
@@ -431,18 +475,45 @@ void Player::SeekThread() {
     PROFILE_THREAD("Player Seek");
 
     while (!m_stopSeekThread) {
-        double target;
+        double target = 0.0;
+        bool populateOnly = false;
         {
             std::unique_lock<std::mutex> lock(m_seekMutex);
             m_seekCv.wait(lock, [&] {
-                return m_seekRequest >= 0.0 || m_stopSeekThread;
+                return m_seekRequest >= 0.0 || m_cacheRequest || m_stopSeekThread;
             });
             if (m_stopSeekThread) break;
-            target = m_seekRequest;
-            m_seekRequest = -1.0;
+            if (m_seekRequest >= 0.0) {
+                // Mark busy before consuming the request, still under the
+                // lock — WaitForSeek checks m_seekRequest and m_seekBusy
+                // under the same lock, so it never observes a gap.
+                m_seekBusy = true;
+                target = m_seekRequest;
+                m_seekRequest = -1.0;
+            } else {
+                populateOnly = true;
+            }
+            m_cacheRequest = false;  // a seek's own flow reposts anyway
         }
 
-        m_seekBusy = true;
+        if (populateOnly) {
+            // Cache-window maintenance. Deliberately does NOT set m_seekBusy:
+            // stepping must not block on it (the cache is mutexed, and this
+            // only touches the dedicated cache demuxer/decoder). A new center
+            // posted mid-run just continues the loop; supersession aborts.
+            auto abort = [this] {
+                if (m_stopSeekThread.load(std::memory_order_relaxed)) return true;
+                if (m_playing.load(std::memory_order_relaxed)) return true;
+                std::lock_guard<std::mutex> lock(m_seekMutex);
+                return m_seekRequest >= 0.0;
+            };
+            while (!abort() &&
+                   MaintainCacheWindow(m_cacheWindowCenter.load(std::memory_order_relaxed),
+                                       abort)) {
+            }
+            continue;
+        }
+
         PROFILE_SCOPE_N("Player::SeekOp");
         Profiler::ScopedSection seekSection(Profiler::kSectionTransport, "Seeking");
 
@@ -500,17 +571,10 @@ void Player::SeekThread() {
 
         bool shouldResume = m_wantsToPlay.load(std::memory_order_relaxed);
 
-        // Populate cache for backward stepping (skip during scrubbing).
-        // Abort early if a fresh seek arrives — the displayable frame is
-        // already set inside SyncSeekAndDecode, so the next seek can run
-        // immediately rather than waiting out a stale cache build.
-        if (!shouldResume && !scrubbing) {
-            PopulateCacheAroundCurrent([this] {
-                if (m_stopSeekThread.load(std::memory_order_relaxed)) return true;
-                std::lock_guard<std::mutex> lock(m_seekMutex);
-                return m_seekRequest >= 0.0;
-            });
-        }
+        // Queue cache-window maintenance for stepping around the landing
+        // point (skip during scrubbing — every drag move would repost it).
+        if (!shouldResume && !scrubbing)
+            PostCacheWindowRequest(m_lastDisplayedPts);
 
         // Pipeline stays parked. PollSeekComplete on main thread will call
         // Play() if shouldResume — Play unparks. Otherwise we stay paused.
@@ -523,10 +587,12 @@ void Player::SeekThread() {
 void Player::PollSeekComplete() {
     SyncAudioToClock();
 
-    // Pause at end of video
+    // Pause at end of video. Set the clock AFTER Pause — its snap-to-
+    // displayed-frame would otherwise undo the at-end position that makes
+    // the next Play() restart from the beginning.
     if (m_playing && m_eof && m_clock.GetTime() >= m_demuxer.GetDuration()) {
-        m_clock.SetTime(m_demuxer.GetDuration());
         Pause();
+        m_clock.SetTime(m_demuxer.GetDuration());
     }
 
     if (!m_seekDone.load(std::memory_order_acquire)) return;
@@ -547,6 +613,24 @@ void Player::SyncAudioToClock() {
     double clockSec = m_clock.GetTime();
     double err = m_audioOutput.GetPlaybackPosition() - clockSec;
     double baseSpeed = m_clock.GetSpeed();
+
+    // Runaway brake: when video delivery can't sustain the requested speed,
+    // the clamped clock falls behind the audio position without bound. Hold
+    // the device until the clock catches up, then resume. At delivery-limited
+    // speeds audio plays in bursts of up to the cap; at sustainable speeds
+    // the brake never engages — the threshold sits well above the constant
+    // ~300ms read-ahead offset of the queue-derived position measurement.
+    if (m_audioHold) {
+        if (err > 0.020) return;  // still catching up
+        m_audioHold = false;
+        m_audioOutput.Resume();
+        return;
+    }
+    if (err > 0.75) {
+        m_audioHold = true;
+        m_audioOutput.Pause();
+        return;
+    }
 
     if (err < -0.25) {
         // Audio fell far behind the video clock (e.g. after a long decode
@@ -609,101 +693,93 @@ void Player::StepFrame(int direction) {
     m_pendingSeekTarget.store(-1.0, std::memory_order_relaxed);
 
     bool wasPlaying = m_playing.load(std::memory_order_relaxed);
-    if (wasPlaying) Pause();
+    if (wasPlaying) Pause(/*populateCache=*/false);  // stepping manages the cache itself
     // Pipeline is now parked (Pause does that, or it was already parked).
 
     if (direction > 0) {
+        AVRational tb = m_demuxer.GetVideoTimeBase();
+        int64_t frameTicks = static_cast<int64_t>(GetFrameDuration() / av_q2d(tb));
+        int64_t halfFrame = frameTicks / 2;
+
         // Forward: check if next frame is already in cache.
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
-            AVRational tb = m_demuxer.GetVideoTimeBase();
-            double frameDurSec = GetFrameDuration();
-            int64_t nextPts = m_lastDisplayedPts + static_cast<int64_t>(frameDurSec / av_q2d(tb));
-            const auto* cached = m_frameCache.FindNearest(nextPts);
-            int64_t halfFrame = static_cast<int64_t>(frameDurSec / 2.0 / av_q2d(tb));
+            int64_t nextPts = m_lastDisplayedPts + frameTicks;
+            ConvertedFramePtr cached = m_frameCache.FindNearest(nextPts);
             if (cached && cached->pts > m_lastDisplayedPts &&
                 std::abs(cached->pts - nextPts) <= halfFrame) {
                 double frameSec = static_cast<double>(cached->pts) * av_q2d(tb);
                 m_clock.SetTime(frameSec);
                 m_lastDisplayedPts = cached->pts;
-                m_cachedFrame = cached->rgba.data();
-                m_cachedWidth = cached->width;
-                m_cachedHeight = cached->height;
-                m_hasCachedFrame = true;
+                StageFrame(std::move(cached), /*putInCache=*/false);
+                PostCacheWindowRequest(m_lastDisplayedPts);
                 return;
             }
         }
 
-        // If a prior backward-step cache hit deferred the decoder reseek,
-        // do it now — we're about to produce the next frame from the
-        // decoder pipeline and need it aligned with m_lastDisplayedPts.
-        if (m_needsResync) {
+        // The prefetched queue is only usable when its head is the immediate
+        // next frame. During playback the convert stage may skip late frames,
+        // so after a pause the queue (and the decoder behind it) can sit
+        // ahead of the displayed frame — a gapped or stale head needs the
+        // same decoder resync as a deferred backward-step cache hit.
+        auto queueHeadGapped = [&]() -> bool {
+            if (m_lastDisplayedPts == AV_NOPTS_VALUE) return false;
+            int64_t headPts = m_videoFrameQueue.PeekPts();
+            if (headPts == AV_NOPTS_VALUE) return false;
+            return headPts <= m_lastDisplayedPts ||
+                   headPts > m_lastDisplayedPts + frameTicks + halfFrame;
+        };
+        // Re-align the decoder with the displayed frame. SyncSeekAndDecode
+        // stages the current frame; we want the NEXT one — clear it and let
+        // the tick path below produce it.
+        auto resyncToDisplayed = [&]() {
             FlushPipelineState();
-            AVRational tb = m_demuxer.GetVideoTimeBase();
-            double seekSec = (m_lastDisplayedPts + 0.5) * av_q2d(tb);
-            SyncSeekAndDecode(seekSec);
+            SyncSeekAndDecode((m_lastDisplayedPts + 0.5) * av_q2d(tb));
             m_needsResync = false;
-            // SyncSeekAndDecode already populated m_cachedFrame for the
-            // current pts; we want the NEXT frame instead. Fall through to
-            // the tick path below to produce one.
-            m_hasCachedFrame = false;
-        }
+            ClearStagedFrame();
+        };
 
-        // Try the prefetched FrameQueue (filled by VideoDecodeThread before
-        // pause). If a frame is sitting there, it's already display-ordered
-        // immediately after m_lastDisplayedPts — use it.
-        AVFrame* frame = av_frame_alloc();
-        if (m_videoFrameQueue.TryPop(frame)) {
-            AVRational tb = m_demuxer.GetVideoTimeBase();
-            double frameSec = static_cast<double>(frame->pts) * av_q2d(tb);
-            m_clock.SetTime(frameSec);
-            m_lastDisplayedPts = frame->pts;
-            m_cachedFrame = m_frameConverter.Convert(frame);
-            m_cachedWidth = m_frameConverter.GetWidth();
-            m_cachedHeight = m_frameConverter.GetHeight();
-            m_hasCachedFrame = (m_cachedFrame != nullptr);
-            if (m_hasCachedFrame)
-                m_frameCache.Put(frame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
-            av_frame_free(&frame);
-            return;
-        }
-        av_frame_free(&frame);
+        if (m_needsResync || queueHeadGapped())
+            resyncToDisplayed();
 
-        // Frame queue empty. Tick the pipeline once: unpark briefly so
-        // VideoDecodeThread can produce one or more frames, then re-park.
-        // This handles both "queue exhausted but decoder pipeline buffered"
-        // and "needs new packets" cases without us touching demuxer/decoder
-        // directly — the worker threads own that.
-        if (TickPipelineOneFrame(500)) {
-            AVFrame* tickFrame = av_frame_alloc();
-            if (m_videoFrameQueue.TryPop(tickFrame)) {
-                AVRational tb = m_demuxer.GetVideoTimeBase();
-                double frameSec = static_cast<double>(tickFrame->pts) * av_q2d(tb);
-                m_clock.SetTime(frameSec);
-                m_lastDisplayedPts = tickFrame->pts;
-                m_cachedFrame = m_frameConverter.Convert(tickFrame);
-                m_cachedWidth = m_frameConverter.GetWidth();
-                m_cachedHeight = m_frameConverter.GetHeight();
-                m_hasCachedFrame = (m_cachedFrame != nullptr);
-                if (m_hasCachedFrame)
-                    m_frameCache.Put(tickFrame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
-            }
-            av_frame_free(&tickFrame);
+        auto stageFromQueue = [&]() -> bool {
+            ConvertedFramePtr f = m_videoFrameQueue.TryPop();
+            if (!f) return false;
+            m_clock.SetTime(static_cast<double>(f->pts) * av_q2d(tb));
+            m_lastDisplayedPts = f->pts;
+            StageFrame(std::move(f), /*putInCache=*/true);
+            PostCacheWindowRequest(m_lastDisplayedPts);
+            return true;
+        };
+        if (stageFromQueue()) return;
+
+        // Frame queue empty. Tick the pipeline once: unpark briefly so the
+        // workers can produce the next frame, then re-park. If what arrives
+        // is gapped (the decoder was ahead and the queue happened to be
+        // drained), resync and tick once more.
+        if (TickPipelineOneFrame(500) && queueHeadGapped()) {
+            resyncToDisplayed();
+            TickPipelineOneFrame(500);
         }
+        stageFromQueue();
     } else {
-        // Backward: check frame cache first (instant).
+        // Backward: check frame cache first (instant). Accept only the
+        // immediate previous frame — FindBefore returns the nearest earlier
+        // cached entry, which can be a stale frame from a much older
+        // position (e.g. a previous seek landing) once the contiguous run
+        // around the rest point is exhausted; that must fall through to the
+        // decode path below instead of teleporting.
         bool cacheHit = false;
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
-            const auto* cached = m_frameCache.FindBefore(m_lastDisplayedPts);
-            if (cached) {
+            AVRational tb = m_demuxer.GetVideoTimeBase();
+            int64_t frameTicks = static_cast<int64_t>(GetFrameDuration() / av_q2d(tb));
+            ConvertedFramePtr cached = m_frameCache.FindBefore(m_lastDisplayedPts);
+            if (cached &&
+                std::abs(cached->pts - (m_lastDisplayedPts - frameTicks)) <= frameTicks / 2) {
                 PROFILE_MARK("StepBack cache hit");
-                AVRational tb = m_demuxer.GetVideoTimeBase();
                 double frameSec = static_cast<double>(cached->pts) * av_q2d(tb);
                 m_clock.SetTime(frameSec);
                 m_lastDisplayedPts = cached->pts;
-                m_cachedFrame = cached->rgba.data();
-                m_cachedWidth = cached->width;
-                m_cachedHeight = cached->height;
-                m_hasCachedFrame = true;
+                StageFrame(std::move(cached), /*putInCache=*/false);
                 cacheHit = true;
             }
         }
@@ -717,6 +793,7 @@ void Player::StepFrame(int direction) {
             // would cost a full GOP catchup decode (hundreds of ms on a
             // 4-second GOP), defeating the cache entirely.
             m_needsResync = true;
+            PostCacheWindowRequest(m_lastDisplayedPts);
             return;
         }
 
@@ -737,13 +814,57 @@ void Player::StepFrame(int direction) {
         // operation, same as the cache-hit path above; without this the
         // next StepFrame(+1) pops a frame ~reorder-depth ahead.
         m_needsResync = true;
-        PopulateCacheAroundCurrent();
+        PostCacheWindowRequest(m_lastDisplayedPts);
     }
 }
 
 double Player::GetFrameDuration() const {
     double fps = m_demuxer.GetVideoFrameRate();
     return (fps > 0) ? 1.0 / fps : 1.0 / 30.0;
+}
+
+ConvertedFramePtr Player::AcquirePooledFrame() {
+    std::lock_guard<std::mutex> lock(m_framePoolMutex);
+    for (auto& f : m_framePool) {
+        if (f.use_count() == 1) {  // only the pool holds it — free to reuse
+            // Order the previous owner's final reads before our writes into
+            // the recycled buffer (pairs with shared_ptr's release decrement).
+            std::atomic_thread_fence(std::memory_order_acquire);
+            return f;
+        }
+    }
+    m_framePool.push_back(std::make_shared<ConvertedFrame>());
+    return m_framePool.back();
+}
+
+ConvertedFramePtr Player::ConvertToPooledFrame(FrameConverter& conv, AVFrame* frame) {
+    ConvertedFramePtr cf = AcquirePooledFrame();
+    if (!conv.ConvertInto(frame, *cf))
+        return nullptr;
+    cf->pts = frame->pts;
+    cf->keyframe = (frame->flags & AV_FRAME_FLAG_KEY) != 0;
+    return cf;
+}
+
+// Stage `frame` as the next frame TryGetVideoFrame hands to the renderer,
+// optionally inserting it into the backward-step cache (cache hits must not
+// re-Put). Returns false when `frame` is null (e.g. conversion failed).
+bool Player::StageFrame(ConvertedFramePtr frame, bool putInCache) {
+    if (!frame) return false;
+    if (putInCache) m_frameCache.Put(frame);
+    std::lock_guard<std::mutex> lock(m_stagedFrameMutex);
+    m_stagedFrame = std::move(frame);
+    return true;
+}
+
+ConvertedFramePtr Player::TakeStagedFrame() {
+    std::lock_guard<std::mutex> lock(m_stagedFrameMutex);
+    return std::move(m_stagedFrame);
+}
+
+void Player::ClearStagedFrame() {
+    std::lock_guard<std::mutex> lock(m_stagedFrameMutex);
+    m_stagedFrame.reset();
 }
 
 const char* Player::GetVideoCodecName() const {
@@ -769,6 +890,9 @@ void Player::SetSpeed(double speed) {
     if (m_hasAudio) {
         m_audioOutput.SetSpeed(static_cast<float>(speed));
     }
+    // Re-label the transport section so the change shows up in traces.
+    if (m_profTransportLabel)
+        SetTransportSection(m_profTransportLabel);
 }
 
 // Map linear slider position (m_volume, 0..1) to perceptual gain via a
@@ -811,8 +935,9 @@ void Player::SetAudioTrack(int streamIndex) {
 
     // Pause() parks the pipeline (workers halt at top-of-loop, queues
     // interrupted) and pauses the audio output — the safe point to swap the
-    // audio decoder/output without racing the decode threads.
-    Pause();
+    // audio decoder/output without racing the decode threads. No cache fill:
+    // the SeekTo below repopulates as part of the seek flow.
+    Pause(/*populateCache=*/false);
 
     m_demuxer.SetAudioStreamIndex(streamIndex);
     m_audioDecoder.Close();
@@ -889,13 +1014,7 @@ bool Player::SyncDecodeNextFrame() {
         m_clock.SetTime(frameSec);
         m_lastDisplayedPts = frame->pts;
 
-        m_cachedFrame = m_frameConverter.Convert(frame);
-        m_cachedWidth = m_frameConverter.GetWidth();
-        m_cachedHeight = m_frameConverter.GetHeight();
-        m_hasCachedFrame = (m_cachedFrame != nullptr);
-
-        if (m_hasCachedFrame)
-            m_frameCache.Put(frame->pts, m_cachedFrame, m_cachedWidth, m_cachedHeight);
+        StageFrame(ConvertToPooledFrame(m_frameConverter, frame), /*putInCache=*/true);
     }
 
     av_frame_free(&frame);
@@ -913,6 +1032,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     // Flush queues and frame cache (stale frames from previous position)
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
+    m_decodedFrameQueue.Flush();
     m_videoFrameQueue.Flush();
     m_frameCache.Clear();
 
@@ -1055,19 +1175,11 @@ done:
         }
 
         // Only convert the final target frame to RGBA (skip intermediates for speed)
-        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
-        if (rgba) {
-            m_frameCache.Put(bestFrame->pts, rgba,
-                             m_frameConverter.GetWidth(),
-                             m_frameConverter.GetHeight());
-            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
-            m_cachedWidth = m_frameConverter.GetWidth();
-            m_cachedHeight = m_frameConverter.GetHeight();
-            m_hasCachedFrame = true;
-        }
+        bool staged = StageFrame(ConvertToPooledFrame(m_frameConverter, bestFrame),
+                                 /*putInCache=*/true);
 
         av_frame_free(&bestFrame);
-        return m_hasCachedFrame;
+        return staged;
     }
 
     m_clock.SetTime(targetSec);
@@ -1078,13 +1190,14 @@ done:
 bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     PROFILE_SCOPE();
 
-    // Flush state (same as SyncSeekAndDecode — we're repositioning).
+    // Flush state (same as SyncSeekAndDecode — we're repositioning). The
+    // frame cache is left alone: the decoded predecessors are ADDED to it.
     m_videoDecoder.Flush();
     if (m_hasAudio) m_audioDecoder.Flush();
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
+    m_decodedFrameQueue.Flush();
     m_videoFrameQueue.Flush();
-    m_frameCache.Clear();
     if (m_hasAudio) {
         m_audioOutput.Flush();
         m_audioOutput.ResetPosition(seekSec);
@@ -1093,13 +1206,13 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
 
     int attempt = 0;
     double trySec = seekSec;
-    AVFrame* bestFrame = nullptr;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     // Keep decoding a few frames past the first frame with pts >= maxPts so
     // that any B-frames with pts < maxPts that emit after (decode order !=
     // display order) are still captured.
     const int kReorderDepth = 8;
+    bool gotAny = false;
 
     while (attempt < 4) {
         m_videoDecoder.Flush();
@@ -1129,23 +1242,20 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
                 if (ret < 0) break;
 
                 if (frame->pts < maxPts) {
-                    if (!bestFrame) {
-                        bestFrame = av_frame_alloc();
-                        av_frame_move_ref(bestFrame, frame);
-                    } else if (frame->pts > bestFrame->pts) {
-                        av_frame_unref(bestFrame);
-                        av_frame_move_ref(bestFrame, frame);
-                    } else {
-                        av_frame_unref(frame);
+                    // Cache every predecessor we had to decode anyway —
+                    // subsequent back-steps hit these instead of re-seeking.
+                    if (ConvertedFramePtr cf = ConvertToPooledFrame(m_frameConverter, frame)) {
+                        m_frameCache.Put(std::move(cf));
+                        gotAny = true;
                     }
                 } else {
                     framesAtOrAfterMax++;
-                    av_frame_unref(frame);
                 }
+                av_frame_unref(frame);
             }
         }
 
-        if (bestFrame) break;
+        if (gotAny) break;
 
         // No frame with pts < maxPts found at this seek point — seek further
         // back and retry. Happens near the head of a GOP when the keyframe
@@ -1158,102 +1268,171 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
     av_packet_free(&pkt);
     av_frame_free(&frame);
 
-    if (bestFrame) {
-        AVRational tb = m_demuxer.GetVideoTimeBase();
-        double frameSec = static_cast<double>(bestFrame->pts) * av_q2d(tb);
-        m_clock.SetTime(frameSec);
-        m_lastDisplayedPts = bestFrame->pts;
+    if (!gotAny)
+        return false;
 
-        const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
-        if (rgba) {
-            m_frameCache.Put(bestFrame->pts, rgba,
-                             m_frameConverter.GetWidth(),
-                             m_frameConverter.GetHeight());
-            m_cachedFrame = m_frameCache.FindExact(bestFrame->pts)->rgba.data();
-            m_cachedWidth = m_frameConverter.GetWidth();
-            m_cachedHeight = m_frameConverter.GetHeight();
-            m_hasCachedFrame = true;
-        }
-        av_frame_free(&bestFrame);
-        return m_hasCachedFrame;
-    }
-
-    return false;
+    ConvertedFramePtr best = m_frameCache.FindBefore(maxPts);
+    if (!best)
+        return false;
+    m_clock.SetTime(static_cast<double>(best->pts) * av_q2d(m_demuxer.GetVideoTimeBase()));
+    m_lastDisplayedPts = best->pts;
+    StageFrame(std::move(best), /*putInCache=*/false);
+    return true;
 }
 
-void Player::PopulateCacheAroundCurrent(std::function<bool()> shouldAbort) {
-    PROFILE_SCOPE();
-    if (!m_hasMedia) return;
-    if (m_playing) return; // only when paused
-    // Cache decoder failed to open — skip cache population.
-    if (m_cacheDemuxer.GetVideoStreamIndex() < 0) return;
+void Player::PostCacheWindowRequest(int64_t centerPts) {
+    if (!m_hasMedia || centerPts == AV_NOPTS_VALUE || !m_seekThreadRunning) return;
+    m_cacheWindowCenter.store(centerPts, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(m_seekMutex);
+        m_cacheRequest = true;
+    }
+    m_seekCv.notify_one();
+}
 
-    double currentSec = m_clock.GetTime();
-    int64_t currentPts = m_lastDisplayedPts;
-
-    // Use the dedicated cache demuxer + decoder so we don't touch the
-    // main pipeline. The main decoder stays warm at lastDisplayedPts and
-    // Play() can resume without a re-seek + GOP catchup.
-    m_cacheDecoder.Flush();
-    m_cacheDemuxer.Seek(currentSec);
-
+int64_t Player::ProbeCacheKeyframeBefore(double sec) {
+    if (!m_cacheDemuxer.Seek(std::max(0.0, sec)))
+        return AV_NOPTS_VALUE;
     AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    int maxPackets = 500;
-    bool eofHit = false;
+    int64_t kf = AV_NOPTS_VALUE;
+    for (int i = 0; i < 256; ++i) {
+        if (m_cacheDemuxer.ReadPacket(pkt) < 0) break;
+        bool video = pkt->stream_index == m_cacheDemuxer.GetVideoStreamIndex();
+        int64_t pts = pkt->pts;
+        av_packet_unref(pkt);
+        if (video) { kf = pts; break; }  // first video packet after a seek is the keyframe
+    }
+    av_packet_free(&pkt);
+    return kf;
+}
 
-    auto cacheFrame = [&](AVFrame* f) -> bool {
-        if (f->pts > currentPts) return false;  // past current — stop
-        if (!m_frameCache.FindExact(f->pts)) {
-            const uint8_t* rgba = m_cacheConverter.Convert(f);
-            if (rgba) {
-                m_frameCache.Put(f->pts, rgba,
-                                 m_cacheConverter.GetWidth(),
-                                 m_cacheConverter.GetHeight());
+bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>& shouldAbort) {
+    PROFILE_SCOPE();
+    if (!m_hasMedia || centerPts == AV_NOPTS_VALUE) return false;
+    // Cache decoder failed to open — no window, stepping uses the sync paths.
+    if (m_cacheDemuxer.GetVideoStreamIndex() < 0) return false;
+
+    const double tbSec = av_q2d(m_cacheDemuxer.GetVideoTimeBase());
+    const double eps = GetFrameDuration() * 0.5;
+
+    // Decode forward from `seekSec` on the dedicated cache pipeline (the main
+    // decoder stays warm for Play), caching frames in [cacheMinPts,
+    // cacheMaxPtsExcl). Stops when `kfLimit` keyframes strictly past
+    // `pastPts` are reached (the limit-th one is not cached), at
+    // cacheMaxPtsExcl, at EOF, on abort, or at the frame-count safety cap.
+    auto decodeChunk = [&](double seekSec, int64_t cacheMinPts, int64_t cacheMaxPtsExcl,
+                           int64_t pastPts, int kfLimit) {
+        PROFILE_SCOPE_N("CacheWindowChunk");
+        m_cacheDecoder.Flush();
+        if (!m_cacheDemuxer.Seek(std::max(0.0, seekSec))) return;
+
+        AVPacket* pkt = av_packet_alloc();
+        AVFrame* frame = av_frame_alloc();
+        int kfsPast = 0;
+        bool stop = false, eofHit = false;
+        int maxPackets = 2000;
+
+        auto handleFrame = [&](AVFrame* f) -> bool {
+            if (f->pts != AV_NOPTS_VALUE) {
+                if (f->pts >= cacheMaxPtsExcl) return false;
+                if ((f->flags & AV_FRAME_FLAG_KEY) && f->pts > pastPts &&
+                    ++kfsPast >= kfLimit)
+                    return false;
+                if (f->pts >= cacheMinPts) {
+                    if (ConvertedFramePtr cf = ConvertToPooledFrame(m_cacheConverter, f))
+                        m_frameCache.Put(std::move(cf));
+                }
+            }
+            return m_frameCache.Count() < kMaxCacheFrames;
+        };
+
+        while (!stop && maxPackets-- > 0) {
+            if (shouldAbort && shouldAbort()) break;
+            int ret = m_cacheDemuxer.ReadPacket(pkt);
+            if (ret == AVERROR_EOF) { eofHit = true; break; }
+            if (ret < 0) break;
+            if (pkt->stream_index != m_cacheDemuxer.GetVideoStreamIndex()) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            m_cacheDecoder.SendPacket(pkt);
+            av_packet_unref(pkt);
+            while (true) {
+                ret = m_cacheDecoder.ReceiveFrame(frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+                if (ret < 0) break;
+                bool keepGoing = handleFrame(frame);
+                av_frame_unref(frame);
+                if (!keepGoing) { stop = true; break; }
             }
         }
-        return true;
+        if (eofHit) {
+            m_cacheEofSeen = true;
+            m_cacheDecoder.DrainAtEOF(frame, handleFrame);
+        }
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
     };
 
-    while (maxPackets-- > 0) {
-        if (shouldAbort && shouldAbort()) {
-            PROFILE_MARK("PopulateCache aborted");
-            goto cacheDone;
+    // Rebuild from scratch when the window doesn't contain the playhead.
+    int64_t startPts = m_frameCache.StartPts();
+    if (startPts == AV_NOPTS_VALUE || centerPts < startPts ||
+        centerPts > m_frameCache.EndPts()) {
+        m_frameCache.Clear();
+        m_cacheBofKf = AV_NOPTS_VALUE;
+        m_cacheEofSeen = false;
+
+        // Walk back kCacheGopsBehind keyframes from the playhead's GOP.
+        double t = static_cast<double>(centerPts) * tbSec;
+        int64_t kf = AV_NOPTS_VALUE;
+        for (int i = 0; i <= kCacheGopsBehind; ++i) {
+            int64_t k = ProbeCacheKeyframeBefore(t);
+            if (k == AV_NOPTS_VALUE) break;
+            if (kf != AV_NOPTS_VALUE && k >= kf) { m_cacheBofKf = kf; break; }
+            kf = k;
+            t = static_cast<double>(k) * tbSec - eps;
         }
-        int ret = m_cacheDemuxer.ReadPacket(pkt);
-        if (ret == AVERROR_EOF) { eofHit = true; break; }
-        if (ret < 0) break;
-
-        if (pkt->stream_index != m_cacheDemuxer.GetVideoStreamIndex()) {
-            av_packet_unref(pkt);
-            continue;
-        }
-
-        m_cacheDecoder.SendPacket(pkt);
-        av_packet_unref(pkt);
-
-        while (true) {
-            ret = m_cacheDecoder.ReceiveFrame(frame);
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-            if (ret < 0) break;
-
-            bool keepGoing = cacheFrame(frame);
-            av_frame_unref(frame);
-            if (!keepGoing) goto cacheDone;
-        }
+        if (kf == AV_NOPTS_VALUE) return false;
+        decodeChunk(static_cast<double>(kf) * tbSec, INT64_MIN, INT64_MAX,
+                    centerPts, kCacheGopsAhead + 1);
+        return true;  // re-evaluate the policy on the next iteration
     }
 
-    // Flush the trailing frames the cache decoder pipeline has been
-    // buffering into the cache too — otherwise frame-step-backward from
-    // the last frame jumps over them.
-    if (eofHit) {
-        m_cacheDecoder.DrainAtEOF(frame, cacheFrame);
+    // Trim to the target window around the playhead's GOP.
+    std::vector<int64_t> kfs = m_frameCache.KeyframePts();
+    int g = -1;  // index of the playhead's GOP
+    for (size_t i = 0; i < kfs.size(); ++i)
+        if (kfs[i] <= centerPts) g = static_cast<int>(i);
+    if (g < 0) {
+        // Window no longer starts at a keyframe covering the center — rebuild.
+        m_frameCache.Clear();
+        return true;
     }
+    m_frameCache.DiscardBefore(kfs[std::max(0, g - kCacheGopsBehind)]);
+    if (g + kCacheGopsAhead + 1 < static_cast<int>(kfs.size()))
+        m_frameCache.DiscardAfter(kfs[g + kCacheGopsAhead + 1] - 1);
 
-cacheDone:
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-    // Main decoder is untouched.
+    if (m_frameCache.Count() >= kMaxCacheFrames) return false;
+
+    // Grow one GOP toward whichever edge violates the policy.
+    startPts = m_frameCache.StartPts();
+    if (g < kCacheGopsBehind && m_cacheBofKf != startPts) {
+        int64_t prevKf = ProbeCacheKeyframeBefore(static_cast<double>(startPts) * tbSec - eps);
+        if (prevKf == AV_NOPTS_VALUE || prevKf >= startPts) {
+            m_cacheBofKf = startPts;  // the file starts here — nothing earlier
+        } else {
+            decodeChunk(static_cast<double>(prevKf) * tbSec, INT64_MIN, startPts,
+                        centerPts, 1 << 30);
+            return true;
+        }
+    }
+    if (static_cast<int>(kfs.size()) - 1 - g < kCacheGopsAhead && !m_cacheEofSeen) {
+        int64_t endPts = m_frameCache.EndPts();
+        decodeChunk(static_cast<double>(endPts) * tbSec, endPts + 1, INT64_MAX,
+                    endPts, 2);
+        return true;
+    }
+    return false;  // window satisfies the policy
 }
 
 // --- TryGetVideoFrame (used during playback) ---
@@ -1262,12 +1441,12 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
     if (!m_hasMedia) return false;
     PROFILE_SCOPE();
 
-    // Return cached frame from synchronous decode
-    if (m_hasCachedFrame) {
-        *outRGBA = m_cachedFrame;
-        *outWidth = m_cachedWidth;
-        *outHeight = m_cachedHeight;
-        m_hasCachedFrame = false;
+    // Return the frame staged by a synchronous decode (seek/step)
+    if (ConvertedFramePtr staged = TakeStagedFrame()) {
+        m_displayedFrame = std::move(staged);
+        *outRGBA = m_displayedFrame->data();
+        *outWidth = m_displayedFrame->width;
+        *outHeight = m_displayedFrame->height;
         return true;
     }
 
@@ -1281,11 +1460,9 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 
     // If waiting for resume frame, silently drop frames before resume time
     if (m_waitingForResumeFrame) {
-        AVFrame* frame = av_frame_alloc();
         while (true) {
             int64_t pts = m_videoFrameQueue.PeekPts();
             if (pts == AV_NOPTS_VALUE) {
-                av_frame_free(&frame);
                 return false; // no frames yet, keep waiting
             }
             double frameSec = static_cast<double>(pts) * av_q2d(tb);
@@ -1309,17 +1486,20 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
                 break;
             }
             // Drop this frame — it's before our resume point
-            if (!m_videoFrameQueue.TryPop(frame)) break;
-            av_frame_unref(frame);
+            if (!m_videoFrameQueue.TryPop()) break;
         }
-        av_frame_free(&frame);
         if (m_waitingForResumeFrame) return false;
     }
 
     double clockSec = m_clock.GetTime();
 
-    AVFrame* frame = av_frame_alloc();
-    AVFrame* bestFrame = nullptr;
+    // Let the convert stage skip frames the catch-up loop below would drop
+    // anyway.
+    m_dropFramesBeforeSec.store(clockSec - frameDur, std::memory_order_relaxed);
+
+    // Frames arrive already converted (ConvertThread does the RGBA
+    // conversion) — pick the newest one that's due against the clock.
+    ConvertedFramePtr best;
 
     while (true) {
         int64_t pts = m_videoFrameQueue.PeekPts();
@@ -1331,40 +1511,36 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
             break; // too early
         }
 
-        if (!m_videoFrameQueue.TryPop(frame)) break;
-
-        if (bestFrame) {
-            av_frame_unref(bestFrame);
-        } else {
-            bestFrame = av_frame_alloc();
-        }
-        av_frame_move_ref(bestFrame, frame);
+        ConvertedFramePtr f = m_videoFrameQueue.TryPop();
+        if (!f) break;
+        best = std::move(f);
 
         double late = clockSec - frameSec;
         if (late <= frameDur) break;
     }
 
-    av_frame_free(&frame);
+    if (!best) return false;
 
-    if (!bestFrame) return false;
+    m_lastDisplayedPts = best->pts;
 
-    m_lastDisplayedPts = bestFrame->pts;
-
-    const uint8_t* rgba = m_frameConverter.Convert(bestFrame);
-    if (!rgba) {
-        av_frame_free(&bestFrame);
-        return false;
+    // The playhead tracks what is actually displayed: when delivery can't
+    // keep up with the requested speed (heavy files at high multipliers),
+    // pull the clock back to the displayed frame instead of letting it run
+    // ahead of the picture.
+    {
+        double frameSec = static_cast<double>(best->pts) * av_q2d(tb);
+        if (clockSec > frameSec + frameDur)
+            m_clock.SetTime(frameSec);
     }
 
-    // Cache the frame for backward stepping
-    m_frameCache.Put(bestFrame->pts, rgba,
-                     m_frameConverter.GetWidth(),
-                     m_frameConverter.GetHeight());
-    av_frame_free(&bestFrame);
+    // No cache Put here: the step-back cache is only populated at rest
+    // (pause / post-seek / stepping), never during playback — playback can
+    // drop or skip frames, which would leave holes in it.
+    m_displayedFrame = std::move(best);
 
-    *outRGBA = rgba;
-    *outWidth = m_frameConverter.GetWidth();
-    *outHeight = m_frameConverter.GetHeight();
+    *outRGBA = m_displayedFrame->data();
+    *outWidth = m_displayedFrame->width;
+    *outHeight = m_displayedFrame->height;
     return true;
 }
 
@@ -1372,10 +1548,17 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 
 void Player::WaitForSeek() {
     PROFILE_WAIT_SCOPE();
-    // Spin-wait for the seek thread to finish its current operation.
-    // This is only called for operations that need decoder consistency
-    // (StepFrame, PopulateCacheAroundCurrent).
-    while (m_seekBusy.load(std::memory_order_acquire)) {
+    // Spin-wait until no seek is pending or in flight. Checking m_seekBusy
+    // alone is not enough: SeekTo posts m_seekRequest and returns before the
+    // seek thread wakes and marks itself busy. Cache-window maintenance is
+    // deliberately NOT awaited — the cache is mutexed, and stepping must not
+    // block on background fills.
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(m_seekMutex);
+            if (m_seekRequest < 0.0 && !m_seekBusy.load(std::memory_order_acquire))
+                break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -1387,14 +1570,16 @@ void Player::SpawnPipelineThreads() {
         m_pipelineActive = false;
         m_pipelineParkedCount = 0;
         m_pipelineExit = false;
-        m_pipelineThreadCount = m_hasAudio ? 3 : 2;
+        m_pipelineThreadCount = m_hasAudio ? 4 : 3;
     }
     m_videoPacketQueue.Reset();
     m_audioPacketQueue.Reset();
+    m_decodedFrameQueue.Reset();
     m_videoFrameQueue.Reset();
 
     m_demuxThread = std::thread(&Player::DemuxThread, this);
     m_videoDecodeThread = std::thread(&Player::VideoDecodeThread, this);
+    m_convertThread = std::thread(&Player::ConvertThread, this);
     if (m_hasAudio) {
         m_audioDecodeThread = std::thread(&Player::AudioDecodeThread, this);
     }
@@ -1410,10 +1595,12 @@ void Player::StopPipelineThreads() {
     m_pipelineCv.notify_all();
     m_videoPacketQueue.Abort();
     m_audioPacketQueue.Abort();
+    m_decodedFrameQueue.Abort();
     m_videoFrameQueue.Abort();
 
     if (m_demuxThread.joinable()) m_demuxThread.join();
     if (m_videoDecodeThread.joinable()) m_videoDecodeThread.join();
+    if (m_convertThread.joinable()) m_convertThread.join();
     if (m_audioDecodeThread.joinable()) m_audioDecodeThread.join();
 }
 
@@ -1434,6 +1621,7 @@ void Player::ParkPipeline() {
     // the top-of-loop park gate.
     m_videoPacketQueue.Interrupt();
     m_audioPacketQueue.Interrupt();
+    m_decodedFrameQueue.Interrupt();
     m_videoFrameQueue.Interrupt();
 
     // Wait for all workers to reach their park gate.
@@ -1448,6 +1636,7 @@ void Player::UnparkPipeline() {
     PROFILE_SCOPE();
     m_videoPacketQueue.ClearInterrupt();
     m_audioPacketQueue.ClearInterrupt();
+    m_decodedFrameQueue.ClearInterrupt();
     m_videoFrameQueue.ClearInterrupt();
     {
         std::lock_guard<std::mutex> lk(m_pipelineMutex);
@@ -1556,10 +1745,23 @@ void Player::VideoDecodeThread() {
     PROFILE_THREAD("Player VideoDecode");
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
+    AVFrame* held = nullptr;  // frame awaiting push (preserved across park)
+    uint64_t heldGen = 0;
     bool drainedEof = false;
 
     while (true) {
         if (!WorkerParkOrExit()) break;
+
+        // A flush while we were parked makes the held frame stale.
+        if (held && m_pipelineFlushGen.load(std::memory_order_relaxed) != heldGen)
+            av_frame_free(&held);
+
+        // Deliver any held frame first — dropping it would punch a gap into
+        // the frame stream, which StepFrame relies on being contiguous.
+        if (held) {
+            if (!m_decodedFrameQueue.Push(held)) continue;  // park requested
+            av_frame_free(&held);
+        }
 
         // Re-arm EOF drain whenever m_eof goes back to false (post-seek).
         if (!m_eof.load(std::memory_order_relaxed)) drainedEof = false;
@@ -1569,7 +1771,7 @@ void Player::VideoDecodeThread() {
             if (!drainedEof) {
                 drainedEof = true;
                 m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* f) {
-                    return m_videoFrameQueue.Push(f);
+                    return m_decodedFrameQueue.Push(f);
                 });
             }
             std::unique_lock<std::mutex> lk(m_pipelineMutex);
@@ -1594,14 +1796,73 @@ void Player::VideoDecodeThread() {
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) break;
 
-            if (!m_videoFrameQueue.Push(frame)) {
-                av_frame_unref(frame);
-                break;  // park requested; top-of-loop handles
+            if (!m_decodedFrameQueue.Push(frame)) {
+                // Park requested while waiting on Push. Save for redelivery.
+                held = av_frame_alloc();
+                av_frame_move_ref(held, frame);
+                heldGen = m_pipelineFlushGen.load(std::memory_order_relaxed);
+                break;  // top-of-loop handles the park
             }
         }
     }
 
+    if (held) av_frame_free(&held);
     av_packet_free(&pkt);
+    av_frame_free(&frame);
+}
+
+// Convert stage: decoded AVFrames in, display-ready ConvertedFrames out.
+// Running this on its own thread keeps decode and sws_scale in parallel —
+// together they can't sustain high-speed playback rates serially — and keeps
+// both off the main thread.
+void Player::ConvertThread() {
+    SetCurrentThreadName(L"ScrubCut Convert");
+    PROFILE_THREAD("Player Convert");
+    AVFrame* frame = av_frame_alloc();
+    ConvertedFramePtr held;  // frame awaiting push (preserved across park)
+    uint64_t heldGen = 0;
+
+    while (true) {
+        if (!WorkerParkOrExit()) break;
+
+        // A flush while we were parked makes the held frame stale.
+        if (held && m_pipelineFlushGen.load(std::memory_order_relaxed) != heldGen)
+            held.reset();
+
+        // Deliver any held frame first — dropping it would punch a gap into
+        // the frame stream, which StepFrame relies on being contiguous.
+        if (held) {
+            if (!m_videoFrameQueue.Push(held)) continue;  // park requested
+            held.reset();
+        }
+
+        if (!m_decodedFrameQueue.PopWithTimeout(frame, 50)) continue;
+
+        // Skip a frame only when it is both late against the clock AND a
+        // newer decoded frame already waits behind it — the main thread
+        // displays the newest due frame, so converting it would be wasted
+        // work. With an empty queue this is the newest frame available:
+        // convert it regardless of lateness, so the display always advances
+        // (a decoder-bound stream shows every frame it manages to produce,
+        // and starvation is structurally impossible).
+        if (frame->pts != AV_NOPTS_VALUE && m_decodedFrameQueue.Size() > 0) {
+            double frameSec = static_cast<double>(frame->pts) * av_q2d(m_demuxer.GetVideoTimeBase());
+            if (frameSec < m_dropFramesBeforeSec.load(std::memory_order_relaxed)) {
+                av_frame_unref(frame);
+                continue;
+            }
+        }
+
+        ConvertedFramePtr cf = ConvertToPooledFrame(m_frameConverter, frame);
+        av_frame_unref(frame);
+        if (!cf) continue;
+        if (!m_videoFrameQueue.Push(cf)) {
+            // Park requested while waiting on Push. Save for redelivery.
+            held = std::move(cf);
+            heldGen = m_pipelineFlushGen.load(std::memory_order_relaxed);
+        }
+    }
+
     av_frame_free(&frame);
 }
 
@@ -1692,7 +1953,9 @@ void Player::EmitProfilerPlots() {
     if (!Profiler::IsEnabled() || !m_hasMedia) return;
     PROFILE_PLOT("Video packet queue", static_cast<int64_t>(m_videoPacketQueue.Size()));
     PROFILE_PLOT("Audio packet queue", static_cast<int64_t>(m_audioPacketQueue.Size()));
+    PROFILE_PLOT("Decoded frame queue", static_cast<int64_t>(m_decodedFrameQueue.Size()));
     PROFILE_PLOT("Video frame queue", static_cast<int64_t>(m_videoFrameQueue.Size()));
+    PROFILE_PLOT("Frame cache", static_cast<int64_t>(m_frameCache.Count()));
 }
 
 void Player::FlushPipelineState() {
@@ -1700,6 +1963,7 @@ void Player::FlushPipelineState() {
     if (m_hasAudio) m_audioDecoder.Flush();
     m_videoPacketQueue.Flush();
     m_audioPacketQueue.Flush();
+    m_decodedFrameQueue.Flush();
     m_videoFrameQueue.Flush();
     m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
 }

@@ -1,91 +1,108 @@
 #pragma once
 
+#include "core/ConvertedFrame.h"
 #include "util/FFmpegUtils.h"
+#include <algorithm>
+#include <mutex>
 #include <vector>
-#include <cstring>
 
-// Fixed-size ring buffer of decoded RGBA frames, indexed by PTS.
-// Used for instant backward stepping without re-seeking.
+// One contiguous window of converted frames around the resting playhead,
+// ordered by pts. Player::MaintainCacheWindow keeps it spanning a few GOPs
+// (grow toward the stepping direction, trim the far side) on the seek thread
+// while the main thread steps through it — hence the internal mutex. Entries
+// share ownership of the pixel buffers (see ConvertedFrame), so Put is a
+// refcount bump rather than a copy. Frames without a pts are not cached.
 class FrameCache {
 public:
-    explicit FrameCache(int capacity = 64) : m_capacity(capacity) {
-        m_entries.resize(capacity);
-    }
-
-    struct Entry {
-        int64_t pts = AV_NOPTS_VALUE;
-        std::vector<uint8_t> rgba;
-        int width = 0;
-        int height = 0;
-    };
-
-    // Store a frame. Overwrites oldest entry if full.
-    void Put(int64_t pts, const uint8_t* rgba, int width, int height) {
-        Entry& e = m_entries[m_writeIdx % m_capacity];
-        e.pts = pts;
-        e.width = width;
-        e.height = height;
-        int size = width * height * 4;
-        e.rgba.resize(size);
-        std::memcpy(e.rgba.data(), rgba, size);
-        m_writeIdx++;
-        if (m_count < m_capacity) m_count++;
+    // Store a frame (sorted insert; an existing entry with the same pts is
+    // replaced).
+    void Put(ConvertedFramePtr frame) {
+        if (!frame || frame->pts == AV_NOPTS_VALUE) return;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = LowerBound(frame->pts);
+        if (it != m_frames.end() && (*it)->pts == frame->pts)
+            *it = std::move(frame);
+        else
+            m_frames.insert(it, std::move(frame));
     }
 
     // Find the frame with the largest PTS that is < the given PTS.
-    // Returns nullptr if not found.
-    const Entry* FindBefore(int64_t pts) const {
-        const Entry* best = nullptr;
-        for (int i = 0; i < m_count; i++) {
-            int idx = ((m_writeIdx - 1 - i) % m_capacity + m_capacity) % m_capacity;
-            const Entry& e = m_entries[idx];
-            if (e.pts != AV_NOPTS_VALUE && e.pts < pts) {
-                if (!best || e.pts > best->pts) {
-                    best = &e;
-                }
-            }
-        }
-        return best;
+    ConvertedFramePtr FindBefore(int64_t pts) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = LowerBound(pts);
+        if (it == m_frames.begin()) return nullptr;
+        return *std::prev(it);
     }
 
     // Find the frame closest to the given PTS.
-    const Entry* FindNearest(int64_t targetPts) const {
-        const Entry* best = nullptr;
-        int64_t bestDist = INT64_MAX;
-        for (int i = 0; i < m_count; i++) {
-            int idx = ((m_writeIdx - 1 - i) % m_capacity + m_capacity) % m_capacity;
-            const Entry& e = m_entries[idx];
-            if (e.pts == AV_NOPTS_VALUE) continue;
-            int64_t dist = std::abs(e.pts - targetPts);
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = &e;
-            }
-        }
-        return best;
+    ConvertedFramePtr FindNearest(int64_t targetPts) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_frames.empty()) return nullptr;
+        auto it = LowerBound(targetPts);
+        if (it == m_frames.end()) return m_frames.back();
+        if (it == m_frames.begin()) return m_frames.front();
+        auto prev = std::prev(it);
+        return (targetPts - (*prev)->pts <= (*it)->pts - targetPts) ? *prev : *it;
     }
 
     // Find exact PTS match.
-    const Entry* FindExact(int64_t pts) const {
-        for (int i = 0; i < m_count; i++) {
-            int idx = ((m_writeIdx - 1 - i) % m_capacity + m_capacity) % m_capacity;
-            const Entry& e = m_entries[idx];
-            if (e.pts == pts) return &e;
-        }
+    ConvertedFramePtr FindExact(int64_t pts) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = LowerBound(pts);
+        if (it != m_frames.end() && (*it)->pts == pts) return *it;
         return nullptr;
     }
 
-    void Clear() {
-        m_writeIdx = 0;
-        m_count = 0;
-        for (auto& e : m_entries) e.pts = AV_NOPTS_VALUE;
+    void DiscardBefore(int64_t pts) {  // remove entries with pts < given
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_frames.erase(m_frames.begin(), LowerBound(pts));
     }
 
-    int Count() const { return m_count; }
+    void DiscardAfter(int64_t pts) {   // remove entries with pts > given
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_frames.erase(LowerBound(pts + 1), m_frames.end());
+    }
+
+    void Clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_frames.clear();
+    }
+
+    int64_t StartPts() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_frames.empty() ? AV_NOPTS_VALUE : m_frames.front()->pts;
+    }
+
+    int64_t EndPts() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_frames.empty() ? AV_NOPTS_VALUE : m_frames.back()->pts;
+    }
+
+    // PTS of every cached keyframe, ascending. Small (a handful of GOPs).
+    std::vector<int64_t> KeyframePts() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::vector<int64_t> kfs;
+        for (const auto& f : m_frames)
+            if (f->keyframe) kfs.push_back(f->pts);
+        return kfs;
+    }
+
+    int Count() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return static_cast<int>(m_frames.size());
+    }
 
 private:
-    std::vector<Entry> m_entries;
-    int m_capacity;
-    int m_writeIdx = 0;
-    int m_count = 0;
+    // First entry with pts >= the given pts. Callers hold m_mutex.
+    std::vector<ConvertedFramePtr>::const_iterator LowerBound(int64_t pts) const {
+        return std::lower_bound(m_frames.begin(), m_frames.end(), pts,
+            [](const ConvertedFramePtr& f, int64_t p) { return f->pts < p; });
+    }
+    std::vector<ConvertedFramePtr>::iterator LowerBound(int64_t pts) {
+        return std::lower_bound(m_frames.begin(), m_frames.end(), pts,
+            [](const ConvertedFramePtr& f, int64_t p) { return f->pts < p; });
+    }
+
+    mutable std::mutex m_mutex;
+    std::vector<ConvertedFramePtr> m_frames;
 };

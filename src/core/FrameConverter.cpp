@@ -32,21 +32,50 @@ const uint8_t* FrameConverter::Convert(AVFrame* frame) {
         return nullptr;
 
     EnsureContext(frame);
-
     if (!m_swsCtx)
         return nullptr;
 
+    int needed = OutputSize();
+    if (needed > m_bufferSize) {
+        FreeBuffer();
+        m_bufferSize = needed;
+        m_buffer = static_cast<uint8_t*>(av_malloc(m_bufferSize));
+    }
+
+    ScaleInto(frame, m_buffer);
+    return m_buffer;
+}
+
+bool FrameConverter::ConvertInto(AVFrame* frame, ConvertedFrame& dst) {
+    PROFILE_SCOPE();
+    if (!frame)
+        return false;
+
+    EnsureContext(frame);
+    if (!m_swsCtx)
+        return false;
+
+    dst.Resize(static_cast<size_t>(OutputSize()));
+    ScaleInto(frame, dst.data());
+    dst.width = m_width;
+    dst.height = m_height;
+    return true;
+}
+
+int FrameConverter::OutputSize() const {
+    return av_image_get_buffer_size(m_dstFmt, m_width, m_height, 1);
+}
+
+void FrameConverter::ScaleInto(AVFrame* frame, uint8_t* dst) {
     // Both the SDR (RGBA) and HDR (X2BGR10LE) destination formats are 4 bytes
     // per pixel, so the destination stride is the same either way.
-    uint8_t* dstData[1] = { m_buffer };
+    uint8_t* dstData[1] = { dst };
     int dstLinesize[1] = { m_width * 4 };
 
     sws_scale(m_swsCtx,
               frame->data, frame->linesize,
               0, frame->height,
               dstData, dstLinesize);
-
-    return m_buffer;
 }
 
 void FrameConverter::EnsureContext(AVFrame* frame) {
@@ -120,13 +149,6 @@ void FrameConverter::EnsureContext(AVFrame* frame) {
         const int* inv_table = sws_getCoefficients(SWS_CS_DEFAULT);
         const int* table = sws_getCoefficients(SWS_CS_DEFAULT);
         sws_setColorspaceDetails(m_swsCtx, inv_table, srcRange, table, dstRange, 0, 1 << 16, 1 << 16);
-    }
-
-    int needed = av_image_get_buffer_size(m_dstFmt, width, height, 1);
-    if (needed > m_bufferSize) {
-        FreeBuffer();
-        m_bufferSize = needed;
-        m_buffer = static_cast<uint8_t*>(av_malloc(m_bufferSize));
     }
 }
 

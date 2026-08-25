@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ConvertedFrame.h"
 #include "util/FFmpegUtils.h"
 #include "util/Profiler.h"
 #include <chrono>
@@ -7,18 +8,19 @@
 #include <condition_variable>
 #include <queue>
 
+// Queue of display-ready converted frames from ConvertThread to the main
+// thread (which picks the due frame and uploads it).
 class FrameQueue {
 public:
     explicit FrameQueue(int maxSize = 4) : m_maxSize(maxSize) {}
-    ~FrameQueue() { Flush(); }
 
     FrameQueue(const FrameQueue&) = delete;
     FrameQueue& operator=(const FrameQueue&) = delete;
 
-    // Push a frame (takes ownership via av_frame_move_ref).
-    // Blocks if queue is full. Returns false if aborted or interrupted —
-    // contents preserved on interrupt.
-    bool Push(AVFrame* frame) {
+    // Push a frame. Blocks if queue is full. Returns false if aborted or
+    // interrupted — the frame is not enqueued in that case, and queue
+    // contents are preserved on interrupt.
+    bool Push(ConvertedFramePtr frame) {
         PROFILE_SCOPE_N("FrameQueue::Push");
         std::unique_lock<std::mutex> lock(m_mutex);
         {
@@ -28,40 +30,20 @@ public:
         }
         if (m_abort || m_interrupt) return false;
 
-        AVFrame* copy = av_frame_alloc();
-        av_frame_move_ref(copy, frame);
-        m_queue.push(copy);
+        m_queue.push(std::move(frame));
         m_condPop.notify_one();
         return true;
     }
 
-    // Pop a frame. Blocks if queue is empty. Returns false if aborted or
-    // interrupted (contents preserved on interrupt).
-    bool Pop(AVFrame* frame) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_condPop.wait(lock, [&] { return !m_queue.empty() || m_abort || m_interrupt; });
-        if (m_interrupt) return false;
-        if (m_abort && m_queue.empty()) return false;
-
-        AVFrame* front = m_queue.front();
-        m_queue.pop();
-        av_frame_move_ref(frame, front);
-        av_frame_free(&front);
-        m_condPush.notify_one();
-        return true;
-    }
-
-    // Try to pop without blocking. Returns false if empty.
-    bool TryPop(AVFrame* frame) {
+    // Try to pop without blocking. Returns nullptr if empty.
+    ConvertedFramePtr TryPop() {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_queue.empty()) return false;
+        if (m_queue.empty()) return nullptr;
 
-        AVFrame* front = m_queue.front();
+        ConvertedFramePtr front = std::move(m_queue.front());
         m_queue.pop();
-        av_frame_move_ref(frame, front);
-        av_frame_free(&front);
         m_condPush.notify_one();
-        return true;
+        return front;
     }
 
     // Peek at the front frame's PTS without removing it. Returns AV_NOPTS_VALUE if empty.
@@ -73,11 +55,7 @@ public:
 
     void Flush() {
         std::lock_guard<std::mutex> lock(m_mutex);
-        while (!m_queue.empty()) {
-            AVFrame* f = m_queue.front();
-            m_queue.pop();
-            av_frame_free(&f);
-        }
+        while (!m_queue.empty()) m_queue.pop();
         m_condPush.notify_all();
     }
 
@@ -94,8 +72,8 @@ public:
         m_interrupt = false;
     }
 
-    // Wake any waiting Push/Pop and make them return false without erasing
-    // queue contents. See PacketQueue::Interrupt for usage.
+    // Wake any waiting Push and make it return false without erasing queue
+    // contents. See PacketQueue::Interrupt for usage.
     void Interrupt() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_interrupt = true;
@@ -124,7 +102,7 @@ public:
     }
 
 private:
-    std::queue<AVFrame*> m_queue;
+    std::queue<ConvertedFramePtr> m_queue;
     std::mutex m_mutex;
     std::condition_variable m_condPush;
     std::condition_variable m_condPop;
