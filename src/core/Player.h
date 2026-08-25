@@ -176,8 +176,10 @@ private:
     bool SyncDecodeNextFrame();
 
     // Seek to targetSec, then synchronously decode forward to the target frame.
-    // Flushes decoder. Pipeline must be parked.
-    bool SyncSeekAndDecode(double targetSec);
+    // Flushes decoder. Pipeline must be parked. clearCache=false keeps the
+    // step cache — for the resync paths, which re-seek to the frame already
+    // displayed (inside the window), not to a new position.
+    bool SyncSeekAndDecode(double targetSec, bool clearCache = true);
 
     // Like SyncSeekAndDecode, but lands on the frame with the largest pts that
     // is STRICTLY LESS than maxPts. Used for backward frame stepping — avoids
@@ -200,6 +202,11 @@ private:
     // PTS of the keyframe at/before `sec` (probes the cache demuxer without
     // decoding). AV_NOPTS_VALUE on failure.
     int64_t ProbeCacheKeyframeBefore(double sec);
+    // Playback-time shedding (main thread, per displayed frame): the window
+    // is never grown while playing, but GOPs the playhead moves out of the
+    // step-back policy are dropped as it goes — a quick play-pause keeps the
+    // still-relevant part of the window, longer playback releases the memory.
+    void TrimCacheBehindPlayhead(int64_t displayedPts);
     std::atomic<int64_t> m_cacheWindowCenter{AV_NOPTS_VALUE};
     int64_t m_cacheBofKf = AV_NOPTS_VALUE;  // window start is the file's first keyframe (seek thread only)
     bool m_cacheEofSeen = false;            // window end reached EOF (seek thread only)

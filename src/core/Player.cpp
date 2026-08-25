@@ -347,7 +347,7 @@ void Player::Play() {
         FlushPipelineState();
         AVRational tb = m_demuxer.GetVideoTimeBase();
         double seekSec = (m_lastDisplayedPts + 0.5) * av_q2d(tb);
-        SyncSeekAndDecode(seekSec);
+        SyncSeekAndDecode(seekSec, /*clearCache=*/false);
         m_needsResync = false;
     }
 
@@ -733,7 +733,8 @@ void Player::StepFrame(int direction) {
         // the tick path below produce it.
         auto resyncToDisplayed = [&]() {
             FlushPipelineState();
-            SyncSeekAndDecode((m_lastDisplayedPts + 0.5) * av_q2d(tb));
+            SyncSeekAndDecode((m_lastDisplayedPts + 0.5) * av_q2d(tb),
+                              /*clearCache=*/false);
             m_needsResync = false;
             ClearStagedFrame();
         };
@@ -1022,7 +1023,7 @@ bool Player::SyncDecodeNextFrame() {
     return found;
 }
 
-bool Player::SyncSeekAndDecode(double targetSec) {
+bool Player::SyncSeekAndDecode(double targetSec, bool clearCache) {
     PROFILE_SCOPE();
 
     // Flush decoder state — we're seeking to a new position
@@ -1034,7 +1035,7 @@ bool Player::SyncSeekAndDecode(double targetSec) {
     m_audioPacketQueue.Flush();
     m_decodedFrameQueue.Flush();
     m_videoFrameQueue.Flush();
-    m_frameCache.Clear();
+    if (clearCache) m_frameCache.Clear();
 
     // Clear the audio queue's interrupt flag so we can push audio packets
     // captured during the forward decode below. ParkPipeline left the queues
@@ -1319,7 +1320,11 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
     // decoder stays warm for Play), caching frames in [cacheMinPts,
     // cacheMaxPtsExcl). Stops when `kfLimit` keyframes strictly past
     // `pastPts` are reached (the limit-th one is not cached), at
-    // cacheMaxPtsExcl, at EOF, on abort, or at the frame-count safety cap.
+    // cacheMaxPtsExcl, at EOF, or on abort. At the frame-count cap it stops
+    // once past `pastPts`; while still at or before it, it slides the window
+    // (evicts the oldest frame) instead — a keyframe interval wider than the
+    // cap must still produce a window that covers the playhead, or the
+    // maintenance loop would clear-and-rebuild forever.
     auto decodeChunk = [&](double seekSec, int64_t cacheMinPts, int64_t cacheMaxPtsExcl,
                            int64_t pastPts, int kfLimit) {
         PROFILE_SCOPE_N("CacheWindowChunk");
@@ -1339,11 +1344,15 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
                     ++kfsPast >= kfLimit)
                     return false;
                 if (f->pts >= cacheMinPts) {
+                    if (m_frameCache.Count() >= kMaxCacheFrames) {
+                        if (f->pts > pastPts) return false;  // capped and past the playhead — done
+                        m_frameCache.DiscardBefore(m_frameCache.StartPts() + 1);  // slide
+                    }
                     if (ConvertedFramePtr cf = ConvertToPooledFrame(m_cacheConverter, f))
                         m_frameCache.Put(std::move(cf));
                 }
             }
-            return m_frameCache.Count() < kMaxCacheFrames;
+            return true;
         };
 
         while (!stop && maxPackets-- > 0) {
@@ -1393,7 +1402,15 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
             t = static_cast<double>(k) * tbSec - eps;
         }
         if (kf == AV_NOPTS_VALUE) return false;
-        decodeChunk(static_cast<double>(kf) * tbSec, INT64_MIN, INT64_MAX,
+        // Frames more than a cap's worth before the playhead can never
+        // survive the slide — skip converting them. The few frames of margin
+        // guarantee that whenever this bound bites (keyframe interval wider
+        // than the cap), the finished window sits exactly AT the cap — the
+        // keyframe-less window check below relies on that to tell a slid
+        // window from a stub.
+        int64_t frameTicks = static_cast<int64_t>(GetFrameDuration() / tbSec);
+        decodeChunk(static_cast<double>(kf) * tbSec,
+                    centerPts - (kMaxCacheFrames + 8) * frameTicks, INT64_MAX,
                     centerPts, kCacheGopsAhead + 1);
         return true;  // re-evaluate the policy on the next iteration
     }
@@ -1404,11 +1421,19 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
     for (size_t i = 0; i < kfs.size(); ++i)
         if (kfs[i] <= centerPts) g = static_cast<int>(i);
     if (g < 0) {
-        // Window no longer starts at a keyframe covering the center — rebuild.
+        // No cached keyframe at/before the center. At the cap this is a
+        // window that slid past its GOP's keyframe (keyframe interval wider
+        // than the cap) — it covers the playhead as well as possible, nothing
+        // more to maintain. Below the cap it's a stub (e.g. just the frame a
+        // seek landing staged) — rebuild it into a real window.
+        if (m_frameCache.Count() >= kMaxCacheFrames) return false;
         m_frameCache.Clear();
         return true;
     }
-    m_frameCache.DiscardBefore(kfs[std::max(0, g - kCacheGopsBehind)]);
+    // Keep the slid pre-keyframe frames when there aren't enough GOPs behind —
+    // they ARE the behind coverage in a wider-than-cap keyframe interval.
+    if (g >= kCacheGopsBehind)
+        m_frameCache.DiscardBefore(kfs[g - kCacheGopsBehind]);
     if (g + kCacheGopsAhead + 1 < static_cast<int>(kfs.size()))
         m_frameCache.DiscardAfter(kfs[g + kCacheGopsAhead + 1] - 1);
 
@@ -1433,6 +1458,41 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         return true;
     }
     return false;  // window satisfies the policy
+}
+
+void Player::TrimCacheBehindPlayhead(int64_t displayedPts) {
+    if (m_frameCache.Count() == 0) return;
+    int64_t endPts = m_frameCache.EndPts();
+    std::vector<int64_t> kfs = m_frameCache.KeyframePts();
+    if (kfs.empty()) {
+        // Keyframe-less (slid) window: useless once the playhead leaves it.
+        if (displayedPts > endPts || displayedPts < m_frameCache.StartPts())
+            m_frameCache.Clear();
+        return;
+    }
+
+    // GOP index of the playhead: cached GOPs count 0..kfs.size()-1; past the
+    // window end, uncached GOPs count on, estimated by the last cached GOP's
+    // length.
+    int g;
+    if (displayedPts > endPts) {
+        int64_t gopTicks = std::max<int64_t>(1, endPts + 1 - kfs.back());
+        int64_t past = (displayedPts - endPts - 1) / gopTicks + 1;
+        g = static_cast<int>(kfs.size()) - 1 +
+            static_cast<int>(std::min<int64_t>(past, kMaxCacheFrames));
+    } else {
+        g = -1;
+        for (size_t i = 0; i < kfs.size(); ++i)
+            if (kfs[i] <= displayedPts) g = static_cast<int>(i);
+        if (g < 0) return;  // playhead in the window's pre-keyframe (slid) part
+    }
+
+    int firstKeep = g - kCacheGopsBehind;
+    if (firstKeep <= 0) return;
+    if (firstKeep >= static_cast<int>(kfs.size()))
+        m_frameCache.Clear();
+    else
+        m_frameCache.DiscardBefore(kfs[firstKeep]);
 }
 
 // --- TryGetVideoFrame (used during playback) ---
@@ -1535,7 +1595,10 @@ bool Player::TryGetVideoFrame(const uint8_t** outRGBA, int* outWidth, int* outHe
 
     // No cache Put here: the step-back cache is only populated at rest
     // (pause / post-seek / stepping), never during playback — playback can
-    // drop or skip frames, which would leave holes in it.
+    // drop or skip frames, which would leave holes in it. It IS shed here:
+    // GOPs falling out of the step-back policy are dropped as the playhead
+    // advances.
+    TrimCacheBehindPlayhead(best->pts);
     m_displayedFrame = std::move(best);
 
     *outRGBA = m_displayedFrame->data();
