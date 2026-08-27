@@ -178,11 +178,11 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, const std::st
 
     std::string suffix;
     if (!markName.empty()) {
-        suffix = "_" + markName;
+        suffix = m_settings.delimiter + markName;
     } else {
         char buf[32];
-        snprintf(buf, sizeof(buf), "_%03d", fallbackIndex + 1);
-        suffix = buf;
+        snprintf(buf, sizeof(buf), "%03d", fallbackIndex + 1);
+        suffix = m_settings.delimiter + buf;
     }
 
     std::filesystem::path result = std::filesystem::path(dir) / (stem + suffix + extension);

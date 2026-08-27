@@ -116,6 +116,7 @@ struct SubtitleEvent {
 
 struct ExportSettings {
     std::string outputPath;
+    std::string delimiter = "_"; // between base filename and mark name
     std::vector<TimeRange> segments;
     std::vector<FrameMark> frames;
     int gifWidth = 480;

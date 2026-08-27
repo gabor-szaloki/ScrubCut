@@ -257,6 +257,9 @@ private:
     std::vector<std::string> m_conflictingFiles;
     char m_exportDir[512] = "";
     char m_exportName[256] = "";
+    // Delimiter between the base filename and mark names, persisted across
+    // sessions.
+    char m_exportDelimiter[16] = "_";
 
     // Export output-directory mode. SameAsVideo (default) auto-fills the
     // export dir with the opened video's parent on each open. Custom uses
