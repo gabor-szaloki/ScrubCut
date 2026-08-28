@@ -222,9 +222,13 @@ bool Player::Open(const std::string& path) {
     // Spawn pipeline workers in parked state. They'll be unparked by Play.
     SpawnPipelineThreads();
 
-    // Decode first frame synchronously so we have something to show.
-    // Pipeline is parked, so this owns the demuxer + video decoder.
-    SyncDecodeNextFrame();
+    // Decode the first frame synchronously so we have something to show.
+    // Pipeline is parked, so this owns the demuxer + video decoder. The seek
+    // path (rather than a bare decode loop) captures the audio packets read
+    // while the frame-threaded decoder spins up and anchors the audio output
+    // to the landed frame — otherwise the first Play() starts audio a decode-
+    // delay's worth of content (~0.7s at 24fps) ahead of video.
+    SyncSeekAndDecode(0.0);
 
     // Profiler phases: what's open, and the initial (paused) transport state.
     size_t nameAt = path.find_last_of("/\\");
@@ -966,62 +970,6 @@ void Player::SetAudioTrack(int streamIndex) {
 }
 
 // --- Synchronous decode (used when paused) ---
-
-bool Player::SyncDecodeNextFrame() {
-    PROFILE_SCOPE();
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    bool found = false;
-    int maxPackets = 200;
-    bool eofHit = false;
-
-    while (!found && maxPackets-- > 0) {
-        // First try to receive a frame (decoder may have buffered frames)
-        int ret = m_videoDecoder.ReceiveFrame(frame);
-        if (ret == 0) {
-            found = true;
-            break;
-        }
-
-        // Need more input — read packets from the demuxer.
-        ret = m_demuxer.ReadPacket(pkt);
-        if (ret == AVERROR_EOF) {
-            m_eof = true;
-            eofHit = true;
-            break;
-        }
-        if (ret < 0) break;
-
-        if (pkt->stream_index == m_demuxer.GetVideoStreamIndex()) {
-            m_videoDecoder.SendPacket(pkt);
-        }
-        av_packet_unref(pkt);
-    }
-
-    // Hit EOF without producing a frame — the next frame may still be
-    // sitting in the decoder pipeline. Drain it out so frame-step-forward
-    // can reach the last few frames of the file instead of stalling
-    // ~thread_count frames before the end.
-    if (eofHit && !found) {
-        m_videoDecoder.DrainAtEOF(frame, [&](AVFrame* /*f*/) {
-            found = true;
-            return false;  // grab the first one and keep its data in `frame`
-        });
-    }
-
-    if (found) {
-        AVRational tb = m_demuxer.GetVideoTimeBase();
-        double frameSec = static_cast<double>(frame->pts) * av_q2d(tb);
-        m_clock.SetTime(frameSec);
-        m_lastDisplayedPts = frame->pts;
-
-        StageFrame(ConvertToPooledFrame(m_frameConverter, frame), /*putInCache=*/true);
-    }
-
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
-    return found;
-}
 
 bool Player::SyncSeekAndDecode(double targetSec, bool clearCache) {
     PROFILE_SCOPE();

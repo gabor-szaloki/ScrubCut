@@ -170,11 +170,6 @@ private:
     ConvertedFramePtr m_stagedFrame;
     std::mutex m_stagedFrameMutex;
 
-    // Synchronously decode the next video frame from the current demuxer/decoder state.
-    // No seek, no flush. Returns true if a frame was decoded and cached.
-    // Used only for the initial-frame decode in Open() — pipeline must be parked.
-    bool SyncDecodeNextFrame();
-
     // Seek to targetSec, then synchronously decode forward to the target frame.
     // Flushes decoder. Pipeline must be parked. clearCache=false keeps the
     // step cache — for the resync paths, which re-seek to the frame already
