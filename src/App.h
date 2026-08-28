@@ -187,6 +187,9 @@ private:
     // After that frame this flag triggers re-hiding them. Avoids
     // duplicating window defaults in the reset code path.
     bool m_hideFloatingWindowsAfterReset = false;
+    // Set by the Reset Layout menu item; Run() performs the window
+    // mutations between frames (resizing mid-frame crashes — see there).
+    bool m_pendingLayoutReset = false;
     bool m_showChapters = true;
     bool m_showWaveform = false;
     bool m_showTooltips = true;

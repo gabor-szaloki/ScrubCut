@@ -524,6 +524,25 @@ void App::Run() {
             OpenSubtitleFile(p);
         }
 
+        // Reset Layout's window mutations, deferred here because resizing the
+        // window mid-frame leaves the frame's ImGui draw data sized for the
+        // old window (Metal aborts on the oversized scissor). The ImGui-side
+        // reset stays in the menu handler — it needs an active frame.
+        if (m_pendingLayoutReset) {
+            m_pendingLayoutReset = false;
+            // Clear "re-maximize on fullscreen exit" so the upcoming
+            // SetFullscreen(false) doesn't undo our un-maximize below.
+            m_wasMaximizedBeforeFullscreen = false;
+            SetFullscreen(false);
+            if (m_maximized) {
+                SDL_RestoreWindow(m_window);
+            }
+            float scale = m_ui.GetUiScale();
+            SDL_SetWindowSize(m_window, static_cast<int>(1280 * scale), static_cast<int>(720 * scale));
+            SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+            std::filesystem::remove(GetAppDataDir() / "layout.ini");
+        }
+
         // Fetch + upload the next due video frame before Render samples the
         // texture. Frames arriving later (e.g. a seek landing mid-Render)
         // are picked up here on the next iteration — nothing displays after
@@ -1858,13 +1877,6 @@ void App::Render() {
             }
             ImGui::SeparatorText("Reset");
             if (ImGui::MenuItem("Reset Layout")) {
-                // Clear "re-maximize on fullscreen exit" so the upcoming
-                // SetFullscreen(false) doesn't undo our un-maximize below.
-                m_wasMaximizedBeforeFullscreen = false;
-                SetFullscreen(false);
-                if (m_maximized) {
-                    SDL_RestoreWindow(m_window);
-                }
                 m_ui.ResetLayout();
                 // Force all floating panels visible so their Begin blocks
                 // run on the next frame with layoutCond = Always and apply
@@ -1876,10 +1888,8 @@ void App::Render() {
                 m_showHelpPanel = true;
                 m_segmentsClosedManually = false;
                 m_hideFloatingWindowsAfterReset = true;
-                float scale = m_ui.GetUiScale();
-                SDL_SetWindowSize(m_window, static_cast<int>(1280 * scale), static_cast<int>(720 * scale));
-                SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-                std::filesystem::remove(GetAppDataDir() / "layout.ini");
+                // Window mutations happen in Run(), between frames.
+                m_pendingLayoutReset = true;
             }
             TooltipFor("Reset the window size and panel layout to defaults.");
             if (ImGui::MenuItem("Reset Settings"))
