@@ -24,6 +24,10 @@ public:
 
     void OpenFile(const std::string& path);
     void RequestOpenFile(const std::string& path);
+    // Close the current video and reset all per-file state (segments,
+    // subtitles, waveform, window title). Runs between frames only — it
+    // releases the video texture the current frame's draw list references.
+    void CloseFile();
 
     // True if `path` has a subtitle-file extension (.srt/.ass/.ssa/.vtt/.sub).
     static bool IsSubtitlePath(const std::string& path);
@@ -239,6 +243,7 @@ private:
     std::vector<bool> m_frameExportChecked;
     bool m_showOverwriteConfirm = false;
     bool m_showOpenFileConfirm = false;
+    bool m_showCloseFileConfirm = false;
     // Cmd+E from the global keyboard handler — resolved in Render where
     // ImGui state is current. (The handler runs before BeginFrame, when
     // ImGui's CurrentWindow is null and calls like IsPopupOpen crash.)
@@ -253,6 +258,9 @@ private:
     bool m_exportDialogItemActiveLast = false;
     bool m_pendingOpenImmediate = false;
     std::string m_pendingOpenFilePath;
+    // Close chosen from the File menu (mid-frame) — applied in Run() between
+    // frames, same constraint as m_pendingOpenImmediate.
+    bool m_pendingCloseFile = false;
     // Subtitle file chosen via the Open dialog. The dialog callback can fire on
     // a non-main thread, so it stashes the path here and Run() applies it on the
     // main thread (same pattern as m_pendingOpenFilePath).

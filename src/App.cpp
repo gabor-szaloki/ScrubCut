@@ -517,6 +517,11 @@ void App::Run() {
             OpenFile(m_pendingOpenFilePath);
             m_pendingOpenFilePath.clear();
         }
+        // Deferred close (from the File menu, which runs mid-frame).
+        if (m_pendingCloseFile) {
+            m_pendingCloseFile = false;
+            CloseFile();
+        }
         // Deferred subtitle-file open (dialog callback, possibly off-thread).
         if (!m_pendingSubtitlePath.empty()) {
             std::string p = m_pendingSubtitlePath;
@@ -724,7 +729,7 @@ void App::RequestOpenFile(const std::string& path) {
     // on a non-main thread, and OpenFile touches GPU resources and player
     // state owned by the main thread.
     m_pendingOpenFilePath = path;
-    if (m_segments.GetCount() > 0)
+    if (m_segments.GetTotalCount() > 0)
         m_showOpenFileConfirm = true;
     else
         m_pendingOpenImmediate = true;
@@ -782,6 +787,38 @@ void App::OpenFile(const std::string& rawPath) {
     AddToRecent(path);
 
     m_player.Play();
+}
+
+void App::CloseFile() {
+    PROFILE_SCOPE();
+
+    m_player.Close();
+
+    if (m_videoTexture) {
+        SDL_ReleaseGPUTexture(m_gpuDevice, m_videoTexture);  // deferred-safe
+        m_videoTexture = nullptr;
+    }
+    m_displayTexture = nullptr;
+    m_videoWidth = 0;
+    m_videoHeight = 0;
+    m_videoColorMode = VideoColorMode::SDR;
+
+    m_currentFilePath.clear();
+    m_segments.Clear();
+    m_segmentsClosedManually = false;
+    m_seekTarget = 0.0;
+
+    ResetSubtitleState();
+    m_waveform.Reset();
+
+    // HDR output is content-gated — disengage now that nothing is open.
+    UpdateHDROutput();
+
+    const char* title = "ScrubCut";
+#ifndef NDEBUG
+    title = "ScrubCut - Debug";
+#endif
+    SDL_SetWindowTitle(m_window, title);
 }
 
 // --- Media: audio / subtitle track selection ---
@@ -1691,11 +1728,11 @@ void App::Render() {
             }
             ImGui::Separator();
 #if defined(__APPLE__)
-            const char* revealLabel = "Show Current Video in Finder";
+            const char* revealLabel = "Show Video in Finder";
 #elif defined(_WIN32)
-            const char* revealLabel = "Show Current Video in Explorer";
+            const char* revealLabel = "Show Video in Explorer";
 #else
-            const char* revealLabel = "Show Current Video in File Manager";
+            const char* revealLabel = "Show Video in File Manager";
 #endif
             if (ImGui::MenuItem(revealLabel, nullptr, false, !m_currentFilePath.empty())) {
                 RevealInShell(m_currentFilePath);
@@ -1708,6 +1745,14 @@ void App::Render() {
                     OpenFolderInShell(base);
             }
             ImGui::Separator();
+            if (ImGui::MenuItem("Close Video", nullptr, false, m_player.HasMedia())) {
+                // Defer the actual close to Run()'s between-frames path —
+                // this frame's draw list still references the video texture.
+                if (m_segments.GetTotalCount() > 0)
+                    m_showCloseFileConfirm = true;
+                else
+                    m_pendingCloseFile = true;
+            }
             if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {
                 m_running = false;
             }
@@ -3765,13 +3810,13 @@ void App::Render() {
         ImGui::EndPopup();
     }
 
-    // Open file confirmation (segments will be lost)
+    // Open file confirmation (marks will be lost)
     if (m_showOpenFileConfirm) {
         ImGui::OpenPopup("Open New File?");
         m_showOpenFileConfirm = false;
     }
     if (ImGui::BeginPopupModal("Open New File?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Opening a new file will clear all segments.");
+        ImGui::Text("Opening a new file will clear all marks.");
         ImGui::Text("Are you sure you want to proceed?");
         ImGui::Spacing();
         ImGui::Separator();
@@ -3789,6 +3834,30 @@ void App::Render() {
             m_pendingOpenFilePath.clear();
             ImGui::CloseCurrentPopup();
         }
+        ImGui::EndPopup();
+    }
+
+    // Close video confirmation (marks will be lost)
+    if (m_showCloseFileConfirm) {
+        ImGui::OpenPopup("Close Video?");
+        m_showCloseFileConfirm = false;
+    }
+    if (ImGui::BeginPopupModal("Close Video?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Closing the video will clear all marks.");
+        ImGui::Text("Are you sure you want to proceed?");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("Proceed", ImVec2(btnW, 0))) {
+            // Defer to Run()'s between-frames close path (same texture-lifetime
+            // constraint as the open confirm above).
+            m_pendingCloseFile = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(-1, 0)))
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 
