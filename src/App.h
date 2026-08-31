@@ -35,8 +35,10 @@ public:
 private:
     void ProcessEvents();
     // One frame iteration: fetch the due video frame + draw the UI. Called
-    // per Run() loop and from ResizeEventWatch during a live resize.
-    void RenderFrame();
+    // per Run() loop and from ResizeEventWatch during a live resize —
+    // `duringLiveResize` tags the latter so Render can anchor its
+    // proportional window repositioning for the duration of the drag.
+    void RenderFrame(bool duringLiveResize = false);
     void Render();
     static bool SDLCALL ResizeEventWatch(void* userdata, SDL_Event* event);
 
@@ -247,6 +249,19 @@ private:
     float m_uiAlpha = 1.0f;
     uint64_t m_lastUIActivityNS = 0;
     ImVec2 m_prevViewportSize = {0, 0};
+
+    // Live-resize session anchor for the proportional repositioning of
+    // floating windows. ImGui truncates window positions to whole pixels
+    // every Begin, so repositioning chained frame-to-frame discards each
+    // drag frame's sub-pixel movement — a slow (1–2 px/frame) border drag
+    // would never move the panels at all. Anchoring every drag frame to the
+    // geometry captured at drag start makes the drag land exactly where an
+    // instant jump to the final size would. Session bounds come from the
+    // RenderFrame call site (see Render's reposition block).
+    bool m_liveResizeFrame = false;
+    bool m_resizeAnchorActive = false;
+    ImVec2 m_resizeAnchorViewport = {0, 0};
+    FloatingWindowSnap m_anchorTimeline, m_anchorSegments, m_anchorHelp;
     ExportSettings m_pendingExport;
     std::vector<bool> m_exportChecked;
     std::vector<bool> m_frameExportChecked;

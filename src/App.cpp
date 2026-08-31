@@ -557,7 +557,9 @@ void App::Run() {
     }
 }
 
-void App::RenderFrame() {
+void App::RenderFrame(bool duringLiveResize) {
+    m_liveResizeFrame = duringLiveResize;
+
     // Fetch + upload the next due video frame before Render samples the
     // texture. Frames arriving later (e.g. a seek landing mid-Render)
     // are picked up here on the next iteration — nothing displays after
@@ -649,7 +651,7 @@ bool SDLCALL App::ResizeEventWatch(void* userdata, SDL_Event* event) {
         app->m_running && app->m_window &&
         event->window.windowID == SDL_GetWindowID(app->m_window) &&
         SDL_IsMainThread()) {
-        app->RenderFrame();
+        app->RenderFrame(true);
     }
     return true;
 }
@@ -1580,33 +1582,82 @@ void App::Render() {
     // Use the full viewport Size (not WorkSize) so that the menu bar appearing
     // or disappearing — e.g. on app start before it renders, or on auto-hide
     // toggle — doesn't cause floating panels to creep over time.
+    //
+    // During a live border drag, reposition from an anchor snapshot taken at
+    // drag start instead of chaining frame-to-frame: ImGui truncates window
+    // positions to whole pixels every Begin, so per-frame sub-pixel movement
+    // is discarded and a slow (1–2 px/frame) drag would never move the panels.
+    // Session bounds come from the RenderFrame call site — only
+    // ResizeEventWatch renders while Run() is blocked in the OS modal drag
+    // loop, so a watch-driven frame starts the session and Run's next frame
+    // (drag released) ends it. No stability heuristics: arbitrarily slow
+    // drags stay in one session.
     {
         ImGuiViewport* mvp = ImGui::GetMainViewport();
         ImVec2 newSize = mvp->Size;
-        if (!m_waitingForFullscreenExit && layoutCond != ImGuiCond_Always &&
+        const bool canReposition =
+            !m_waitingForFullscreenExit && layoutCond != ImGuiCond_Always &&
             newSize.x > 0 && newSize.y > 0 &&
-            m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0 &&
-            (newSize.x != m_prevViewportSize.x || newSize.y != m_prevViewportSize.y)) {
+            m_prevViewportSize.x > 0 && m_prevViewportSize.y > 0;
 
-            const char* floatingWindows[] = { "Timeline", "Marks", "Help" };
+        if (m_liveResizeFrame && canReposition) {
+            if (!m_resizeAnchorActive) {
+                // Run's last frame laid the windows out at m_prevViewportSize,
+                // so the current positions pair with it as the baseline.
+                m_resizeAnchorActive = true;
+                m_resizeAnchorViewport = m_prevViewportSize;
+                auto snap = [](FloatingWindowSnap& s, const char* name) {
+                    ImGuiWindow* w = ImGui::FindWindowByName(name);
+                    if (!w || w->DockId != 0) { s.valid = false; return; }
+                    s.pos = w->Pos;
+                    s.size = w->SizeFull;
+                    s.valid = true;
+                };
+                snap(m_anchorTimeline, "Timeline");
+                snap(m_anchorSegments, "Marks");
+                snap(m_anchorHelp,     "Help");
+            }
+        } else {
+            m_resizeAnchorActive = false;
+        }
+
+        const ImVec2 baseViewport =
+            m_resizeAnchorActive ? m_resizeAnchorViewport : m_prevViewportSize;
+        if (canReposition &&
+            (newSize.x != baseViewport.x || newSize.y != baseViewport.y)) {
+
+            const struct { const char* name; const FloatingWindowSnap* anchor; }
+                floatingWindows[] = {
+                    { "Timeline", &m_anchorTimeline },
+                    { "Marks",    &m_anchorSegments },
+                    { "Help",     &m_anchorHelp },
+                };
             float margin = 20.0f;
-            for (const char* name : floatingWindows) {
-                ImGuiWindow* win = ImGui::FindWindowByName(name);
+            for (const auto& fw : floatingWindows) {
+                ImGuiWindow* win = ImGui::FindWindowByName(fw.name);
                 if (!win || win->DockId != 0) continue;
+
+                ImVec2 basePos = win->Pos;
+                ImVec2 baseSize = win->SizeFull;
+                if (m_resizeAnchorActive) {
+                    if (!fw.anchor->valid) continue;
+                    basePos = fw.anchor->pos;
+                    baseSize = fw.anchor->size;
+                }
 
                 // Timeline scales its width with the viewport — the wider it
                 // is the more scrubbing resolution you get. Height stays. This
                 // is the sole owner of the Timeline's width (SetUiScale leaves
                 // it alone), so DPI/UI-scale grows track it here too.
-                bool scaleWidth = (strcmp(name, "Timeline") == 0);
+                bool scaleWidth = (strcmp(fw.name, "Timeline") == 0);
                 float newW = scaleWidth
-                    ? win->SizeFull.x * (newSize.x / m_prevViewportSize.x)
-                    : win->SizeFull.x;
-                float newH = win->SizeFull.y;
+                    ? baseSize.x * (newSize.x / baseViewport.x)
+                    : baseSize.x;
+                float newH = baseSize.y;
 
-                // Compute center as ratio of old viewport
-                float cx = (win->Pos.x + win->SizeFull.x * 0.5f - mvp->Pos.x) / m_prevViewportSize.x;
-                float cy = (win->Pos.y + win->SizeFull.y * 0.5f - mvp->Pos.y) / m_prevViewportSize.y;
+                // Compute center as ratio of the base viewport
+                float cx = (basePos.x + baseSize.x * 0.5f - mvp->Pos.x) / baseViewport.x;
+                float cy = (basePos.y + baseSize.y * 0.5f - mvp->Pos.y) / baseViewport.y;
 
                 // Apply ratio to new viewport to get new center, then top-left
                 float newX = mvp->Pos.x + cx * newSize.x - newW * 0.5f;
