@@ -89,6 +89,11 @@ private:
     // mouse movement, mark/seek shortcuts, window-toggle shortcuts, etc.
     void BumpUIActivity();
 
+    // Manual Show/Hide UI toggle (H key, View menu) — works with auto-hide
+    // UI too: showing restarts the idle timer, hiding lasts until the next
+    // mouse activity.
+    void ToggleUIHidden();
+
     // Toggle playback and trigger the center-of-video Play/Pause flash —
     // call this from any user-initiated toggle (Space, video click, the
     // transport-bar Play button) so the flash fires consistently.

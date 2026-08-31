@@ -1482,6 +1482,9 @@ void App::ProcessEvents() {
                 } else if (m_uiHidden) {
                     m_uiHidden = false;
                     m_uiAlpha = 1.0f;
+                    // Restart the idle timer so auto-hide doesn't re-hide
+                    // the UI on the same frame it was shown.
+                    BumpUIActivity();
                 }
                 break;
             case SDLK_H:
@@ -1489,10 +1492,7 @@ void App::ProcessEvents() {
                     m_showHelpPanel = !m_showHelpPanel;
                     BumpUIActivity();
                 } else if (noMod) {
-                    if (!m_autoHideUI) {
-                        m_uiHidden = !m_uiHidden;
-                        m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
-                    }
+                    ToggleUIHidden();
                 }
                 break;
             case SDLK_Q:
@@ -1916,10 +1916,8 @@ void App::Render() {
                 m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
                 m_autoHideUI = !m_autoHideUI;
-            if (ImGui::MenuItem("Show/Hide UI", "H", false, !m_autoHideUI)) {
-                m_uiHidden = !m_uiHidden;
-                m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
-            }
+            if (ImGui::MenuItem("Show/Hide UI", "H"))
+                ToggleUIHidden();
             ImGui::SeparatorText("Reset");
             if (ImGui::MenuItem("Reset Layout")) {
                 m_ui.ResetLayout();
@@ -3961,6 +3959,15 @@ void App::Render() {
 void App::BumpUIActivity() {
     m_lastUIActivityNS = SDL_GetTicksNS();
     if (m_autoHideUI) m_uiHidden = false;
+}
+
+void App::ToggleUIHidden() {
+    m_uiHidden = !m_uiHidden;
+    m_uiAlpha = m_uiHidden ? 0.0f : 1.0f;
+    // Restart the idle timer on show so auto-hide doesn't re-hide the UI on
+    // the same frame. With auto-hide on, a manual hide lasts until the next
+    // mouse activity — the same contract as an idle-timeout hide.
+    if (!m_uiHidden) BumpUIActivity();
 }
 
 void App::TogglePlayPauseWithFlash() {
