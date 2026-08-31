@@ -34,7 +34,11 @@ public:
 
 private:
     void ProcessEvents();
+    // One frame iteration: fetch the due video frame + draw the UI. Called
+    // per Run() loop and from ResizeEventWatch during a live resize.
+    void RenderFrame();
     void Render();
+    static bool SDLCALL ResizeEventWatch(void* userdata, SDL_Event* event);
 
     // --- Media: audio / subtitle track selection ---
     // Switch the active audio track and flash a status overlay. Used by both

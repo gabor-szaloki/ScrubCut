@@ -471,7 +471,7 @@ bool App::Init() {
     UpdateHDROutput();
 
     // The GPU HDR->SDR tone-mapper (m_tonemap) is created lazily when the
-    // first HDR video opens — see fetchFrame in Run(). The Exporter's
+    // first HDR video opens — see fetchFrame in RenderFrame(). The Exporter's
     // background thread runs the same tone-map pass for HDR re-encode exports
     // (GIF/PNG) on its own command buffers of this device.
     m_exporter.SetTonemapDevice(m_gpuDevice);
@@ -483,6 +483,9 @@ bool App::Init() {
 
     // Apply the initial UI scale (1.0 unless DPI scaling is enabled on Windows).
     m_ui.SetUiScale(GetEffectiveUiScale());
+
+    // Redraw from inside the OS modal resize loop — see ResizeEventWatch.
+    SDL_AddEventWatch(&App::ResizeEventWatch, this);
 
     m_startupInitDoneNS = SDL_GetTicksNS();
     LOG_INFO("ScrubCut initialized");
@@ -548,68 +551,50 @@ void App::Run() {
             std::filesystem::remove(GetAppDataDir() / "layout.ini");
         }
 
-        // Fetch + upload the next due video frame before Render samples the
-        // texture. Frames arriving later (e.g. a seek landing mid-Render)
-        // are picked up here on the next iteration — nothing displays after
-        // Render, so a post-Render fetch would buy no latency.
-        auto fetchFrame = [&]() {
-            PROFILE_SCOPE_N("FetchFrame");
-            const uint8_t* rgba = nullptr;
-            int w = 0, h = 0;
-            if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
-                VideoColorMode mode = m_player.GetVideoColorMode();
-                if (w != m_videoWidth || h != m_videoHeight || mode != m_videoColorMode) {
-                    const bool modeChanged = (mode != m_videoColorMode);
-                    m_videoWidth = w;
-                    m_videoHeight = h;
-                    m_videoColorMode = mode;
-                    CreateVideoTexture(w, h);
-                    // HDR output is content-gated: (dis)engage as the opened
-                    // video's color mode becomes known.
-                    if (modeChanged)
-                        UpdateHDROutput();
-                }
-                UploadFrame(rgba, w, h);
-                // Lazily create the tone-map pipeline the first time an HDR
-                // video shows up. Non-fatal on failure (don't retry per frame)
-                // — SDR playback is unaffected; only HDR videos would then
-                // display incorrectly.
-                if (m_videoColorMode != VideoColorMode::SDR && !m_tonemap.IsReady() &&
-                    !m_tonemapInitFailed && !m_tonemap.Init(m_gpuDevice)) {
-                    m_tonemapInitFailed = true;
-                    LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
-                }
-                // HDR frames carry their PQ/HLG transfer in a 10-bit texture;
-                // map them before ImGui composites them: tone-mapped to SDR on
-                // SDR output, passthrough at native brightness on HDR output.
-                if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady()) {
-                    m_displayTexture = m_tonemap.Process(m_videoTexture, w, h,
-                                                         m_videoColorMode,
-                                                         m_player.GetVideoColorPrimaries(),
-                                                         m_tonemapper,
-                                                         m_swapchainHDR, m_hdrHeadroom,
-                                                         m_sdrWhite);
-                    m_lastProcessedTonemapper = m_tonemapper;
-                    m_lastProcessedHDROut = m_swapchainHDR;
-                    m_lastProcessedHeadroom = m_hdrHeadroom;
-                    m_lastProcessedSDRWhite = m_sdrWhite;
-                } else {
-                    m_displayTexture = m_videoTexture;
-                }
-            }
-        };
+        RenderFrame();
 
-        // Re-run the HDR tone-map on the held frame when the operator changes
-        // while paused — no new frame arrives then, so fetchFrame() won't.
-        auto refreshTonemap = [&]() {
-            if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady() &&
-                m_videoTexture &&
-                (m_tonemapper != m_lastProcessedTonemapper ||
-                 m_swapchainHDR != m_lastProcessedHDROut ||
-                 m_hdrHeadroom != m_lastProcessedHeadroom ||
-                 m_sdrWhite != m_lastProcessedSDRWhite)) {
-                m_displayTexture = m_tonemap.Process(m_videoTexture, m_videoWidth,
-                                                     m_videoHeight, m_videoColorMode,
+        PROFILE_FRAME();
+    }
+}
+
+void App::RenderFrame() {
+    // Fetch + upload the next due video frame before Render samples the
+    // texture. Frames arriving later (e.g. a seek landing mid-Render)
+    // are picked up here on the next iteration — nothing displays after
+    // Render, so a post-Render fetch would buy no latency.
+    auto fetchFrame = [&]() {
+        PROFILE_SCOPE_N("FetchFrame");
+        const uint8_t* rgba = nullptr;
+        int w = 0, h = 0;
+        if (m_player.TryGetVideoFrame(&rgba, &w, &h)) {
+            VideoColorMode mode = m_player.GetVideoColorMode();
+            if (w != m_videoWidth || h != m_videoHeight || mode != m_videoColorMode) {
+                const bool modeChanged = (mode != m_videoColorMode);
+                m_videoWidth = w;
+                m_videoHeight = h;
+                m_videoColorMode = mode;
+                CreateVideoTexture(w, h);
+                // HDR output is content-gated: (dis)engage as the opened
+                // video's color mode becomes known.
+                if (modeChanged)
+                    UpdateHDROutput();
+            }
+            UploadFrame(rgba, w, h);
+            // Lazily create the tone-map pipeline the first time an HDR
+            // video shows up. Non-fatal on failure (don't retry per frame)
+            // — SDR playback is unaffected; only HDR videos would then
+            // display incorrectly.
+            if (m_videoColorMode != VideoColorMode::SDR && !m_tonemap.IsReady() &&
+                !m_tonemapInitFailed && !m_tonemap.Init(m_gpuDevice)) {
+                m_tonemapInitFailed = true;
+                LOG_ERROR("HDR tone-mapper unavailable; HDR videos may display incorrectly");
+            }
+            // HDR frames carry their PQ/HLG transfer in a 10-bit texture;
+            // map them before ImGui composites them: tone-mapped to SDR on
+            // SDR output, passthrough at native brightness on HDR output.
+            if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady()) {
+                m_displayTexture = m_tonemap.Process(m_videoTexture, w, h,
+                                                     m_videoColorMode,
                                                      m_player.GetVideoColorPrimaries(),
                                                      m_tonemapper,
                                                      m_swapchainHDR, m_hdrHeadroom,
@@ -618,19 +603,60 @@ void App::Run() {
                 m_lastProcessedHDROut = m_swapchainHDR;
                 m_lastProcessedHeadroom = m_hdrHeadroom;
                 m_lastProcessedSDRWhite = m_sdrWhite;
+            } else {
+                m_displayTexture = m_videoTexture;
             }
-        };
+        }
+    };
 
-        fetchFrame();
-        refreshTonemap();
+    // Re-run the HDR tone-map on the held frame when the operator changes
+    // while paused — no new frame arrives then, so fetchFrame() won't.
+    auto refreshTonemap = [&]() {
+        if (m_videoColorMode != VideoColorMode::SDR && m_tonemap.IsReady() &&
+            m_videoTexture &&
+            (m_tonemapper != m_lastProcessedTonemapper ||
+             m_swapchainHDR != m_lastProcessedHDROut ||
+             m_hdrHeadroom != m_lastProcessedHeadroom ||
+             m_sdrWhite != m_lastProcessedSDRWhite)) {
+            m_displayTexture = m_tonemap.Process(m_videoTexture, m_videoWidth,
+                                                 m_videoHeight, m_videoColorMode,
+                                                 m_player.GetVideoColorPrimaries(),
+                                                 m_tonemapper,
+                                                 m_swapchainHDR, m_hdrHeadroom,
+                                                 m_sdrWhite);
+            m_lastProcessedTonemapper = m_tonemapper;
+            m_lastProcessedHDROut = m_swapchainHDR;
+            m_lastProcessedHeadroom = m_hdrHeadroom;
+            m_lastProcessedSDRWhite = m_sdrWhite;
+        }
+    };
 
-        Render();
+    fetchFrame();
+    refreshTonemap();
 
-        PROFILE_FRAME();
+    Render();
+}
+
+// Live-resize redraw. A window-edge drag blocks Run() in a modal loop inside
+// SDL_PollEvent; SDL ticks a ~60 FPS timer there that sends EXPOSED, which
+// event watches receive synchronously — so render from here. EXPOSED only:
+// RESIZED fires mid-frame-set, before the Metal drawable has the new size,
+// and a frame drawn then aborts on an out-of-bounds scissor.
+bool SDLCALL App::ResizeEventWatch(void* userdata, SDL_Event* event) {
+    App* app = static_cast<App*>(userdata);
+    if (event->type == SDL_EVENT_WINDOW_EXPOSED &&
+        event->window.data1 == 1 &&  // live-resize expose tick, per SDL docs
+        app->m_running && app->m_window &&
+        event->window.windowID == SDL_GetWindowID(app->m_window) &&
+        SDL_IsMainThread()) {
+        app->RenderFrame();
     }
+    return true;
 }
 
 void App::Shutdown() {
+    SDL_RemoveEventWatch(&App::ResizeEventWatch, this);
+
     // If closing while in fullscreen, revert floating-panel ImGui positions
     // to their pre-fullscreen snapshots. Otherwise ImGui would save the
     // fullscreen-repositioned coordinates to imgui.ini, and on the next
