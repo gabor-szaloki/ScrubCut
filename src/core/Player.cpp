@@ -299,6 +299,7 @@ void Player::Close() {
     m_playing = false;
     m_eof = false;
     m_lastDisplayedPts = AV_NOPTS_VALUE;
+    m_eofConfirmedLastPts = AV_NOPTS_VALUE;
     ClearStagedFrame();
     m_displayedFrame.reset();
     m_dropFramesBeforeSec.store(kNeverDrop, std::memory_order_relaxed);
@@ -705,6 +706,13 @@ void Player::StepFrame(int direction) {
         int64_t frameTicks = static_cast<int64_t>(GetFrameDuration() / av_q2d(tb));
         int64_t halfFrame = frameTicks / 2;
 
+        // Already probed past this frame and found nothing (see
+        // m_eofConfirmedLastPts) — nothing to do, instantly.
+        if (m_eof.load(std::memory_order_relaxed) &&
+            m_lastDisplayedPts != AV_NOPTS_VALUE &&
+            m_lastDisplayedPts == m_eofConfirmedLastPts)
+            return;
+
         // Forward: check if next frame is already in cache.
         if (m_lastDisplayedPts != AV_NOPTS_VALUE) {
             int64_t nextPts = m_lastDisplayedPts + frameTicks;
@@ -760,12 +768,40 @@ void Player::StepFrame(int direction) {
         // Frame queue empty. Tick the pipeline once: unpark briefly so the
         // workers can produce the next frame, then re-park. If what arrives
         // is gapped (the decoder was ahead and the queue happened to be
-        // drained), resync and tick once more.
-        if (TickPipelineOneFrame(500) && queueHeadGapped()) {
+        // drained), resync and tick once more. At EOF the workers have no
+        // decode to do (at most the EOF drain hands over already-decoded
+        // frames), so don't hold the main thread on the full timeout.
+        bool eof = m_eof.load(std::memory_order_relaxed);
+        if (TickPipelineOneFrame(eof ? 100 : 500) && queueHeadGapped()) {
             resyncToDisplayed();
             TickPipelineOneFrame(500);
         }
-        stageFromQueue();
+        if (stageFromQueue()) return;
+
+        // The pipeline produced nothing. At EOF that leaves two cases: the
+        // decoder's buffered tail frames were discarded by an earlier partial
+        // EOF drain (stepping into the file's end goes permanently blind one
+        // frame early without this), or the displayed frame really is the
+        // file's last. A sync decode aimed just past the displayed frame
+        // settles it — it lands on the next frame when one exists, and
+        // re-lands on the current frame at the true end.
+        if (m_eof.load(std::memory_order_relaxed) &&
+            m_lastDisplayedPts != AV_NOPTS_VALUE) {
+            int64_t prevLast = m_lastDisplayedPts;
+            double prevClock = m_clock.GetTime();
+            FlushPipelineState();
+            SyncSeekAndDecode((prevLast + 1) * av_q2d(tb), /*clearCache=*/false);
+            m_needsResync = false;
+            if (m_lastDisplayedPts == prevLast) {
+                // Confirmed at the last frame. Keep the clock where it was —
+                // a seek/playback that ended here parked it at the duration,
+                // and Play()'s restart-from-beginning check relies on that.
+                m_clock.SetTime(prevClock);
+                m_eofConfirmedLastPts = prevLast;
+            } else {
+                PostCacheWindowRequest(m_lastDisplayedPts);
+            }
+        }
     } else {
         // Backward: check frame cache first (instant). Accept only the
         // immediate previous frame — FindBefore returns the nearest earlier
@@ -1169,10 +1205,15 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
         m_pipelineFlushGen.fetch_add(1, std::memory_order_relaxed);
         m_eof = false;
 
-        int maxPackets = 500;
+        // Budget counts VIDEO packets only — audio/other streams interleaved
+        // in the read must not eat it. It has to outlast a full keyframe
+        // interval, or a long-GOP file's back-step lands wherever the budget
+        // ran out (potentially seconds before maxPts) instead of on the
+        // immediate predecessor.
+        int maxPackets = 5000;
         int framesAtOrAfterMax = 0;
 
-        while (maxPackets-- > 0 && framesAtOrAfterMax < kReorderDepth) {
+        while (maxPackets > 0 && framesAtOrAfterMax < kReorderDepth) {
             int ret = m_demuxer.ReadPacket(pkt);
             if (ret == AVERROR_EOF) { m_eof = true; break; }
             if (ret < 0) break;
@@ -1181,6 +1222,7 @@ bool Player::SyncSeekAndDecodeBefore(double seekSec, int64_t maxPts) {
                 av_packet_unref(pkt);
                 continue;
             }
+            maxPackets--;
             ret = m_videoDecoder.SendPacket(pkt);
             av_packet_unref(pkt);
             if (ret < 0) continue;
@@ -1283,7 +1325,12 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         AVFrame* frame = av_frame_alloc();
         int kfsPast = 0;
         bool stop = false, eofHit = false;
-        int maxPackets = 2000;
+        // VIDEO packets only (audio interleave must not eat the budget), and
+        // enough of them to cross the widest realistic keyframe interval —
+        // a rebuild that stops short of centerPts can never satisfy the
+        // contains-the-playhead check, so the policy loop would rebuild the
+        // same too-short window forever.
+        int maxPackets = 5000;
 
         auto handleFrame = [&](AVFrame* f) -> bool {
             if (f->pts != AV_NOPTS_VALUE) {
@@ -1303,7 +1350,7 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
             return true;
         };
 
-        while (!stop && maxPackets-- > 0) {
+        while (!stop && maxPackets > 0) {
             if (shouldAbort && shouldAbort()) break;
             int ret = m_cacheDemuxer.ReadPacket(pkt);
             if (ret == AVERROR_EOF) { eofHit = true; break; }
@@ -1312,6 +1359,7 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
                 av_packet_unref(pkt);
                 continue;
             }
+            maxPackets--;
             m_cacheDecoder.SendPacket(pkt);
             av_packet_unref(pkt);
             while (true) {
@@ -1360,6 +1408,13 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         decodeChunk(static_cast<double>(kf) * tbSec,
                     centerPts - (kMaxCacheFrames + 8) * frameTicks, INT64_MAX,
                     centerPts, kCacheGopsAhead + 1);
+        // A chunk that couldn't reach the playhead (aborted, or packet budget
+        // exhausted inside an extreme keyframe interval) can never satisfy
+        // the contains-the-playhead check above — looping would clear and
+        // rebuild the same too-short window forever. Stop; the next rest
+        // point posts a fresh request.
+        int64_t endPts = m_frameCache.EndPts();
+        if (endPts == AV_NOPTS_VALUE || endPts < centerPts) return false;
         return true;  // re-evaluate the policy on the next iteration
     }
 

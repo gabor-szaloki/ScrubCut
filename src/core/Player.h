@@ -296,6 +296,13 @@ private:
 
     int64_t m_lastDisplayedPts = AV_NOPTS_VALUE;
 
+    // The file's last video frame, learned when a forward step at EOF probed
+    // for a next frame and found none. While m_eof holds and the displayed
+    // frame is this one, further forward steps return immediately — without
+    // this, every key-repeat press would re-pay the full probe (a pipeline
+    // tick + a sync decode), freezing the main thread for its duration.
+    int64_t m_eofConfirmedLastPts = AV_NOPTS_VALUE;
+
     // Pipeline park state. The DemuxThread/VideoDecodeThread/AudioDecodeThread
     // workers run continuously between Open() and Close(); pause is
     // implemented by parking them at the top of their loop instead of
