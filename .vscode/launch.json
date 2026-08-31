@@ -66,22 +66,6 @@
                 "program": "${workspaceFolder}/build/release/bin/ScrubCut",
                 "MIMode": "lldb"
             }
-        },
-        {
-            "name": "Run ScrubCut Release -trace",
-            "type": "cppvsdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/release/bin/ScrubCut.exe",
-            "args": ["-trace"],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "console": "integratedTerminal",
-            "osx": {
-                "type": "cppdbg",
-                "program": "${workspaceFolder}/build/release/bin/ScrubCut",
-                "MIMode": "lldb"
-            }
         }
     ]
 }
