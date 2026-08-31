@@ -32,6 +32,8 @@
 #define NOIME
 #include <windows.h>
 #include <shellapi.h>
+#include <objbase.h>  // CoInitializeEx (SHOpenFolderAndSelectItems needs COM)
+#include <shlobj.h>   // SHOpenFolderAndSelectItems / ILCreateFromPathW
 #include <dxgi1_6.h>
 // dxgi pulls in <rpcndr.h> (via <unknwn.h>), whose `small` macro collides
 // with parameter names in this file.
@@ -45,6 +47,10 @@ extern "C" HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute,
 #ifndef DWMWA_TRANSITIONS_FORCEDISABLED
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
 #endif
+#endif
+
+#ifdef __APPLE__
+#include "util/MacReveal.h"
 #endif
 
 struct PlatformKeys {
@@ -110,6 +116,47 @@ static void RevealInShell(const std::filesystem::path& file) {
     std::system(cmd.c_str());
 #else
     OpenFolderInShell(file.parent_path());
+#endif
+}
+
+// Open the system file browser with every file in `files` selected inside
+// their shared parent folder `dir`. Falls back to just opening the folder
+// where multi-selection isn't supported (Linux) or when it fails.
+static void RevealFilesInShell(const std::filesystem::path& dir,
+                               const std::vector<std::filesystem::path>& files) {
+#if defined(_WIN32)
+    // Explorer's `/select,` argument takes a single file only —
+    // SHOpenFolderAndSelectItems is the API for multi-selection. It requires
+    // COM; SDL may already have initialized it with a different threading
+    // model, so tolerate RPC_E_CHANGED_MODE and only pair CoUninitialize with
+    // our own successful init.
+    std::vector<PIDLIST_ABSOLUTE> items;
+    for (const auto& f : files) {
+        if (PIDLIST_ABSOLUTE p = ILCreateFromPathW(f.wstring().c_str()))
+            items.push_back(p);
+    }
+    bool ok = false;
+    if (!items.empty()) {
+        if (PIDLIST_ABSOLUTE dirPidl = ILCreateFromPathW(dir.wstring().c_str())) {
+            HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+            ok = SUCCEEDED(SHOpenFolderAndSelectItems(
+                dirPidl, static_cast<UINT>(items.size()),
+                reinterpret_cast<PCUITEMID_CHILD_ARRAY>(items.data()), 0));
+            if (SUCCEEDED(com)) CoUninitialize();
+            ILFree(dirPidl);
+        }
+    }
+    for (PIDLIST_ABSOLUTE p : items) ILFree(p);
+    if (!ok) OpenFolderInShell(dir);
+#elif defined(__APPLE__)
+    std::vector<std::string> paths;
+    paths.reserve(files.size());
+    for (const auto& f : files) paths.push_back(f.string());
+    if (paths.empty() || !MacRevealFilesInFinder(paths))
+        OpenFolderInShell(dir);
+#else
+    (void)files;
+    OpenFolderInShell(dir);
 #endif
 }
 
@@ -3711,26 +3758,23 @@ void App::Render() {
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Export complete!");
             ImGui::Spacing();
 
-            std::filesystem::path basePath(m_pendingExport.outputPath);
-            std::filesystem::path dirPath = basePath.parent_path();
+            std::filesystem::path dirPath =
+                std::filesystem::path(m_pendingExport.outputPath).parent_path();
             std::string dir = dirPath.string();
-            std::string stem = basePath.filename().string();
+            // The paths the exporter actually wrote — covers fallback naming
+            // (unnamed marks, MP4-remux retry) the settings alone can't predict.
+            const std::vector<std::string> outputs = m_exporter.GetOutputPaths();
             ImGui::Text("Output folder:");
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  %s", dir.c_str());
             ImGui::SameLine();
             if (ImGui::SmallButton("Open")) {
-                OpenFolderInShell(dirPath);
+                RevealFilesInShell(dirPath,
+                                   {outputs.begin(), outputs.end()});
             }
             ImGui::Spacing();
             ImGui::Text("Exported files:");
-            for (const auto& seg : m_pendingExport.segments) {
-                std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                ImGui::BulletText("%s%s%s%s", stem.c_str(), m_pendingExport.delimiter.c_str(),
-                                  seg.name.c_str(), ext.c_str());
-            }
-            for (const auto& fm : m_pendingExport.frames) {
-                ImGui::BulletText("%s%s%s.png", stem.c_str(), m_pendingExport.delimiter.c_str(),
-                                  fm.name.c_str());
+            for (const auto& out : outputs) {
+                ImGui::BulletText("%s", std::filesystem::path(out).filename().string().c_str());
             }
             ImGui::Spacing();
 

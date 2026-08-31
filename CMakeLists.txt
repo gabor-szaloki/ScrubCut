@@ -43,6 +43,11 @@ find_package(Tracy CONFIG REQUIRED)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
+if(APPLE)
+    # Objective-C++ shims for Cocoa-only APIs (e.g. util/MacReveal.mm).
+    file(GLOB_RECURSE MACOS_SOURCES CONFIGURE_DEPENDS src/*.mm)
+    list(APPEND SOURCES ${MACOS_SOURCES})
+endif()
 
 # --- App icon + Win32 version resource ---
 # The configured .rc carries both the icon and VS_VERSION_INFO (FileDescription
@@ -213,17 +218,18 @@ target_link_libraries(ScrubCut PRIVATE
 )
 
 # Link ws2_32 and friends on Windows (needed by FFmpeg), dxgi for the native
-# HDR-state query in App.cpp
+# HDR-state query in App.cpp, shell32/ole32 for the multi-select reveal
+# (SHOpenFolderAndSelectItems) in App.cpp
 if(WIN32)
-    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi shell32 ole32)
 endif()
 
 # FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the
 # harmless duplicates. CoreFoundation backs the NFC path normalization in
-# util/UnicodeNormalize.h.
+# util/UnicodeNormalize.h; AppKit backs the Finder reveal in util/MacReveal.mm.
 if(APPLE)
     target_link_options(ScrubCut PRIVATE LINKER:-no_warn_duplicate_libraries)
-    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation")
+    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation" "-framework AppKit")
 endif()
 
 # Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are

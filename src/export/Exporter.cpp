@@ -40,6 +40,10 @@ void Exporter::Start(const std::string& inputPath, const ExportSettings& setting
     m_cancel = false;
     m_inputPath = inputPath;
     m_settings = settings;
+    {
+        std::lock_guard<std::mutex> lock(m_outputPathsMutex);
+        m_outputPaths.clear();
+    }
     m_progress.totalItems = static_cast<int>(settings.segments.size() + settings.frames.size());
     m_progress.running = true;
 
@@ -78,6 +82,10 @@ void Exporter::ExportThread() {
     };
 
     int itemsDone = 0;
+    auto recordOutput = [&](const std::string& outPath) {
+        std::lock_guard<std::mutex> lock(m_outputPathsMutex);
+        m_outputPaths.push_back(outPath);
+    };
     std::string srcExt = std::filesystem::path(m_inputPath).extension().string();
 
     // Matroska (.mkv/.webm) doesn't support edit lists, so stream-copy
@@ -102,17 +110,18 @@ void Exporter::ExportThread() {
         const auto& seg = m_settings.segments[i];
 
         bool ok = false;
+        std::string outPath;
         if (srcIsGif) {
             // GIF source: output is always GIF at source W/FPS, regardless
             // of seg.mode (the UI locks the toggle, but old segments may
             // still carry mode==GIF; treat them as SourceFormat anyway).
-            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
+            outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
             LOG_INFO("Exporting segment %d/%d (GIF, source params) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
             // 0/0.0 = "match source W/FPS" — see ExportSegmentGIF.
             ok = ExportSegmentGIF(m_inputPath, seg, outPath, 0, 0.0);
         } else if (seg.mode == ExportMode::SourceFormat) {
-            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, sourceFormatExt);
+            outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, sourceFormatExt);
             LOG_INFO("Exporting segment %d/%d (stream copy) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentStreamCopy(m_inputPath, seg, outPath);
@@ -128,7 +137,7 @@ void Exporter::ExportThread() {
                 ok = ExportSegmentStreamCopy(m_inputPath, seg, outPath);
             }
         } else {
-            std::string outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
+            outPath = BuildOutputPath(m_settings.outputPath, seg.name, i, ".gif");
             LOG_INFO("Exporting segment %d/%d (GIF) -> %s",
                      itemsDone + 1, totalItems, outPath.c_str());
             ok = ExportSegmentGIF(m_inputPath, seg, outPath,
@@ -139,6 +148,7 @@ void Exporter::ExportThread() {
             finish();
             return;
         }
+        if (ok) recordOutput(outPath);
         itemsDone++;
         m_progress.fraction = static_cast<float>(itemsDone) / static_cast<float>(totalItems);
     }
@@ -156,6 +166,7 @@ void Exporter::ExportThread() {
             finish();
             return;
         }
+        if (ok) recordOutput(outPath);
         itemsDone++;
         m_progress.fraction = static_cast<float>(itemsDone) / static_cast<float>(totalItems);
     }

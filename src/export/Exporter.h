@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 class Exporter {
 public:
@@ -67,6 +68,15 @@ public:
     const Progress& GetProgress() const { return m_progress; }
     bool IsRunning() const { return m_progress.running; }
 
+    // Full paths of the files written so far by the current/last export, in
+    // export order. Authoritative — includes fallback naming (unnamed marks,
+    // MP4-remux retry) the UI's own reconstruction wouldn't know about.
+    // Returns a guarded copy, safe to call from the UI thread while exporting.
+    std::vector<std::string> GetOutputPaths() const {
+        std::lock_guard<std::mutex> lock(m_outputPathsMutex);
+        return m_outputPaths;
+    }
+
 private:
     void ExportThread();
 
@@ -95,6 +105,9 @@ private:
     std::string m_inputPath;
     ExportSettings m_settings;
     std::atomic<bool> m_cancel{false};
+
+    mutable std::mutex m_outputPathsMutex;
+    std::vector<std::string> m_outputPaths;
 
     // Shared GPU device for HDR tone-mapping on the export thread (set by App).
     SDL_GPUDevice* m_gpuDevice = nullptr;
