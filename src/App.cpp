@@ -1704,13 +1704,16 @@ void App::Render() {
         }
     }
 
-    // Keep UI visible while hovering any panel or menu (except the Viewport)
+    // Keep UI visible while hovering any panel or menu (except the Viewport),
+    // or while any widget is active — a focused text field (segment name,
+    // export dialog) or a held slider/button is ongoing interaction even
+    // with the mouse perfectly still, so typing must not fade the UI out.
     bool hoveringUI = false;
     if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
         ImGuiWindow* hovered = ImGui::GetCurrentContext()->HoveredWindow;
         hoveringUI = hovered && strcmp(hovered->Name, "Viewport") != 0;
     }
-    if (hoveringUI || ImGui::IsAnyItemHovered())
+    if (hoveringUI || ImGui::IsAnyItemHovered() || ImGui::IsAnyItemActive())
         BumpUIActivity();
 
     // Auto-hide UI after 5 seconds of no mouse activity (with 0.3s fade).
