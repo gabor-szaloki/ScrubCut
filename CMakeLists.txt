@@ -226,19 +226,20 @@ target_link_libraries(ScrubCut PRIVATE
 )
 
 # Link ws2_32 and friends on Windows (needed by FFmpeg), dxgi for the native
-# HDR-state query in App.cpp, winhttp for the update check
+# HDR-state query in App.cpp, winhttp for the update check, shell32/ole32 for
+# the multi-select file reveal
 if(WIN32)
-    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi winhttp)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi winhttp shell32 ole32)
 endif()
 
 # FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the
 # harmless duplicates. Objective-C(++) sources build with ARC. CoreFoundation
 # backs the NFC path normalization in util/UnicodeNormalize.h, Foundation the
-# Objective-C sources.
+# Objective-C sources, AppKit the Finder reveal.
 if(APPLE)
     target_link_options(ScrubCut PRIVATE LINKER:-no_warn_duplicate_libraries)
     target_compile_options(ScrubCut PRIVATE $<$<COMPILE_LANGUAGE:OBJC,OBJCXX>:-fobjc-arc>)
-    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation" "-framework Foundation")
+    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation" "-framework Foundation" "-framework AppKit")
 endif()
 
 # Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are
