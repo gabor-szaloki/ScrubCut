@@ -9,6 +9,7 @@
 #include "util/Types.h"
 #include "export/Exporter.h"
 #include "util/Settings.h"
+#include "util/UpdateChecker.h"
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
@@ -186,6 +187,8 @@ private:
     SegmentManager m_segments;
     Exporter m_exporter;
     WaveformExtractor m_waveform;
+    // GitHub release check: started at the end of Init(), polled in Run().
+    UpdateChecker m_updateChecker;
 
     // UI state — window visibility
     bool m_showTimeline = true;

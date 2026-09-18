@@ -58,14 +58,23 @@ inline void SetEnabled(bool enabled) {
     }
 }
 
-// Tear down the Tracy runtime at process exit, after all instrumented
-// threads have been joined. No PROFILE_* macro may run past this point.
+// Set when an instrumented thread is detached instead of joined (a worker
+// still blocked at quit). Tracy forbids a thread from outliving
+// ShutdownProfiler(), so Shutdown() then only stops emission and leaves the
+// runtime to the OS; only unsent trace data is lost.
+inline std::atomic<bool> g_abandonedThread{false};
+inline void AbandonInstrumentedThread() {
+    g_abandonedThread.store(true, std::memory_order_release);
+}
+
+// Tear down the Tracy runtime at process exit, once every instrumented
+// thread is joined or abandoned. No PROFILE_* macro may run past this point.
 inline void Shutdown() {
-    if (g_started.load(std::memory_order_acquire)) {
-        g_enabled.store(false, std::memory_order_relaxed);
-        tracy::ShutdownProfiler();
-        g_started.store(false, std::memory_order_release);
-    }
+    if (!g_started.load(std::memory_order_acquire)) return;
+    g_enabled.store(false, std::memory_order_relaxed);
+    if (g_abandonedThread.load(std::memory_order_acquire)) return;
+    tracy::ShutdownProfiler();
+    g_started.store(false, std::memory_order_release);
 }
 
 // True while a viewer/capture is connected. The IsEnabled gate keeps

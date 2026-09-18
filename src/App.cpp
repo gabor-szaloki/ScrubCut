@@ -491,6 +491,9 @@ bool App::Init() {
     LOG_INFO("ScrubCut initialized");
     m_running = true;
 
+    // Silent update check on a worker thread.
+    m_updateChecker.Start();
+
     // Open file passed on the command line (e.g. via file association on Windows)
     std::string fileArg = CommandLine::Get().GetFileArg();
     if (!fileArg.empty())
@@ -505,6 +508,7 @@ void App::Run() {
         ProcessEvents();
         m_player.PollSeekComplete();
         m_player.EmitProfilerPlots();
+        m_updateChecker.Poll();
 
         // While HDR output is active, poll the OS HDR state every frame so
         // the UI tracks the SDR-brightness slider live (cached DXGI reads,
@@ -704,6 +708,9 @@ void App::Shutdown() {
         m_prefSettings.Save();
     }
     SDL_ShowCursor();
+
+    // Join or abandon the update-check worker; must precede Profiler::Shutdown().
+    m_updateChecker.Stop();
 
     // Stop any in-flight export (joins its thread) before tearing down the GPU
     // resources it may still be using, then drain the GPU before releasing.
@@ -2110,6 +2117,63 @@ void App::Render() {
         if (ImGui::BeginMenu("Help")) {
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str())) {
                 m_showHelpPanel = !m_showHelpPanel;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Show on GitHub"))
+                SDL_OpenURL(UpdateChecker::kRepoUrl);
+            // Update status: text plus a right-aligned button (same layout as
+            // the Subtitle Delay row). Buttons keep the menu open, so the row
+            // updates in place.
+            {
+                using S = UpdateChecker::State;
+                const S state = m_updateChecker.GetState();
+                const char* label = "Check for updates";   // Idle
+                const char* button = "Check";
+                std::string available;
+                switch (state) {
+                case S::Checking:
+                    label = "Checking...";
+                    button = nullptr;
+                    break;
+                case S::UpToDate:
+                    label = "ScrubCut is up to date";
+                    break;
+                case S::UpdateAvailable:
+                    available = "Update available (v" + m_updateChecker.GetLatestVersion() + ")";
+                    label = available.c_str();
+                    button = "Download";
+                    break;
+                case S::Failed:
+                    label = "Update check failed";
+                    button = "Retry";
+                    break;
+                case S::Idle:
+                    break;
+                }
+                ImGui::AlignTextToFramePadding();
+                if (state == S::Checking)
+                    ImGui::TextDisabled("%s", label);
+                else
+                    ImGui::TextUnformatted(label);
+                // Diagnostic, so not gated by the tooltip preference.
+                if (state == S::Failed && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                    ImGui::SetTooltip("%s", m_updateChecker.GetError().c_str());
+                if (button) {
+                    ImGui::SameLine();
+                    const ImGuiStyle& st = ImGui::GetStyle();
+                    float btnW = ImGui::CalcTextSize(button).x + st.FramePadding.x * 2.0f;
+                    float avail = ImGui::GetContentRegionAvail().x;
+                    if (avail > btnW)
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - btnW));
+                    if (ImGui::Button(button)) {
+                        if (state == S::UpdateAvailable) {
+                            SDL_OpenURL(m_updateChecker.GetLatestUrl().c_str());
+                            ImGui::CloseCurrentPopup();   // like a MenuItem would
+                        } else {
+                            m_updateChecker.Start();
+                        }
+                    }
+                }
             }
             ImGui::Separator();
             // Same switch -profile arms at launch; records only while a

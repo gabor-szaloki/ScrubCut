@@ -4,6 +4,12 @@ project(ScrubCut VERSION 0.9.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Objective-C(++) sources (.m/.mm) are globbed from src/ like .cpp and built
+# with ARC (see the APPLE block after the target). OBJCXX inherits CXX_STANDARD.
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
+
 # Default install prefix per platform
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
     if(WIN32)
@@ -43,6 +49,13 @@ find_package(Tracy CONFIG REQUIRED)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
+if(APPLE)
+    file(GLOB_RECURSE OBJC_SOURCES CONFIGURE_DEPENDS
+        src/*.m
+        src/*.mm
+    )
+    list(APPEND SOURCES ${OBJC_SOURCES})
+endif()
 
 # --- App icon + Win32 version resource ---
 # The configured .rc carries both the icon and VS_VERSION_INFO (FileDescription
@@ -213,17 +226,19 @@ target_link_libraries(ScrubCut PRIVATE
 )
 
 # Link ws2_32 and friends on Windows (needed by FFmpeg), dxgi for the native
-# HDR-state query in App.cpp
+# HDR-state query in App.cpp, winhttp for the update check
 if(WIN32)
-    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi)
+    target_link_libraries(ScrubCut PRIVATE ws2_32 bcrypt mfplat mfuuid strmiids dwmapi dxgi winhttp)
 endif()
 
 # FFmpeg and SDL3 both pull in -lm/libz; Xcode 15+'s linker warns about the
-# harmless duplicates. CoreFoundation backs the NFC path normalization in
-# util/UnicodeNormalize.h.
+# harmless duplicates. Objective-C(++) sources build with ARC. CoreFoundation
+# backs the NFC path normalization in util/UnicodeNormalize.h, Foundation the
+# Objective-C sources.
 if(APPLE)
     target_link_options(ScrubCut PRIVATE LINKER:-no_warn_duplicate_libraries)
-    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation")
+    target_compile_options(ScrubCut PRIVATE $<$<COMPILE_LANGUAGE:OBJC,OBJCXX>:-fobjc-arc>)
+    target_link_libraries(ScrubCut PRIVATE "-framework CoreFoundation" "-framework Foundation")
 endif()
 
 # Subtitle fonts (Roboto + pan-CJK DroidSansFallback, both Apache-2.0) are
