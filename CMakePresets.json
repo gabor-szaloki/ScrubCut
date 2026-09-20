@@ -4,6 +4,9 @@
     {
       "name": "debug",
       "binaryDir": "${sourceDir}/build/debug",
+      "environment": {
+        "VCPKG_FORCE_DOWNLOADED_BINARIES": "1"
+      },
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Debug",
@@ -14,6 +17,9 @@
     {
       "name": "release",
       "binaryDir": "${sourceDir}/build/release",
+      "environment": {
+        "VCPKG_FORCE_DOWNLOADED_BINARIES": "1"
+      },
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
         "CMAKE_BUILD_TYPE": "Release",
