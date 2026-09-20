@@ -138,7 +138,7 @@ static void RevealFilesInShell(const std::filesystem::path& dir,
             HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
             ok = SUCCEEDED(SHOpenFolderAndSelectItems(
                 dirPidl, static_cast<UINT>(items.size()),
-                reinterpret_cast<PCUITEMID_CHILD_ARRAY>(items.data()), 0));
+                (PCUITEMID_CHILD_ARRAY)items.data(), 0));
             if (SUCCEEDED(com)) CoUninitialize();
             ILFree(dirPidl);
         }
