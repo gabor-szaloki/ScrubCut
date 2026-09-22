@@ -1321,6 +1321,13 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         m_cacheDecoder.Flush();
         if (!m_cacheDemuxer.Seek(std::max(0.0, seekSec))) return;
 
+        // Decoding from the file start: the first frame that lands in the
+        // window is a GOP anchor even when it isn't a keyframe. In a
+        // stream-copied clip the keyframe sits in edit-list pre-roll the
+        // decoder drops, and a window with no anchor at or before the
+        // playhead would be cleared and rebuilt forever.
+        bool anchorNext = seekSec <= 0.0;
+
         AVPacket* pkt = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
         int kfsPast = 0;
@@ -1343,8 +1350,13 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
                         if (f->pts > pastPts) return false;  // capped and past the playhead — done
                         m_frameCache.DiscardBefore(m_frameCache.StartPts() + 1);  // slide
                     }
-                    if (ConvertedFramePtr cf = ConvertToPooledFrame(m_cacheConverter, f))
+                    if (ConvertedFramePtr cf = ConvertToPooledFrame(m_cacheConverter, f)) {
+                        if (anchorNext) {
+                            cf->keyframe = true;
+                            anchorNext = false;
+                        }
                         m_frameCache.Put(std::move(cf));
+                    }
                 }
             }
             return true;
@@ -1405,6 +1417,9 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         // keyframe-less window check below relies on that to tell a slid
         // window from a stub.
         int64_t frameTicks = static_cast<int64_t>(GetFrameDuration() / tbSec);
+        // From the file start: the probe hit it, or the keyframe lies
+        // at/before t=0 (hidden pre-roll).
+        bool fromBof = m_cacheBofKf != AV_NOPTS_VALUE || static_cast<double>(kf) * tbSec <= 0.0;
         decodeChunk(static_cast<double>(kf) * tbSec,
                     centerPts - (kMaxCacheFrames + 8) * frameTicks, INT64_MAX,
                     centerPts, kCacheGopsAhead + 1);
@@ -1415,6 +1430,10 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         // point posts a fresh request.
         int64_t endPts = m_frameCache.EndPts();
         if (endPts == AV_NOPTS_VALUE || endPts < centerPts) return false;
+        // The window's first frame is then the earliest presentable one: the
+        // start-of-file mark the grow-behind step compares against.
+        if (fromBof)
+            m_cacheBofKf = m_frameCache.StartPts();
         return true;  // re-evaluate the policy on the next iteration
     }
 
@@ -1430,6 +1449,9 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         // more to maintain. Below the cap it's a stub (e.g. just the frame a
         // seek landing staged) — rebuild it into a real window.
         if (m_frameCache.Count() >= kMaxCacheFrames) return false;
+        // Or it already starts at the first presentable frame: nothing
+        // earlier to find.
+        if (m_cacheBofKf != AV_NOPTS_VALUE && m_frameCache.StartPts() == m_cacheBofKf) return false;
         m_frameCache.Clear();
         return true;
     }
@@ -1451,6 +1473,10 @@ bool Player::MaintainCacheWindow(int64_t centerPts, const std::function<bool()>&
         } else {
             decodeChunk(static_cast<double>(prevKf) * tbSec, INT64_MIN, startPts,
                         centerPts, 1 << 30);
+            // Nothing presentable before the window (hidden pre-roll): treat
+            // it as the file start, or this would retry forever.
+            if (m_frameCache.StartPts() == startPts && !(shouldAbort && shouldAbort()))
+                m_cacheBofKf = startPts;
             return true;
         }
     }
