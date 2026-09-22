@@ -16,15 +16,16 @@
 #endif
 
 // Headless single-segment export:
-//   ScrubCut -export-segment <startSec> <endSec> <inputPath> [outputBasePath] [-gif]
+//   ScrubCut -export-segment <startSec> <endSec> <inputPath> [outputBasePath] [-gif] [-speed <x>]
 // outputBasePath works the same as the UI's "output directory + base name":
 // the exporter appends the mark name and source extension. If omitted, the
 // default is the input file's directory + stem, matching the UI default.
-// -gif exports a GIF with default settings.
+// -gif exports a GIF with default settings; -speed sets the playback speed
+// (1 = source).
 static int RunExportSegment(int argc, char* argv[]) {
     if (argc < 5) {
         fprintf(stderr,
-            "usage: -export-segment <startSec> <endSec> <input> [outputBase] [-gif]\n");
+            "usage: -export-segment <startSec> <endSec> <input> [outputBase] [-gif] [-speed <x>]\n");
         return 1;
     }
     std::string input = argv[4];
@@ -42,6 +43,7 @@ static int RunExportSegment(int argc, char* argv[]) {
     r.name     = "001";
     r.colorIndex = 0;
     r.mode = CommandLine::Get().HasFlag("-gif") ? ExportMode::GIF : ExportMode::SourceFormat;
+    r.speed = std::stod(CommandLine::Get().GetValue("-speed", "1"));
     s.segments.push_back(r);
 
     Exporter exp;

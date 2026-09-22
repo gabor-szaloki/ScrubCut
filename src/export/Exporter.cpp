@@ -437,6 +437,58 @@ static bool TrimMp4Presentation(const std::string& path, double presentationSec)
 }
 
 // ---------------------------------------------------------------------------
+// Embedded frame-rate rewrite for speed-changed copies
+// ---------------------------------------------------------------------------
+// A speed change scales the container timestamps, but H.264/HEVC parameter
+// sets still carry the encoder's frame rate, and FFmpeg-based readers prefer
+// that when it disagrees with the container. Rewrite it to the output rate
+// with the codec's metadata bitstream filter; slice data is untouched.
+// Returns nullptr when the codec has no such filter.
+static AVBSFContext* OpenTimingRewriteFilter(AVFormatContext* inFmt, int videoIdx, double speed) {
+    AVStream* st = inFmt->streams[videoIdx];
+    const char* filterName = nullptr;
+    AVRational ticksPerFrame = {1, 1};
+    switch (st->codecpar->codec_id) {
+        case AV_CODEC_ID_H264:
+            filterName = "h264_metadata";
+            ticksPerFrame = {2, 1};  // H.264 VUI ticks count fields
+            break;
+        case AV_CODEC_ID_HEVC:
+            filterName = "hevc_metadata";
+            break;
+        default:
+            break;
+    }
+    if (!filterName) {
+        LOG_INFO("Segment export: no frame-rate rewrite for %s",
+                 avcodec_get_name(st->codecpar->codec_id));
+        return nullptr;
+    }
+    AVRational srcFps = av_guess_frame_rate(inFmt, st, nullptr);
+    if (srcFps.num <= 0 || srcFps.den <= 0) return nullptr;
+    AVRational outFps = av_mul_q(srcFps, av_d2q(speed, 100000));
+    AVRational tickRate = av_mul_q(outFps, ticksPerFrame);
+
+    const AVBitStreamFilter* filter = av_bsf_get_by_name(filterName);
+    if (!filter) {
+        LOG_WARN("Segment export: %s unavailable; embedded frame rate left unchanged", filterName);
+        return nullptr;
+    }
+    AVBSFContext* bsf = nullptr;
+    if (av_bsf_alloc(filter, &bsf) < 0) return nullptr;
+    avcodec_parameters_copy(bsf->par_in, st->codecpar);
+    bsf->time_base_in = st->time_base;
+    if (av_opt_set_q(bsf->priv_data, "tick_rate", tickRate, 0) < 0 || av_bsf_init(bsf) < 0) {
+        LOG_WARN("Segment export: %s failed; embedded frame rate left unchanged", filterName);
+        av_bsf_free(&bsf);
+        return nullptr;
+    }
+    LOG_INFO("Segment export: embedded frame rate %.3f -> %.3f fps for %.4gx speed (%s)",
+             av_q2d(srcFps), av_q2d(outFps), speed, filterName);
+    return bsf;
+}
+
+// ---------------------------------------------------------------------------
 // Stream copy export
 // ---------------------------------------------------------------------------
 bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
@@ -468,16 +520,28 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     int audioOutIdx = -1;
     int outStreamCount = 0;
 
+    // Speed != 1: audio is already dropped (audioInIdx = -1), so only video
+    // pts/dts/duration get divided by `speed`.
+    const bool speedScaled = range.speed > 0.0 && std::abs(range.speed - 1.0) > 1e-6;
+    const double speedInv = speedScaled ? (1.0 / range.speed) : 1.0;
+    AVBSFContext* videoBsf = nullptr;  // embedded frame-rate rewrite, speed-changed copies only
+
     for (int i = 0; i < static_cast<int>(inFmt->nb_streams); i++) {
         AVStream* inStream = inFmt->streams[i];
         if (i == videoInIdx || i == audioInIdx) {
             AVStream* outStream = avformat_new_stream(outFmt, nullptr);
             if (!outStream) {
                 m_progress.SetError("Failed to create output stream");
+                av_bsf_free(&videoBsf);
                 avformat_free_context(outFmt);
                 return false;
             }
             avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
+            if (i == videoInIdx && speedScaled) {
+                videoBsf = OpenTimingRewriteFilter(inFmt, videoInIdx, range.speed);
+                // Carries the rewritten extradata into the container header.
+                if (videoBsf) avcodec_parameters_copy(outStream->codecpar, videoBsf->par_out);
+            }
             outStream->codecpar->codec_tag = 0;
 
             if (i == videoInIdx) videoOutIdx = outStreamCount;
@@ -491,6 +555,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         ret = avio_open(&outFmt->pb, outputPath.c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) {
             m_progress.SetError("Failed to open output file: " + ff::ErrorString(ret));
+            av_bsf_free(&videoBsf);
             avformat_free_context(outFmt);
             return false;
         }
@@ -499,6 +564,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     ret = avformat_write_header(outFmt, nullptr);
     if (ret < 0) {
         m_progress.SetError("Failed to write header: " + ff::ErrorString(ret));
+        av_bsf_free(&videoBsf);
         avio_closep(&outFmt->pb);
         avformat_free_context(outFmt);
         return false;
@@ -542,12 +608,6 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     }
 
     double segDuration = static_cast<double>(videoEndTs - videoStartPts) * av_q2d(vtb);
-    // Speed scaling. At speed != 1, audio packets are filtered out earlier
-    // (audioInIdx = -1 above) so this block only touches video packets:
-    // dividing video pts/dts/duration by `speed` compresses (>1×) or
-    // stretches (<1×) the output timeline.
-    bool speedScaled = range.speed > 0.0 && std::abs(range.speed - 1.0) > 1e-6;
-    double speedInv = speedScaled ? (1.0 / range.speed) : 1.0;
     double effSegDuration = speedScaled ? segDuration / range.speed : segDuration;
 
     // Only MP4/MOV has an edit list to trim after muxing (see below).
@@ -580,6 +640,19 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         } else {
             av_packet_unref(pkt);
             continue;
+        }
+
+        // Speed-changed copies: rewrite in-band parameter sets (see
+        // OpenTimingRewriteFilter). The filter returns each packet immediately.
+        if (inIdx == videoInIdx && videoBsf) {
+            ret = av_bsf_send_packet(videoBsf, pkt);
+            if (ret >= 0) ret = av_bsf_receive_packet(videoBsf, pkt);
+            if (ret == AVERROR(EAGAIN)) continue;  // filter held the packet (never, for metadata filters)
+            if (ret < 0) {
+                m_progress.SetError("Frame-rate rewrite failed: " + ff::ErrorString(ret));
+                av_packet_free(&pkt);
+                goto cleanup;
+            }
         }
 
         // Terminate via DTS (monotonic) with a margin past the out frame:
@@ -665,6 +738,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     }
 
     av_packet_free(&pkt);
+    av_bsf_free(&videoBsf);
     av_write_trailer(outFmt);
 
     if (!(outFmt->oformat->flags & AVFMT_NOFILE))
@@ -678,6 +752,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     return true;
 
 cleanup:
+    av_bsf_free(&videoBsf);
     av_write_trailer(outFmt);
     if (!(outFmt->oformat->flags & AVFMT_NOFILE))
         avio_closep(&outFmt->pb);
