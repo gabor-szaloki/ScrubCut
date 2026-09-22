@@ -156,6 +156,7 @@ Shortcuts are grouped the same way as the in-app help panel (press **?**).
 | `-log`           | Allocate a console for stdout/stderr (Windows only)             |
 | `-resetlayout`   | Reset the docked panel layout to defaults                       |
 | `-export-segment <startSec> <endSec> <input> [outputBase]` | Headless stream-copy export of a single segment; no UI. Defaults `outputBase` to the input's directory and stem. Output is `<outputBase>_001.<input_ext>`. |
+| `-export-frame <timeSec> <input> [outputBase]` | Headless PNG export of the frame shown at `timeSec`; no UI. Defaults `outputBase` like `-export-segment`. Output is `<outputBase>_001.png`. |
 
 ## Tech stack
 

@@ -13,6 +13,7 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 }
 
+#include <cstdint>
 #include <string>
 
 namespace ff {
@@ -22,6 +23,15 @@ inline std::string ErrorString(int errnum) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {};
     av_strerror(errnum, buf, sizeof(buf));
     return buf;
+}
+
+// Timeline seconds to stream ticks. Deliberately the same truncating
+// expression as Player::SyncSeekAndDecode and Demuxer::Seek, so a mark
+// resolves to the same frame on export as on screen. Treat the result as a
+// lower bound ("first frame at or after"): a clock time is exactly
+// pts * av_q2d(tb) and dividing it back can land one tick low.
+inline int64_t SecondsToPts(double sec, AVRational tb) {
+    return static_cast<int64_t>(sec / av_q2d(tb));
 }
 
 } // namespace ff

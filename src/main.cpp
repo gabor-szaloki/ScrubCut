@@ -50,6 +50,41 @@ static int RunExportSegment(int argc, char* argv[]) {
     return exp.GetProgress().error ? 1 : 0;
 }
 
+// Headless single-frame PNG export:
+//   ScrubCut -export-frame <timeSec> <inputPath> [outputBasePath]
+// Same frame resolution as a frame mark exported from the UI. Output is
+// <outputBase>_001.png.
+static int RunExportFrame(int argc, char* argv[]) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: -export-frame <timeSec> <input> [outputBase]\n");
+        return 1;
+    }
+    std::string input = argv[3];
+    std::string outputBase = (argc >= 5) ? argv[4] : "";
+    if (outputBase.empty()) {
+        std::filesystem::path p(input);
+        outputBase = (p.parent_path() / p.stem()).string();
+    }
+
+    ExportSettings s;
+    s.outputPath = outputBase;
+    FrameMark f;
+    f.timeSec = std::stod(argv[2]);
+    f.name = "001";
+    f.colorIndex = 0;
+    s.frames.push_back(f);
+
+    Exporter exp;
+    exp.Start(input, s);
+    while (exp.IsRunning())
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (exp.GetProgress().error) {
+        fprintf(stderr, "export failed: %s\n", exp.GetProgress().GetError().c_str());
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     // Arm the Tracy profiler before anything else runs so a waiting viewer
     // (tracy-profiler -a 127.0.0.1) can catch the startup flow. The on-demand
@@ -87,6 +122,11 @@ int main(int argc, char* argv[]) {
 
     if (CommandLine::Get().HasFlag("-export-segment")) {
         int rc = RunExportSegment(argc, argv);
+        Profiler::Shutdown();
+        return rc;
+    }
+    if (CommandLine::Get().HasFlag("-export-frame")) {
+        int rc = RunExportFrame(argc, argv);
         Profiler::Shutdown();
         return rc;
     }

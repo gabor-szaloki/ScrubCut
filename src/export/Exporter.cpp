@@ -865,15 +865,21 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
         return false;
     }
 
+    // Resolve the mark to a frame the way the player's seek does
+    // (Player::SyncSeekAndDecode): the first frame at or past the target. A
+    // mark between two frames exports the later one, the frame on screen at
+    // that time.
     AVRational tb = demuxer.GetVideoTimeBase();
-    int64_t targetPts = static_cast<int64_t>(frame.timeSec / av_q2d(tb));
+    int64_t targetPts = ff::SecondsToPts(frame.timeSec, tb);
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame* decFrame = av_frame_alloc();
-    AVFrame* captured = nullptr;  // the latest frame whose PTS <= target
-    bool pastTarget = false;
+    // First frame at or past the target; until one arrives, the latest
+    // decoded, so a mark past the last frame exports that frame.
+    AVFrame* captured = nullptr;
+    bool found = false;
 
-    while (!pastTarget && !m_cancel) {
+    while (!found && !m_cancel) {
         int rr = demuxer.ReadPacket(pkt);
         if (rr < 0) {
             // EOF or error — flush decoder
@@ -898,21 +904,16 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
             }
             int64_t pts = decFrame->best_effort_timestamp;
             if (pts == AV_NOPTS_VALUE) pts = decFrame->pts;
-            if (pts <= targetPts) {
-                // Keep the most recent frame at-or-before the target.
-                if (captured) av_frame_free(&captured);
-                captured = av_frame_clone(decFrame);
-            } else {
-                // Target precedes the first frame — streams often start
-                // slightly past 0 (e.g. WebM with a 12ms start_time), so a
-                // mark at 0.0s has no frame at-or-before it. Use the first
-                // frame instead of failing.
-                if (!captured) captured = av_frame_clone(decFrame);
-                pastTarget = true;
-                av_frame_unref(decFrame);
+            if (captured) av_frame_free(&captured);
+            captured = av_frame_clone(decFrame);
+            av_frame_unref(decFrame);
+            // Presentation order, so this is the first frame at or past the
+            // target. Also covers a mark at 0.0s on a stream whose first
+            // frame starts later.
+            if (pts >= targetPts) {
+                found = true;
                 break;
             }
-            av_frame_unref(decFrame);
         }
         if (rr < 0) break;  // EOF after flush
     }
@@ -927,6 +928,12 @@ bool Exporter::ExportFramePNG(const std::string& inputPath,
     if (!captured) {
         m_progress.SetError("No frame decoded at " + std::to_string(frame.timeSec) + "s");
         return false;
+    }
+    {
+        int64_t pts = captured->best_effort_timestamp;
+        if (pts == AV_NOPTS_VALUE) pts = captured->pts;
+        LOG_INFO("Frame export: mark %.3fs -> frame pts %.3fs%s", frame.timeSec,
+                 static_cast<double>(pts) * av_q2d(tb), found ? "" : " (last frame)");
     }
 
     FrameConverter conv;
