@@ -50,6 +50,7 @@ extern "C" HRESULT WINAPI DwmSetWindowAttribute(HWND hwnd, DWORD dwAttribute,
 #endif
 
 #ifdef __APPLE__
+#include "util/MacFullscreen.h"
 #include "util/MacReveal.h"
 #endif
 
@@ -578,6 +579,14 @@ void App::Run() {
             std::string p = m_pendingSubtitlePath;
             m_pendingSubtitlePath.clear();
             OpenSubtitleFile(p);
+        }
+
+        // Fullscreen toggles from the View menu / video double-click, deferred
+        // to between frames like the layout reset below (mid-frame resizes
+        // crash on Metal).
+        if (m_pendingFullscreenToggle) {
+            m_pendingFullscreenToggle = false;
+            SetFullscreen(!m_fullscreen);
         }
 
         // Reset Layout's window mutations, deferred here because resizing the
@@ -1281,12 +1290,29 @@ void App::ProcessEvents() {
             BumpUIActivity();
         }
 
+#ifdef __APPLE__
+        // The green button / Ctrl+Cmd+F put the window into a native fullscreen
+        // Space behind our back. Adopt it as m_fullscreen so F / Esc leave it
+        // again, and mirror a user-driven exit so the panel snapshots are
+        // restored. Both events arrive after the transition, before the panels
+        // are laid out for the new size.
+        if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN && !m_fullscreen) {
+            SetFullscreen(true);
+        } else if (event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN && m_fullscreen &&
+                   m_macSpaceFullscreen) {
+            SetFullscreen(false);
+        }
+#endif
+
         // Track maximize / restore so we can preserve the unmaximized geometry
-        // across sessions even when closing the app while maximized.
-        if (event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
-            m_maximized = true;
-        } else if (event.type == SDL_EVENT_WINDOW_RESTORED) {
-            m_maximized = false;
+        // across sessions even when closing the app while maximized. Read
+        // SDL's flag rather than the event type: a macOS fullscreen exit
+        // queues several intermediate MAXIMIZED / RESTORED at once, and only
+        // the final state is meaningful. Frozen while fullscreen — AppKit
+        // reports the screen-sized borderless window as zoomed.
+        if (!m_fullscreen &&
+            (event.type == SDL_EVENT_WINDOW_MAXIMIZED || event.type == SDL_EVENT_WINDOW_RESTORED)) {
+            m_maximized = (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MAXIMIZED) != 0;
         }
 
         // Capture the unmaximized windowed geometry. Skip when fullscreen
@@ -1891,7 +1917,7 @@ void App::Render() {
         }
         if (ImGui::BeginMenu("View")) {
             if (ImGui::MenuItem("Fullscreen", "F", m_fullscreen)) {
-                SetFullscreen(!m_fullscreen);
+                m_pendingFullscreenToggle = true;
             }
             if (ImGui::BeginMenu("HDR")) {
                 if (ImGui::MenuItem("HDR Output", nullptr, m_hdrOutputEnabled)) {
@@ -2291,7 +2317,7 @@ void App::Render() {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 TogglePlayPauseWithFlash();
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                SetFullscreen(!m_fullscreen);
+                m_pendingFullscreenToggle = true;
         }
 
         // Briefly flash a Play/Pause icon at the center of the video after a
@@ -4807,11 +4833,9 @@ void App::SetFullscreen(bool fullscreen) {
         m_waitingForFullscreenExit = false;
     } else {
         // Wait for the viewport to settle at its post-exit size before
-        // restoring snapshot positions. Needed for macOS, which animates
-        // the fullscreen exit and leaves the viewport at fullscreen size
-        // for several frames; on Windows and Linux the wait completes on
-        // the next frame, which is harmless. See the Render-loop settle
-        // check for the matching consume.
+        // restoring snapshot positions — several frames when leaving an
+        // animated macOS Space, the next frame otherwise. See the Render-loop
+        // settle check for the matching consume.
         m_waitingForFullscreenExit = true;
     }
 
@@ -4911,10 +4935,26 @@ void App::SetFullscreen(bool fullscreen) {
         }
     }
 #elif defined(__APPLE__)
-    // On macOS, SDL_SetWindowFullscreen works as expected. Maximized is a
-    // non-concept on macOS (we treat fullscreen as the equivalent), so the
-    // m_wasMaximizedBeforeFullscreen path above won't fire in practice.
-    SDL_SetWindowFullscreen(m_window, fullscreen);
+    // Our fullscreen is borderless through Cocoa (util/MacFullscreen.mm), not
+    // SDL's fullscreen Space with its animation and Cmd-Tab Space switches.
+    // The green button / Ctrl+Cmd+F still give the native Space; ProcessEvents
+    // adopts that, and leaving it goes through SDL. Either exit lands on the
+    // pre-entry frame, so a zoomed window comes back zoomed by itself — no
+    // re-maximize step.
+    if (fullscreen) {
+        if (MacWindowInFullscreenSpace(m_window)) {
+            m_macSpaceFullscreen = true;  // AppKit already did the work
+        } else {
+            MacSetBorderlessFullscreen(m_window, true);
+        }
+    } else if (m_macSpaceFullscreen) {
+        m_macSpaceFullscreen = false;
+        if (MacWindowInFullscreenSpace(m_window))  // false when mirroring a user-driven exit
+            SDL_SetWindowFullscreen(m_window, false);
+    } else {
+        MacSetBorderlessFullscreen(m_window, false);
+    }
+    m_wasMaximizedBeforeFullscreen = false;
 #else
     // Linux (X11/Wayland): mirror the Windows behaviour using SDL primitives.
     // SDL_SetWindowFullscreen doesn't reliably preserve maximize state across

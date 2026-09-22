@@ -25,7 +25,7 @@ src/core/           # playback pipeline (Player, Demuxer, decoders, queues, cloc
 src/ui/UIManager    # ImGui + SDL3 + SDLGPU3 backends, fonts, DPI, dockspace
 src/ui/shaders/     # HLSL, compiled at build time (shadercross; glslang+spirv-cross on macOS) and embedded per-platform
 src/export/         # background segment/frame export
-src/util/           # AppPaths, Settings (INI), Log, Profiler (Tracy wrappers), Types (shared structs), FFmpegUtils, HttpClient (WinHTTP / NSURLSession GET), UpdateChecker (GitHub release check)
+src/util/           # AppPaths, Settings (INI), Log, Profiler (Tracy wrappers), Types (shared structs), FFmpegUtils, HttpClient (WinHTTP / NSURLSession GET), UpdateChecker (GitHub release check), MacReveal + MacFullscreen (.mm: Finder reveal, Cocoa borderless fullscreen)
 platform/{windows,macos}/  # icons, manifest, plist template, NSIS bits
 cmake/              # GenerateVersion.cmake, EmbedShaders.cmake (shader blob embedding)
 third_party/stb/    # vendored stb_image_write

@@ -208,6 +208,9 @@ private:
     // Set by the Reset Layout menu item; Run() performs the window
     // mutations between frames (resizing mid-frame crashes — see there).
     bool m_pendingLayoutReset = false;
+    // Set by View > Fullscreen and the video double-click (mid-frame); Run()
+    // toggles between frames, like m_pendingLayoutReset.
+    bool m_pendingFullscreenToggle = false;
     bool m_showChapters = true;
     bool m_showWaveform = false;
     bool m_showTooltips = true;
@@ -237,6 +240,9 @@ private:
     bool m_maximized = false;
     bool m_wasMaximizedBeforeFullscreen = false;
     bool m_waitingForFullscreenExit = false;
+    // macOS: the current fullscreen is a native Space (green button /
+    // Ctrl+Cmd+F), not our borderless mode.
+    bool m_macSpaceFullscreen = false;
 
     // Floating window geometry snapshot (position + size) taken when entering
     // fullscreen, so it can be restored exactly on exit.
