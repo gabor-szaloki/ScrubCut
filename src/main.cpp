@@ -16,18 +16,19 @@
 #endif
 
 // Headless single-segment export:
-//   ScrubCut -export-segment <startSec> <endSec> <inputPath> [outputBasePath]
+//   ScrubCut -export-segment <startSec> <endSec> <inputPath> [outputBasePath] [-gif]
 // outputBasePath works the same as the UI's "output directory + base name":
 // the exporter appends the mark name and source extension. If omitted, the
 // default is the input file's directory + stem, matching the UI default.
+// -gif exports a GIF with default settings.
 static int RunExportSegment(int argc, char* argv[]) {
     if (argc < 5) {
         fprintf(stderr,
-            "usage: -export-segment <startSec> <endSec> <input> [outputBase]\n");
+            "usage: -export-segment <startSec> <endSec> <input> [outputBase] [-gif]\n");
         return 1;
     }
     std::string input = argv[4];
-    std::string outputBase = (argc >= 6) ? argv[5] : "";
+    std::string outputBase = (argc >= 6 && argv[5][0] != '-') ? argv[5] : "";
     if (outputBase.empty()) {
         std::filesystem::path p(input);
         outputBase = (p.parent_path() / p.stem()).string();
@@ -40,7 +41,7 @@ static int RunExportSegment(int argc, char* argv[]) {
     r.endSec   = std::stod(argv[3]);
     r.name     = "001";
     r.colorIndex = 0;
-    r.mode = ExportMode::SourceFormat;
+    r.mode = CommandLine::Get().HasFlag("-gif") ? ExportMode::GIF : ExportMode::SourceFormat;
     s.segments.push_back(r);
 
     Exporter exp;

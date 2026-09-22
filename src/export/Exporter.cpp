@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -201,6 +202,241 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, const std::st
 }
 
 // ---------------------------------------------------------------------------
+// Frame boundaries of a mark range
+// ---------------------------------------------------------------------------
+// The player shows the first frame at or after a time
+// (Player::SyncSeekAndDecode), so a segment runs from that frame at mark-in
+// through that frame at mark-out, inclusive.
+struct SegmentFrames {
+    int64_t inPts = AV_NOPTS_VALUE;   // first frame at/after mark-in
+    int64_t outPts = AV_NOPTS_VALUE;  // first frame at/after mark-out (last frame when none)
+    int64_t outDts = AV_NOPTS_VALUE;  // frames decoded before it may be its references
+    int64_t outDur = 0;               // display duration of the out frame, in ticks
+};
+
+// Scan packets (no decoding) from the keyframe before `sec` for the smallest
+// video pts at or after `targetPts`. Packets come in decode order, so keep
+// reading until a dts reaches the candidate: nothing after that can beat it
+// (pts >= dts). Falls back to the largest pts seen when the target is past
+// the last frame. Returns false if no timestamped video packet exists.
+static bool FindFrameAtOrAfter(Demuxer& demuxer, double sec, int64_t targetPts,
+                               int64_t& outPts, int64_t& outDts, int64_t& outDur) {
+    if (!demuxer.Seek(sec)) return false;
+    const int videoIdx = demuxer.GetVideoStreamIndex();
+    // Streams without dts: give up a second past the candidate.
+    const int64_t marginTs = ff::SecondsToPts(1.0, demuxer.GetVideoTimeBase());
+
+    int64_t best = AV_NOPTS_VALUE, bestDts = AV_NOPTS_VALUE, bestDur = 0;
+    int64_t last = AV_NOPTS_VALUE, lastDts = AV_NOPTS_VALUE, lastDur = 0;
+    AVPacket* pkt = av_packet_alloc();
+    while (demuxer.ReadPacket(pkt) >= 0) {
+        if (pkt->stream_index != videoIdx || pkt->pts == AV_NOPTS_VALUE) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        if (pkt->pts >= targetPts && (best == AV_NOPTS_VALUE || pkt->pts < best)) {
+            best = pkt->pts;
+            bestDts = pkt->dts;
+            bestDur = pkt->duration;
+        }
+        if (last == AV_NOPTS_VALUE || pkt->pts > last) {
+            last = pkt->pts;
+            lastDts = pkt->dts;
+            lastDur = pkt->duration;
+        }
+        bool past = false;
+        if (best != AV_NOPTS_VALUE) {
+            past = (pkt->dts != AV_NOPTS_VALUE) ? (pkt->dts >= best)
+                                                : (pkt->pts > best + marginTs);
+        }
+        av_packet_unref(pkt);
+        if (past) break;
+    }
+    av_packet_free(&pkt);
+
+    if (best == AV_NOPTS_VALUE) {
+        best = last;
+        bestDts = lastDts;
+        bestDur = lastDur;
+    }
+    if (best == AV_NOPTS_VALUE) return false;
+    outPts = best;
+    outDts = bestDts;
+    outDur = bestDur;
+    return true;
+}
+
+// Resolve both ends of `range` to frames. Leaves the demuxer positioned
+// arbitrarily; seek again before reading. Returns false when the stream has
+// no usable timestamps.
+static bool ResolveSegmentFrames(Demuxer& demuxer, const TimeRange& range, SegmentFrames& f) {
+    const AVRational tb = demuxer.GetVideoTimeBase();
+    int64_t inDts = AV_NOPTS_VALUE, inDur = 0;
+    if (!FindFrameAtOrAfter(demuxer, range.startSec, ff::SecondsToPts(range.startSec, tb),
+                            f.inPts, inDts, inDur))
+        return false;
+    if (!FindFrameAtOrAfter(demuxer, range.endSec, ff::SecondsToPts(range.endSec, tb),
+                            f.outPts, f.outDts, f.outDur))
+        return false;
+    if (f.outPts < f.inPts) {
+        // Both marks past the last frame: a single-frame segment.
+        f.outPts = f.inPts;
+        f.outDts = inDts;
+        f.outDur = inDur;
+    }
+    if (f.outDur <= 0) {
+        // Containers without per-packet durations: assume the nominal rate.
+        double fps = demuxer.GetVideoFrameRate();
+        f.outDur = (fps > 0.0) ? ff::SecondsToPts(1.0 / fps, tb) : 0;
+    }
+    LOG_INFO("Segment export: marks %.3f-%.3fs -> frames %.3f..%.3fs",
+             range.startSec, range.endSec,
+             static_cast<double>(f.inPts) * av_q2d(tb),
+             static_cast<double>(f.outPts) * av_q2d(tb));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// MP4 edit-list trim
+// ---------------------------------------------------------------------------
+static uint32_t Rd32(const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+static uint64_t Rd64(const uint8_t* p) { return (uint64_t(Rd32(p)) << 32) | Rd32(p + 4); }
+static void Wr32(uint8_t* p, uint32_t v) {
+    p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+}
+static void Wr64(uint8_t* p, uint64_t v) { Wr32(p, uint32_t(v >> 32)); Wr32(p + 4, uint32_t(v)); }
+
+// The copied segment carries reference frames after the out frame (see the
+// copy loop) and the muxer's edit list runs to the end of the last sample,
+// which would present them. Cap every track's edit list and the track/movie
+// durations at `presentationSec`. Values are rewritten in place. Returns
+// false, without modifying anything, if the layout isn't as expected.
+static bool TrimMp4Presentation(const std::string& path, double presentationSec) {
+    std::fstream f(std::filesystem::u8path(path), std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    const int64_t fileSize = static_cast<int64_t>(f.tellg());
+
+    // Top-level moov atom.
+    int64_t moovPos = -1;
+    uint64_t moovSize = 0;
+    size_t moovHdr = 8;
+    for (int64_t pos = 0; pos + 8 <= fileSize;) {
+        uint8_t hdr[16];
+        f.seekg(pos);
+        f.read(reinterpret_cast<char*>(hdr), 8);
+        if (!f) return false;
+        uint64_t size = Rd32(hdr);
+        size_t hdrLen = 8;
+        if (size == 1) {
+            f.read(reinterpret_cast<char*>(hdr + 8), 8);
+            if (!f) return false;
+            size = Rd64(hdr + 8);
+            hdrLen = 16;
+        } else if (size == 0) {
+            size = static_cast<uint64_t>(fileSize - pos);
+        }
+        if (size < hdrLen) return false;
+        if (memcmp(hdr + 4, "moov", 4) == 0) {
+            moovPos = pos;
+            moovSize = size;
+            moovHdr = hdrLen;
+            break;
+        }
+        pos += static_cast<int64_t>(size);
+    }
+    if (moovPos < 0 || moovSize > (uint64_t(64) << 20)) return false;
+
+    std::vector<uint8_t> moov(static_cast<size_t>(moovSize));
+    f.seekg(moovPos);
+    f.read(reinterpret_cast<char*>(moov.data()), static_cast<std::streamsize>(moov.size()));
+    if (!f) return false;
+
+    struct Atom { size_t pos; size_t hdr; size_t size; };
+    auto children = [&](size_t begin, size_t end) {
+        std::vector<Atom> out;
+        for (size_t pos = begin; pos + 8 <= end;) {
+            uint64_t size = Rd32(&moov[pos]);
+            size_t hdr = 8;
+            if (size == 1 && pos + 16 <= end) {
+                size = Rd64(&moov[pos + 8]);
+                hdr = 16;
+            } else if (size == 0) {
+                size = end - pos;
+            }
+            if (size < hdr || pos + size > end) break;
+            out.push_back({pos, hdr, static_cast<size_t>(size)});
+            pos += static_cast<size_t>(size);
+        }
+        return out;
+    };
+    auto is = [&](const Atom& a, const char* type) { return memcmp(&moov[a.pos + 4], type, 4) == 0; };
+    // Byte 0 of each payload is the version; v1 widens the timestamp fields.
+
+    const auto top = children(moovHdr, moov.size());
+    uint32_t movieTimescale = 0;
+    const Atom* mvhd = nullptr;
+    for (const Atom& a : top) {
+        if (!is(a, "mvhd")) continue;
+        const uint8_t* p = &moov[a.pos + a.hdr];
+        movieTimescale = Rd32(p + (p[0] == 0 ? 12 : 20));
+        mvhd = &a;
+        break;
+    }
+    if (!mvhd || movieTimescale == 0) return false;
+    const uint64_t cap = static_cast<uint64_t>(std::llround(presentationSec * movieTimescale));
+
+    auto capField = [&](uint8_t* p, bool wide) {
+        uint64_t v = wide ? Rd64(p) : Rd32(p);
+        if (v <= cap) return;
+        if (wide) Wr64(p, cap);
+        else Wr32(p, static_cast<uint32_t>(cap));
+    };
+    {
+        uint8_t* p = &moov[mvhd->pos + mvhd->hdr];
+        capField(p + (p[0] == 0 ? 16 : 24), p[0] != 0);
+    }
+    for (const Atom& trak : top) {
+        if (!is(trak, "trak")) continue;
+        for (const Atom& a : children(trak.pos + trak.hdr, trak.pos + trak.size)) {
+            if (is(a, "tkhd")) {
+                uint8_t* p = &moov[a.pos + a.hdr];
+                capField(p + (p[0] == 0 ? 20 : 28), p[0] != 0);
+            } else if (is(a, "edts")) {
+                for (const Atom& e : children(a.pos + a.hdr, a.pos + a.size)) {
+                    if (!is(e, "elst")) continue;
+                    uint8_t* p = &moov[e.pos + e.hdr];
+                    const bool wide = p[0] != 0;
+                    const uint32_t count = Rd32(p + 4);
+                    const size_t entrySize = wide ? 20 : 12;
+                    if (e.hdr + 8 + static_cast<size_t>(count) * entrySize > e.size) return false;
+                    // Segment durations are in movie timescale; cap the
+                    // running total so presentation stops at `cap`.
+                    uint64_t acc = 0;
+                    for (uint32_t i = 0; i < count; i++) {
+                        uint8_t* d = p + 8 + i * entrySize;
+                        uint64_t dur = wide ? Rd64(d) : Rd32(d);
+                        uint64_t allowed = (acc >= cap) ? 0 : cap - acc;
+                        if (dur > allowed) {
+                            dur = allowed;
+                            if (wide) Wr64(d, dur);
+                            else Wr32(d, static_cast<uint32_t>(dur));
+                        }
+                        acc += dur;
+                    }
+                }
+            }
+        }
+    }
+
+    f.seekp(moovPos);
+    f.write(reinterpret_cast<const char*>(moov.data()), static_cast<std::streamsize>(moov.size()));
+    return static_cast<bool>(f);
+}
+
+// ---------------------------------------------------------------------------
 // Stream copy export
 // ---------------------------------------------------------------------------
 bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
@@ -268,30 +504,44 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         return false;
     }
 
+    // Snap the range to the frames shown at the marks (see SegmentFrames):
+    // the edit list then starts on a frame boundary and the out frame is
+    // included.
+    SegmentFrames sf;
+    bool snapped = (videoInIdx >= 0) && ResolveSegmentFrames(demuxer, range, sf);
+    if (!snapped)
+        LOG_WARN("Segment export: no video timestamps to snap to; cutting at raw mark times");
+
     // Seek to start of range. av_seek_frame with BACKWARD lands on the
     // keyframe at or before range.startSec — stream copy can only start at a
     // keyframe.
     demuxer.Seek(range.startSec);
 
-    // Compute start/end PTS for each stream from the mark, NOT from the first
-    // keyframe we read. Packets between the pre-roll keyframe and the mark-in
-    // flow through with negative PTS; MP4/MOV muxers pick that up and emit an
-    // edit list so players skip the pre-roll on playback and start at mark-in
-    // frame-accurately. MKV has no equivalent — the pre-roll will play as
-    // leading content in .mkv exports.
-    // Convert user timeline seconds to raw stream PTS. The Player's clock
-    // tracks time as `frame->pts * tb` directly (no stream start_time
-    // subtraction), so user seconds correspond 1:1 to raw pts seconds.
-    auto toPts = [](double sec, AVStream* s) -> int64_t {
-        return static_cast<int64_t>(sec / av_q2d(s->time_base));
-    };
+    // Start/end PTS per stream come from the in/out frames, not the first
+    // keyframe read. Packets between the pre-roll keyframe and the in frame
+    // flow through with negative PTS; MP4/MOV muxers turn that into an edit
+    // list so playback starts exactly on the in frame. MKV has no equivalent,
+    // so the pre-roll plays as leading content there.
+    // User seconds map 1:1 to raw pts seconds (the Player's clock is
+    // `frame->pts * tb`, no start_time subtraction).
+    // videoEndPts is the last video packet kept (inclusive); the segment ends
+    // where that frame's display ends (videoEndTs), which is where audio cuts.
+    AVRational vtb = (videoInIdx >= 0) ? inFmt->streams[videoInIdx]->time_base
+                                       : AVRational{1, AV_TIME_BASE};
+    int64_t videoStartPts = snapped ? sf.inPts  : ff::SecondsToPts(range.startSec, vtb);
+    int64_t videoEndPts   = snapped ? sf.outPts : ff::SecondsToPts(range.endSec, vtb);
+    int64_t videoEndTs    = snapped ? sf.outPts + sf.outDur : videoEndPts;
+    int64_t audioStartPts = 0;
+    int64_t audioEndPts   = 0;
+    if (audioInIdx >= 0) {
+        AVRational atb = inFmt->streams[audioInIdx]->time_base;
+        audioStartPts = (videoInIdx >= 0) ? av_rescale_q(videoStartPts, vtb, atb)
+                                          : ff::SecondsToPts(range.startSec, atb);
+        audioEndPts   = (videoInIdx >= 0) ? av_rescale_q(videoEndTs, vtb, atb)
+                                          : ff::SecondsToPts(range.endSec, atb);
+    }
 
-    int64_t videoStartPts = (videoInIdx >= 0) ? toPts(range.startSec, inFmt->streams[videoInIdx]) : 0;
-    int64_t audioStartPts = (audioInIdx >= 0) ? toPts(range.startSec, inFmt->streams[audioInIdx]) : 0;
-    int64_t videoEndPts   = (videoInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[videoInIdx]) : 0;
-    int64_t audioEndPts   = (audioInIdx >= 0) ? toPts(range.endSec,   inFmt->streams[audioInIdx]) : 0;
-
-    double segDuration = range.endSec - range.startSec;
+    double segDuration = static_cast<double>(videoEndTs - videoStartPts) * av_q2d(vtb);
     // Speed scaling. At speed != 1, audio packets are filtered out earlier
     // (audioInIdx = -1 above) so this block only touches video packets:
     // dividing video pts/dts/duration by `speed` compresses (>1×) or
@@ -299,6 +549,11 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     bool speedScaled = range.speed > 0.0 && std::abs(range.speed - 1.0) > 1e-6;
     double speedInv = speedScaled ? (1.0 / range.speed) : 1.0;
     double effSegDuration = speedScaled ? segDuration / range.speed : segDuration;
+
+    // Only MP4/MOV has an edit list to trim after muxing (see below).
+    const bool isMp4 = outFmt->oformat && outFmt->oformat->name &&
+                       (strcmp(outFmt->oformat->name, "mp4") == 0 ||
+                        strcmp(outFmt->oformat->name, "mov") == 0);
 
     // Read and write packets
     AVPacket* pkt = av_packet_alloc();
@@ -327,13 +582,11 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
             continue;
         }
 
-        // Terminate via DTS (monotonic) with a safety margin for B-frame
-        // reorder depth — stopping on first pts > endPts would drop trailing
-        // B-frames whose pts falls at/before mark-out but which arrive later
-        // in decode order.
+        // Terminate via DTS (monotonic) with a margin past the out frame:
+        // trailing B-frames arrive after it in decode order, and interleaved
+        // audio may lag the video.
         if (inIdx == videoInIdx && pkt->dts != AV_NOPTS_VALUE) {
-            AVRational vtb = inFmt->streams[videoInIdx]->time_base;
-            int64_t marginTs = static_cast<int64_t>(1.0 / av_q2d(vtb));
+            int64_t marginTs = ff::SecondsToPts(1.0, vtb);
             if (pkt->dts > endPts + marginTs) {
                 done = true;
                 av_packet_unref(pkt);
@@ -341,17 +594,28 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
             }
         }
 
-        // Drop packets whose display time is past mark-out, but keep reading
-        // — later packets in decode order may still be within range.
-        if (pkt->pts != AV_NOPTS_VALUE && pkt->pts > endPts) {
-            av_packet_unref(pkt);
-            continue;
+        // Drop packets past the segment, but keep reading — later packets in
+        // decode order may still be within range. Video keeps everything up
+        // to the out frame plus the frames decoded before it (references its
+        // trailing B-frames may need); the MP4 edit list hides those, other
+        // containers would show them. Audio ends at the segment's end.
+        if (pkt->pts != AV_NOPTS_VALUE) {
+            bool past;
+            if (inIdx == videoInIdx) {
+                bool decodedBeforeOut = snapped && isMp4 && pkt->dts != AV_NOPTS_VALUE &&
+                                        sf.outDts != AV_NOPTS_VALUE && pkt->dts <= sf.outDts;
+                past = pkt->pts > endPts && !decodedBeforeOut;
+            } else {
+                past = pkt->pts >= endPts;
+            }
+            if (past) {
+                av_packet_unref(pkt);
+                continue;
+            }
         }
 
-        // Rebase timestamps against mark-in. Packets before mark-in (keyframe
-        // pre-roll) will get negative PTS/DTS — intentional. The muxer
-        // flows these into an edit list for MP4/MOV so playback skips the
-        // pre-roll. (MKV has no edit list equivalent; pre-roll will play.)
+        // Rebase against the in frame; pre-roll packets get negative PTS/DTS,
+        // which the MP4/MOV muxer turns into the edit list (see above).
         int64_t startPts = (inIdx == videoInIdx) ? videoStartPts : audioStartPts;
         AVStream* inStream = inFmt->streams[inIdx];
         AVStream* outStream = outFmt->streams[outIdx];
@@ -406,6 +670,11 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     if (!(outFmt->oformat->flags & AVFMT_NOFILE))
         avio_closep(&outFmt->pb);
     avformat_free_context(outFmt);
+
+    // The trailing reference frames extended the muxer's edit list; pull it
+    // back to the segment (post-speed duration).
+    if (snapped && isMp4 && !TrimMp4Presentation(outputPath, effSegDuration))
+        LOG_WARN("Segment export: could not trim the MP4 edit list; trailing reference frames may show");
     return true;
 
 cleanup:
@@ -538,19 +807,24 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     // src_duration/speed: slow-mo gets MORE unique frames (smoother
     // motion) and fast-forward gets FEWER (no redundant duplicates).
     double srcSampleFps = (range.speed > 0.0) ? gifFps / range.speed : gifFps;
+    // The fps resampler keeps the LAST frame that rounds into a slot. With
+    // the in frame rebased to t=0 (see feedFrame) and round=up, slot 0 can
+    // only hold the in frame and each later slot holds the frame on screen at
+    // that instant. eof_action=pass plus the out frame's stretched duration
+    // makes the final slot emit the out frame.
     char filterDesc[512];
     if (hdr) {
         // HDR frames arrive already tone-mapped to sRGB BT.709 RGBA, so the
         // colorspace conversion is skipped — just resample, scale, and palettize.
         snprintf(filterDesc, sizeof(filterDesc),
-                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,format=rgb24,"
+                 "fps=fps=%.4f:round=up:eof_action=pass,scale=%d:%d:flags=lanczos,format=rgb24,"
                  "split[a][b];"
                  "[a]palettegen=stats_mode=full[p];"
                  "[b][p]paletteuse=dither=bayer:bayer_scale=3",
                  srcSampleFps, gifWidth, outH);
     } else {
         snprintf(filterDesc, sizeof(filterDesc),
-                 "fps=fps=%.4f,scale=%d:%d:flags=lanczos,"
+                 "fps=fps=%.4f:round=up:eof_action=pass,scale=%d:%d:flags=lanczos,"
                  "format=rgb24,colorspace=all=bt709:iall=bt709:fast=1,"
                  "setparams=colorspace=bt709:color_primaries=bt709:color_trc=iec61966-2-1,"
                  "split[a][b];"
@@ -637,6 +911,14 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
         return false;
     }
 
+    // Frames shown at the marks (see SegmentFrames); raw mark times if the
+    // stream has no usable timestamps.
+    SegmentFrames sf;
+    if (!ResolveSegmentFrames(demuxer, range, sf)) {
+        sf.inPts  = ff::SecondsToPts(range.startSec, srcTimeBase);
+        sf.outPts = ff::SecondsToPts(range.endSec, srcTimeBase);
+    }
+
     // --- Decode, filter, encode loop ---
     demuxer.Seek(range.startSec);
     decoder.Flush();
@@ -652,8 +934,10 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
     std::vector<uint8_t> tmRGBA;
 
     int videoIdx = demuxer.GetVideoStreamIndex();
-    double segDuration = range.endSec - range.startSec;
-    bool inputDone = false;
+    double segStartSec = static_cast<double>(sf.inPts) * av_q2d(srcTimeBase);
+    double segDuration = static_cast<double>(sf.outPts - sf.inPts) * av_q2d(srcTimeBase);
+    // One output interval of the fps resampler, in source ticks.
+    const int64_t outIntervalTs = ff::SecondsToPts(1.0 / srcSampleFps, srcTimeBase) + 1;
     int64_t frameCount = 0;
 
     auto encodeFilteredFrames = [&]() -> bool {
@@ -695,102 +979,110 @@ bool Exporter::ExportSegmentGIF(const std::string& inputPath,
         }
     };
 
-    // Feed frames into filter graph
-    while (!inputDone && !m_cancel) {
-        ret = demuxer.ReadPacket(pkt);
-        if (ret == AVERROR_EOF) {
-            inputDone = true;
-            av_packet_unref(pkt);
-            break;
-        }
-        if (ret < 0 || pkt->stream_index != videoIdx) {
-            av_packet_unref(pkt);
-            if (ret < 0 && ret != AVERROR_EOF) {
-                inputDone = true;
-            }
-            continue;
+    // Feed one decoded frame to the filter graph and encode whatever comes
+    // out. Returns +1 to keep going, 0 once the out frame has been fed, -1 on
+    // error (progress error already set).
+    auto feedFrame = [&](AVFrame* frame) -> int {
+        int64_t pts = frame->best_effort_timestamp;
+        if (pts == AV_NOPTS_VALUE) pts = frame->pts;
+        if (pts < sf.inPts) return 1;  // keyframe pre-roll before the in frame
+
+        // Stretch the out frame to a full output interval so the end of
+        // stream lands in the next slot and the resampler emits it.
+        if (pts >= sf.outPts)
+            frame->duration = std::max<int64_t>(frame->duration, outIntervalTs);
+
+        // Update progress
+        if (segDuration > 0.0) {
+            double frameTime = static_cast<double>(pts) * av_q2d(srcTimeBase);
+            float segProgress = static_cast<float>((frameTime - segStartSec) / segDuration);
+            int totalItems = std::max(1, m_progress.totalItems.load());
+            float base = static_cast<float>(m_progress.currentItem - 1) / totalItems;
+            m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalItems;
         }
 
-        // Check if past end of range
-        double pktTime = static_cast<double>(pkt->pts) * av_q2d(srcTimeBase);
-        if (pktTime > range.endSec) {
+        // In frame at t=0 so it owns the resampler's first slot; output
+        // timestamps are regenerated anyway.
+        frame->pts = pts - sf.inPts;
+
+        if (hdr) {
+            // Tone-map the HDR frame to SDR RGBA8, wrap it in an rgba AVFrame
+            // (keeping the source pts/time_base), and feed that to the graph.
+            const uint8_t* packed = gifConv.Convert(frame);
+            if (!packed || !m_tonemap.RenderToBuffer(packed, gifConv.GetWidth(),
+                                                     gifConv.GetHeight(), colorMode,
+                                                     colorPrimaries, m_settings.tonemapper,
+                                                     tmRGBA)) {
+                m_progress.SetError("GIF: HDR tone-map failed");
+                return -1;
+            }
+            AVFrame* rgbaFrame = av_frame_alloc();
+            rgbaFrame->format = AV_PIX_FMT_RGBA;
+            rgbaFrame->width = gifConv.GetWidth();
+            rgbaFrame->height = gifConv.GetHeight();
+            if (av_frame_get_buffer(rgbaFrame, 0) < 0) {
+                av_frame_free(&rgbaFrame);
+                m_progress.SetError("GIF: Failed to alloc RGBA frame");
+                return -1;
+            }
+            for (int y = 0; y < rgbaFrame->height; y++) {
+                memcpy(rgbaFrame->data[0] + static_cast<size_t>(y) * rgbaFrame->linesize[0],
+                       tmRGBA.data() + static_cast<size_t>(y) * rgbaFrame->width * 4,
+                       static_cast<size_t>(rgbaFrame->width) * 4);
+            }
+            rgbaFrame->pts = frame->pts;
+            rgbaFrame->duration = frame->duration;
+            ret = av_buffersrc_add_frame_flags(bufSrcCtx, rgbaFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
+            av_frame_free(&rgbaFrame);
+        } else {
+            ret = av_buffersrc_add_frame(bufSrcCtx, frame);
+        }
+        if (ret < 0) {
+            m_progress.SetError("GIF: Failed to feed filter: " + ff::ErrorString(ret));
+            return -1;
+        }
+
+        if (!encodeFilteredFrames()) return -1;
+        // Presentation order: the first frame at or past the out pts is the
+        // out frame.
+        return (pts >= sf.outPts) ? 0 : 1;
+    };
+
+    // Read until the out frame has been fed; drain the decoder at EOF so an
+    // out frame in the last GOP isn't lost.
+    int feedStatus = 1;
+    while (feedStatus > 0 && !m_cancel) {
+        ret = demuxer.ReadPacket(pkt);
+        if (ret == AVERROR_EOF) {
             av_packet_unref(pkt);
-            inputDone = true;
+            decoder.DrainAtEOF(decFrame, [&](AVFrame* f) {
+                feedStatus = feedFrame(f);
+                return feedStatus > 0;
+            });
+            if (feedStatus > 0) feedStatus = 0;  // ran out of frames first
             break;
+        }
+        if (ret < 0) {
+            av_packet_unref(pkt);
+            break;  // read error: finish the GIF with what we have
+        }
+        if (pkt->stream_index != videoIdx) {
+            av_packet_unref(pkt);
+            continue;
         }
 
         decoder.SendPacket(pkt);
         av_packet_unref(pkt);
 
-        while (true) {
+        while (feedStatus > 0) {
             ret = decoder.ReceiveFrame(decFrame);
-            if (ret == AVERROR(EAGAIN)) break;
-            if (ret == AVERROR_EOF) { inputDone = true; break; }
-            if (ret < 0) { inputDone = true; break; }
-
-            double frameTime = static_cast<double>(decFrame->pts) * av_q2d(srcTimeBase);
-
-            // Skip frames before range start
-            if (frameTime < range.startSec) {
-                av_frame_unref(decFrame);
-                continue;
-            }
-            if (frameTime > range.endSec) {
-                av_frame_unref(decFrame);
-                inputDone = true;
-                break;
-            }
-
-            // Update progress
-            if (segDuration > 0.0) {
-                float segProgress = static_cast<float>((frameTime - range.startSec) / segDuration);
-                int totalItems = std::max(1, m_progress.totalItems.load());
-                float base = static_cast<float>(m_progress.currentItem - 1) / totalItems;
-                m_progress.fraction = base + std::max(0.0f, std::min(segProgress, 1.0f)) / totalItems;
-            }
-
-            if (hdr) {
-                // Tone-map the HDR frame to SDR RGBA8, wrap it in an rgba AVFrame
-                // (keeping the source pts/time_base), and feed that to the graph.
-                const uint8_t* packed = gifConv.Convert(decFrame);
-                if (!packed || !m_tonemap.RenderToBuffer(packed, gifConv.GetWidth(),
-                                                         gifConv.GetHeight(), colorMode,
-                                                         colorPrimaries, m_settings.tonemapper,
-                                                         tmRGBA)) {
-                    av_frame_unref(decFrame);
-                    m_progress.SetError("GIF: HDR tone-map failed");
-                    goto gif_cleanup;
-                }
-                AVFrame* rgbaFrame = av_frame_alloc();
-                rgbaFrame->format = AV_PIX_FMT_RGBA;
-                rgbaFrame->width = gifConv.GetWidth();
-                rgbaFrame->height = gifConv.GetHeight();
-                if (av_frame_get_buffer(rgbaFrame, 0) < 0) {
-                    av_frame_free(&rgbaFrame);
-                    av_frame_unref(decFrame);
-                    m_progress.SetError("GIF: Failed to alloc RGBA frame");
-                    goto gif_cleanup;
-                }
-                for (int y = 0; y < rgbaFrame->height; y++) {
-                    memcpy(rgbaFrame->data[0] + static_cast<size_t>(y) * rgbaFrame->linesize[0],
-                           tmRGBA.data() + static_cast<size_t>(y) * rgbaFrame->width * 4,
-                           static_cast<size_t>(rgbaFrame->width) * 4);
-                }
-                rgbaFrame->pts = decFrame->pts;
-                ret = av_buffersrc_add_frame_flags(bufSrcCtx, rgbaFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
-                av_frame_free(&rgbaFrame);
-            } else {
-                ret = av_buffersrc_add_frame(bufSrcCtx, decFrame);
-            }
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+            if (ret < 0) { feedStatus = 0; break; }
+            feedStatus = feedFrame(decFrame);
             av_frame_unref(decFrame);
-            if (ret < 0) {
-                m_progress.SetError("GIF: Failed to feed filter: " + ff::ErrorString(ret));
-                goto gif_cleanup;
-            }
-
-            if (!encodeFilteredFrames()) goto gif_cleanup;
         }
     }
+    if (feedStatus < 0) goto gif_cleanup;
 
     // Flush filter graph
     if (av_buffersrc_add_frame(bufSrcCtx, nullptr) < 0) goto gif_cleanup;
