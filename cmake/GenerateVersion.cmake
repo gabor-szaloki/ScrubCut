@@ -10,6 +10,8 @@
 # Only writes the file if its content would change, to avoid forcing a rebuild
 # on every invocation when nothing has changed.
 
+cmake_minimum_required(VERSION 3.21)  # script mode: enables IN_LIST policy
+
 find_package(Git QUIET)
 
 set(GIT_HASH "unknown")
