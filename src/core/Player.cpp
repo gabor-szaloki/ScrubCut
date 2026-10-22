@@ -126,14 +126,25 @@ bool Player::Open(const std::string& path) {
                 AVDictionaryEntry* e = av_dict_get(st->metadata, key, nullptr, 0);
                 return (e && e->value) ? e->value : std::string();
             };
+            // MP4/MOV store a track title as a "name" atom, read back under that key.
+            auto getTitle = [&]() {
+                std::string t = getTag("title");
+                return t.empty() ? getTag("name") : t;
+            };
+            // "und" (ISO 639-2 undetermined) is what MP4/MOV write for an
+            // untagged track; the language field is mandatory there.
+            auto getLanguage = [&]() {
+                std::string l = getTag("language");
+                return l == "und" ? std::string() : l;
+            };
 
             if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
                 AudioTrackInfo a;
                 a.streamIndex = static_cast<int>(i);
-                a.language = getTag("language");
+                a.language = getLanguage();
                 a.codecName = avcodec_get_name(par->codec_id);
                 a.channels = par->ch_layout.nb_channels;
-                std::string title = getTag("title");
+                std::string title = getTitle();
                 // Technical info (codec + channels) is always shown; language is
                 // included when tagged. With a title, append it parenthetically;
                 // without, use the language (or "Audio") as the name.
@@ -150,7 +161,7 @@ bool Player::Open(const std::string& path) {
             } else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
                 SubtitleTrackInfo s;
                 s.streamIndex = static_cast<int>(i);
-                s.language = getTag("language");
+                s.language = getLanguage();
                 switch (par->codec_id) {
                     case AV_CODEC_ID_DVD_SUBTITLE:
                     case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
@@ -162,7 +173,7 @@ bool Player::Open(const std::string& path) {
                         s.textBased = true;
                         break;
                 }
-                std::string title = getTag("title");
+                std::string title = getTitle();
                 if (!title.empty()) {
                     s.title = title;
                 } else {
