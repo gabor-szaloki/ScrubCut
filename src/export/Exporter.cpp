@@ -188,16 +188,15 @@ std::string Exporter::BuildOutputPath(const std::string& basePath, const std::st
     std::string stem = base.filename().string();
     std::string dir = base.parent_path().string();
 
-    std::string suffix;
-    if (!markName.empty()) {
-        suffix = m_settings.delimiter + markName;
-    } else {
+    std::string name = markName;
+    if (name.empty()) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%03d", fallbackIndex + 1);
-        suffix = m_settings.delimiter + buf;
+        name = buf;
     }
+    std::string prefix = m_settings.useBaseName ? stem + m_settings.delimiter : std::string();
 
-    std::filesystem::path result = std::filesystem::path(dir) / (stem + suffix + extension);
+    std::filesystem::path result = std::filesystem::path(dir) / (prefix + name + extension);
     return result.string();
 }
 

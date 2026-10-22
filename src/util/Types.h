@@ -117,6 +117,7 @@ struct SubtitleEvent {
 struct ExportSettings {
     std::string outputPath;
     std::string delimiter = "_"; // between base filename and mark name
+    bool useBaseName = true;     // false: files are named by mark name alone
     std::vector<TimeRange> segments;
     std::vector<FrameMark> frames;
     int gifWidth = 480;

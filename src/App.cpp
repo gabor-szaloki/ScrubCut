@@ -421,6 +421,7 @@ bool App::Init() {
         snprintf(m_exportCustomDir, sizeof(m_exportCustomDir), "%s", customDir.c_str());
         std::string delim = m_prefSettings.GetString("export_delimiter", "_");
         snprintf(m_exportDelimiter, sizeof(m_exportDelimiter), "%s", delim.c_str());
+        m_exportUseBaseName = m_prefSettings.GetBool("export_use_base_name", true);
     }
 
     LoadRecentFiles();
@@ -755,6 +756,7 @@ void App::Shutdown() {
         m_prefSettings.SetInt("export_dir_mode", static_cast<int>(m_exportDirMode));
         m_prefSettings.SetString("export_custom_dir", m_exportCustomDir);
         m_prefSettings.SetString("export_delimiter", m_exportDelimiter);
+        m_prefSettings.SetBool("export_use_base_name", m_exportUseBaseName);
         m_prefSettings.SetInt("tonemapper", static_cast<int>(m_tonemapper));
         m_prefSettings.SetBool("hdr_output", m_hdrOutputEnabled);
         SaveRecentFiles();
@@ -3598,17 +3600,23 @@ void App::Render() {
             // Delimiter column matches the Browse+Open block above it, so the
             // name input lines up with the dir input and both rows end flush.
             float delimW = browseW + openW + dirSpacing;
+            // The use-base-name checkbox leads the input row.
             float rowX = ImGui::GetCursorPosX();
+            float chkW = ImGui::GetFrameHeight() + dirSpacing;
             ImGui::Text("Filename Base:");
             ImGui::SameLine();
             ImGui::SetCursorPosX(rowX + dialogWidth - delimW);
             ImGui::Text("Delimiter:");
             TooltipFor("Text inserted between the base filename and each mark name");
-            ImGui::SetNextItemWidth(dialogWidth - delimW - dirSpacing);
+            ImGui::Checkbox("##use_base_name", &m_exportUseBaseName);
+            ImGui::SameLine();
+            if (!m_exportUseBaseName) ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(dialogWidth - delimW - dirSpacing - chkW);
             ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(delimW);
             ImGui::InputText("##delim", m_exportDelimiter, sizeof(m_exportDelimiter));
+            if (!m_exportUseBaseName) ImGui::EndDisabled();
 
             // Mark list with checkboxes in scrollable table
             ImGui::Spacing();
@@ -3756,7 +3764,8 @@ void App::Render() {
             // Output file preview
             ImGui::Spacing();
             if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
-                std::string stem = m_exportName;
+                std::string prefix = m_exportUseBaseName
+                    ? std::string(m_exportName) + m_exportDelimiter : std::string();
                 ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetUiScale()),
                                   ImGuiChildFlags_Borders);
                 bool anyForPreview = false;
@@ -3766,7 +3775,7 @@ void App::Render() {
                     std::string ext = extForRow(row);
                     const std::string& nm = nameForRow(row);
                     std::string filename = nm.empty() ? std::string("<unnamed>")
-                                                      : (stem + m_exportDelimiter + nm + ext);
+                                                      : (prefix + nm + ext);
                     bool exists = !nm.empty() &&
                                   std::filesystem::exists(std::filesystem::path(m_exportDir) / filename);
                     if (exists)
@@ -3830,6 +3839,7 @@ void App::Render() {
                 // currently viewing with.
                 m_pendingExport.tonemapper = m_tonemapper;
                 m_pendingExport.delimiter = m_exportDelimiter;
+                m_pendingExport.useBaseName = m_exportUseBaseName;
                 m_pendingExport.segments.clear();
                 m_pendingExport.frames.clear();
                 for (const Row& row : rows) {
@@ -3843,17 +3853,18 @@ void App::Render() {
                 // base name, so filename() (not stem()) — base names may
                 // contain dots.
                 std::filesystem::path base(m_pendingExport.outputPath);
-                std::string stem = base.filename().string();
+                std::string prefix = m_pendingExport.useBaseName
+                    ? base.filename().string() + m_pendingExport.delimiter : std::string();
                 std::string dir = base.parent_path().string();
                 m_conflictingFiles.clear();
                 for (const auto& seg : m_pendingExport.segments) {
                     std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + m_pendingExport.delimiter + seg.name + ext);
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + seg.name + ext);
                     if (std::filesystem::exists(outPath))
                         m_conflictingFiles.push_back(outPath.filename().string());
                 }
                 for (const auto& fm : m_pendingExport.frames) {
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + m_pendingExport.delimiter + fm.name + ".png");
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + fm.name + ".png");
                     if (std::filesystem::exists(outPath))
                         m_conflictingFiles.push_back(outPath.filename().string());
                 }
@@ -3984,17 +3995,18 @@ void App::Render() {
             ImGui::SameLine();
             if (ImGui::Button("Skip Existing", ImVec2(btnW, 0))) {
                 std::filesystem::path base(m_pendingExport.outputPath);
-                std::string stem = base.filename().string();
+                std::string prefix = m_pendingExport.useBaseName
+                    ? base.filename().string() + m_pendingExport.delimiter : std::string();
                 std::string dir = base.parent_path().string();
                 std::vector<TimeRange> filteredSegs;
                 for (const auto& seg : m_pendingExport.segments) {
                     std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + m_pendingExport.delimiter + seg.name + ext);
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + seg.name + ext);
                     if (!std::filesystem::exists(outPath)) filteredSegs.push_back(seg);
                 }
                 std::vector<FrameMark> filteredFrames;
                 for (const auto& fm : m_pendingExport.frames) {
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (stem + m_pendingExport.delimiter + fm.name + ".png");
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + fm.name + ".png");
                     if (!std::filesystem::exists(outPath)) filteredFrames.push_back(fm);
                 }
                 m_pendingExport.segments = filteredSegs;

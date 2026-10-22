@@ -304,6 +304,9 @@ private:
     // Delimiter between the base filename and mark names, persisted across
     // sessions.
     char m_exportDelimiter[16] = "_";
+    // When off, exported files are named by mark name alone (no base name or
+    // delimiter). Persisted across sessions.
+    bool m_exportUseBaseName = true;
 
     // Export output-directory mode. SameAsVideo (default) auto-fills the
     // export dir with the opened video's parent on each open. Custom uses
