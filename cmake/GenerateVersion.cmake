@@ -1,4 +1,5 @@
-# Generate a header with project version + git hash + dirty flag.
+# Generate a header with project version + git hash + dirty flag + whether
+# HEAD is the release tag (v<PROJECT_VERSION>).
 #
 # Invoked at build time via: cmake -P GenerateVersion.cmake
 # Inputs (passed as -DVAR=value):
@@ -13,6 +14,7 @@ find_package(Git QUIET)
 
 set(GIT_HASH "unknown")
 set(GIT_DIRTY 0)
+set(GIT_ON_RELEASE_TAG 0)
 
 if(GIT_EXECUTABLE AND EXISTS "${SOURCE_DIR}/.git")
     execute_process(
@@ -37,6 +39,18 @@ if(GIT_EXECUTABLE AND EXISTS "${SOURCE_DIR}/.git")
     if(NOT _status STREQUAL "")
         set(GIT_DIRTY 1)
     endif()
+
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} tag --points-at HEAD
+        WORKING_DIRECTORY ${SOURCE_DIR}
+        OUTPUT_VARIABLE _tags
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    string(REPLACE "\n" ";" _tags "${_tags}")
+    if("v${PROJECT_VERSION}" IN_LIST _tags)
+        set(GIT_ON_RELEASE_TAG 1)
+    endif()
 endif()
 
 set(_new
@@ -44,6 +58,7 @@ set(_new
 #define SCRUBCUT_VERSION \"${PROJECT_VERSION}\"
 #define SCRUBCUT_GIT_HASH \"${GIT_HASH}\"
 #define SCRUBCUT_GIT_DIRTY ${GIT_DIRTY}
+#define SCRUBCUT_GIT_ON_RELEASE_TAG ${GIT_ON_RELEASE_TAG}
 ")
 
 set(_old "")
@@ -51,7 +66,10 @@ if(EXISTS "${OUTPUT_FILE}")
     file(READ "${OUTPUT_FILE}" _old)
 endif()
 
+# "" = clean release tag, "*" = clean but not the release tag, "**" = dirty
 if(GIT_DIRTY)
+    set(_dirty "**")
+elseif(NOT GIT_ON_RELEASE_TAG)
     set(_dirty "*")
 else()
     set(_dirty "")

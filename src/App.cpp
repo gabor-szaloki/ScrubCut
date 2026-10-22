@@ -2262,12 +2262,16 @@ void App::Render() {
             ImGui::EndMenu();
         }
 
-        // Version string at right edge of the menu bar
+        // Version string at right edge of the menu bar. No mark = clean
+        // build of the release tag, "*" = clean but a different commit,
+        // "**" = built from uncommitted changes.
         {
             char verBuf[64];
             snprintf(verBuf, sizeof(verBuf), "v%s - %s%s",
                      SCRUBCUT_VERSION, SCRUBCUT_GIT_HASH,
-                     SCRUBCUT_GIT_DIRTY ? "*" : "");
+                     SCRUBCUT_GIT_DIRTY            ? "**"
+                     : SCRUBCUT_GIT_ON_RELEASE_TAG ? ""
+                                                   : "*");
             float w = ImGui::CalcTextSize(verBuf).x;
             float avail = ImGui::GetContentRegionAvail().x;
             float pad = ImGui::GetStyle().ItemSpacing.x;
