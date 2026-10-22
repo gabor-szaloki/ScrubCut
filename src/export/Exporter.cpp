@@ -89,6 +89,17 @@ void Exporter::ExportThread() {
         std::lock_guard<std::mutex> lock(m_outputPathsMutex);
         m_outputPaths.push_back(outPath);
     };
+    // The export folder may be a typed-in custom path that doesn't exist yet.
+    std::filesystem::path outDir = std::filesystem::u8path(m_settings.outputPath).parent_path();
+    std::error_code dirEc;
+    std::filesystem::create_directories(outDir, dirEc);
+    if (dirEc) {
+        m_progress.SetError("Failed to create output folder: " + outDir.u8string() +
+                            " (" + dirEc.message() + ")");
+        finish();
+        return;
+    }
+
     std::string srcExt = std::filesystem::path(m_inputPath).extension().string();
 
     // Matroska (.mkv/.webm) doesn't support edit lists, so stream-copy
