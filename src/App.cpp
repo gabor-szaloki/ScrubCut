@@ -2191,63 +2191,6 @@ void App::Render() {
                 m_showHelpPanel = !m_showHelpPanel;
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Show on GitHub"))
-                SDL_OpenURL(UpdateChecker::kRepoUrl);
-            // Update status: text plus a right-aligned button (same layout as
-            // the Subtitle Delay row). Buttons keep the menu open, so the row
-            // updates in place.
-            {
-                using S = UpdateChecker::State;
-                const S state = m_updateChecker.GetState();
-                const char* label = "Check for updates";   // Idle
-                const char* button = "Check";
-                std::string available;
-                switch (state) {
-                case S::Checking:
-                    label = "Checking...";
-                    button = nullptr;
-                    break;
-                case S::UpToDate:
-                    label = "ScrubCut is up to date";
-                    break;
-                case S::UpdateAvailable:
-                    available = "Update available (v" + m_updateChecker.GetLatestVersion() + ")";
-                    label = available.c_str();
-                    button = "Download";
-                    break;
-                case S::Failed:
-                    label = "Update check failed";
-                    button = "Retry";
-                    break;
-                case S::Idle:
-                    break;
-                }
-                ImGui::AlignTextToFramePadding();
-                if (state == S::Checking)
-                    ImGui::TextDisabled("%s", label);
-                else
-                    ImGui::TextUnformatted(label);
-                // Diagnostic, so not gated by the tooltip preference.
-                if (state == S::Failed && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-                    ImGui::SetTooltip("%s", m_updateChecker.GetError().c_str());
-                if (button) {
-                    ImGui::SameLine();
-                    const ImGuiStyle& st = ImGui::GetStyle();
-                    float btnW = ImGui::CalcTextSize(button).x + st.FramePadding.x * 2.0f;
-                    float avail = ImGui::GetContentRegionAvail().x;
-                    if (avail > btnW)
-                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - btnW));
-                    if (ImGui::Button(button)) {
-                        if (state == S::UpdateAvailable) {
-                            SDL_OpenURL(m_updateChecker.GetLatestUrl().c_str());
-                            ImGui::CloseCurrentPopup();   // like a MenuItem would
-                        } else {
-                            m_updateChecker.Start();
-                        }
-                    }
-                }
-            }
-            ImGui::Separator();
             // Same switch -profile arms at launch; records only while a
             // Tracy viewer/capture is connected (see util/Profiler.h).
             bool profilerOn = Profiler::IsEnabled();
@@ -2262,22 +2205,90 @@ void App::Render() {
             ImGui::EndMenu();
         }
 
-        // Version string at right edge of the menu bar. No mark = clean
+        // Version menu at right edge of the menu bar. No mark = clean
         // build of the release tag, "*" = clean but a different commit,
-        // "**" = built from uncommitted changes.
+        // "**" = built from uncommitted changes. "(!)" = update available.
         {
-            char verBuf[64];
-            snprintf(verBuf, sizeof(verBuf), "v%s - %s%s",
+            const bool updateAvailable =
+                m_updateChecker.GetState() == UpdateChecker::State::UpdateAvailable;
+            char verBuf[80];
+            snprintf(verBuf, sizeof(verBuf), "v%s - %s%s%s###VersionMenu",
                      SCRUBCUT_VERSION, SCRUBCUT_GIT_HASH,
                      SCRUBCUT_GIT_DIRTY            ? "**"
                      : SCRUBCUT_GIT_ON_RELEASE_TAG ? ""
-                                                   : "*");
-            float w = ImGui::CalcTextSize(verBuf).x;
+                                                   : "*",
+                     updateAvailable ? " (!)" : "");
+            float w = ImGui::CalcTextSize(verBuf, nullptr, true).x;
             float avail = ImGui::GetContentRegionAvail().x;
             float pad = ImGui::GetStyle().ItemSpacing.x;
             if (avail > w + pad) {
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - w - pad);
-                ImGui::TextDisabled("%s", verBuf);
+                // Dimmed like a status readout; full white while hovered or open.
+                if (!m_versionMenuHot)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                const bool open = ImGui::BeginMenu(verBuf);
+                if (!m_versionMenuHot)
+                    ImGui::PopStyleColor();
+                m_versionMenuHot = open || ImGui::IsItemHovered();
+                if (open) {
+                    if (ImGui::MenuItem("Show on GitHub"))
+                        SDL_OpenURL(UpdateChecker::kRepoUrl);
+                    // Update status: text plus a right-aligned button (same layout as
+                    // the Subtitle Delay row). Buttons keep the menu open, so the row
+                    // updates in place.
+                    {
+                        using S = UpdateChecker::State;
+                        const S state = m_updateChecker.GetState();
+                        const char* label = "Check for updates";   // Idle
+                        const char* button = "Check";
+                        std::string available;
+                        switch (state) {
+                        case S::Checking:
+                            label = "Checking...";
+                            button = nullptr;
+                            break;
+                        case S::UpToDate:
+                            label = "ScrubCut is up to date";
+                            break;
+                        case S::UpdateAvailable:
+                            available = "Update available (v" + m_updateChecker.GetLatestVersion() + ")";
+                            label = available.c_str();
+                            button = "Download";
+                            break;
+                        case S::Failed:
+                            label = "Update check failed";
+                            button = "Retry";
+                            break;
+                        case S::Idle:
+                            break;
+                        }
+                        ImGui::AlignTextToFramePadding();
+                        if (state == S::Checking)
+                            ImGui::TextDisabled("%s", label);
+                        else
+                            ImGui::TextUnformatted(label);
+                        // Diagnostic, so not gated by the tooltip preference.
+                        if (state == S::Failed && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                            ImGui::SetTooltip("%s", m_updateChecker.GetError().c_str());
+                        if (button) {
+                            ImGui::SameLine();
+                            const ImGuiStyle& st = ImGui::GetStyle();
+                            float btnW = ImGui::CalcTextSize(button).x + st.FramePadding.x * 2.0f;
+                            float avail = ImGui::GetContentRegionAvail().x;
+                            if (avail > btnW)
+                                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - btnW));
+                            if (ImGui::Button(button)) {
+                                if (state == S::UpdateAvailable) {
+                                    SDL_OpenURL(m_updateChecker.GetLatestUrl().c_str());
+                                    ImGui::CloseCurrentPopup();   // like a MenuItem would
+                                } else {
+                                    m_updateChecker.Start();
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
             }
         }
 

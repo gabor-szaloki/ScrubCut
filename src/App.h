@@ -189,6 +189,7 @@ private:
     WaveformExtractor m_waveform;
     // GitHub release check: started at the end of Init(), polled in Run().
     UpdateChecker m_updateChecker;
+    bool m_versionMenuHot = false;   // hovered/open last frame; lights up the label
 
     // UI state — window visibility
     bool m_showTimeline = true;
