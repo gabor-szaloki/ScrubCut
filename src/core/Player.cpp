@@ -341,7 +341,9 @@ void Player::Play() {
     double curTime = m_clock.GetTime();
     double duration = m_demuxer.GetDuration();
     bool atActualEnd = duration > 0.0 && curTime >= duration - 0.001;
+    bool restarted = false;
     if (m_eof && atActualEnd) {
+        restarted = true;
         // Restart from beginning. Pipeline is parked (Pause did that, or
         // playback ended which leaves it parked too).
         ParkPipeline();
@@ -354,6 +356,13 @@ void Player::Play() {
 
     double resumeTime = m_clock.GetTime();
     ClearStagedFrame();
+
+    // Audio played well past the resume point: that content is gone and the
+    // packet queue only continues from the end of the buffered audio, so
+    // re-seek. TryGetVideoFrame absorbs smaller leads.
+    if (m_hasAudio && !restarted &&
+        m_audioOutput.GetPlaybackPosition() - resumeTime > 0.100)
+        m_needsResync = true;
 
     // If the last operation left the decoder out of sync with what's
     // displayed (backward-step cache hit), re-seek now so the threads
@@ -381,6 +390,8 @@ void Player::Play() {
                 // Clock moved forward within buffered content (frame steps):
                 // the stream head was consumed up to resumeTime, the rest
                 // plays on in sync.
+            } else if (gap < 0.0 && !restarted) {
+                // Slightly ahead: TryGetVideoFrame anchors the clock to it.
             } else {
                 // Content at resumeTime isn't in the stream (restart from 0,
                 // or stepped past the buffered end): rebuild from the packet
