@@ -848,6 +848,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
 
     // Read and write packets
     AVPacket* pkt = av_packet_alloc();
+    std::vector<int64_t> lastDts(inFmt->nb_streams, AV_NOPTS_VALUE);
     bool done = false;
     while (!done && !m_cancel) {
         const bool leadIn = !subLeadIns.empty();
@@ -887,6 +888,28 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
                 goto cleanup;
             }
         }
+
+        // Matroska stores no DTS; after a seek the demuxer can't derive one
+        // for the first packet of a stream with reordered frames (the
+        // keyframe the copy starts on). Fill gaps like the ffmpeg CLI does:
+        // the first packet sits the reorder delay before its pts, later ones
+        // follow the previous dts — never past their own pts.
+        if (pkt->dts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE && !isSub) {
+            const AVStream* st = inFmt->streams[inIdx];
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+                pkt->dts = pkt->pts;
+            } else {
+                int64_t frameDur = pkt->duration;
+                if (frameDur <= 0 && st->avg_frame_rate.num > 0)
+                    frameDur = av_rescale_q(1, av_inv_q(st->avg_frame_rate), st->time_base);
+                frameDur = std::max<int64_t>(frameDur, 1);
+                int64_t guess = (lastDts[inIdx] != AV_NOPTS_VALUE)
+                                    ? lastDts[inIdx] + frameDur
+                                    : pkt->pts - std::max(st->codecpar->video_delay, 1) * frameDur;
+                pkt->dts = std::min(guess, pkt->pts);
+            }
+        }
+        if (pkt->dts != AV_NOPTS_VALUE) lastDts[inIdx] = pkt->dts;
 
         // Terminate via DTS (monotonic) with a margin past the out frame:
         // trailing B-frames arrive after it in decode order, and interleaved
