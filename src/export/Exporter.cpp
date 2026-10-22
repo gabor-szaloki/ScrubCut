@@ -10,6 +10,8 @@
 #include <SDL3/SDL.h>
 
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <vector>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -130,6 +132,8 @@ void Exporter::ExportThread() {
             // original .mkv/.webm extension.
             if (!ok && !m_cancel && remuxToMp4) {
                 LOG_WARN("MP4 remux failed; falling back to %s", srcExt.c_str());
+                std::error_code ec;
+                std::filesystem::remove(std::filesystem::u8path(outPath), ec);  // the partial MP4
                 m_progress.Reset();
                 m_progress.totalItems = totalItems;
                 m_progress.currentItem = itemsDone + 1;
@@ -488,6 +492,157 @@ static AVBSFContext* OpenTimingRewriteFilter(AVFormatContext* inFmt, int videoId
 }
 
 // ---------------------------------------------------------------------------
+// Stream tags and subtitle conversion for stream-copy exports
+// ---------------------------------------------------------------------------
+// Copy tags (language, title, ...) minus mkvmerge's per-track statistics
+// (BPS, DURATION, NUMBER_OF_FRAMES, ...): they describe the whole source
+// track and would be stale on a segment. Matroska suffixes them with a
+// language ("BPS-eng").
+static void CopyTags(AVDictionary** dst, const AVDictionary* src) {
+    static const char* const kStale[] = {"BPS", "DURATION", "NUMBER_OF_FRAMES", "NUMBER_OF_BYTES"};
+    const AVDictionaryEntry* e = nullptr;
+    while ((e = av_dict_iterate(src, e))) {
+        bool stale = strncmp(e->key, "_STATISTICS_", 12) == 0;
+        for (const char* name : kStale) {
+            size_t n = strlen(name);
+            if (strncmp(e->key, name, n) == 0 && (e->key[n] == '\0' || e->key[n] == '-'))
+                stale = true;
+        }
+        if (!stale) av_dict_set(dst, e->key, e->value, 0);
+    }
+    // MP4/MOV read a track title back as "name" but only write "title".
+    const AVDictionaryEntry* name = av_dict_get(*dst, "name", nullptr, AV_DICT_MATCH_CASE);
+    if (name && !av_dict_get(*dst, "title", nullptr, 0))
+        av_dict_set(dst, "title", name->value, 0);
+}
+
+// Text subtitles the output muxer can't take as-is (SubRip/ASS/WebVTT into
+// MP4) are decoded cue by cue and re-encoded as mov_text, MP4's native text
+// format. Only the text payload changes; cue timing is handled by the copy
+// loop like any other packet.
+struct SubtitleConverter {
+    AVCodecContext* dec = nullptr;
+    AVCodecContext* enc = nullptr;
+
+    ~SubtitleConverter() {
+        avcodec_free_context(&dec);
+        avcodec_free_context(&enc);
+    }
+
+    bool Open(const AVStream* in, const AVCodecParameters* video) {
+        const AVCodec* decoder = avcodec_find_decoder(in->codecpar->codec_id);
+        const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MOV_TEXT);
+        if (!decoder || !encoder) return false;
+        dec = avcodec_alloc_context3(decoder);
+        if (!dec || avcodec_parameters_to_context(dec, in->codecpar) < 0) return false;
+        dec->pkt_timebase = in->time_base;
+        if (avcodec_open2(dec, decoder, nullptr) < 0) return false;
+
+        enc = avcodec_alloc_context3(encoder);
+        if (!enc) return false;
+        enc->time_base = AV_TIME_BASE_Q;
+        // mov_text scales ASS font sizes against the frame height.
+        if (video) {
+            enc->width = video->width;
+            enc->height = video->height;
+        }
+        // The decoder's ASS header carries the source styles.
+        if (dec->subtitle_header) {
+            enc->subtitle_header = static_cast<uint8_t*>(av_mallocz(dec->subtitle_header_size + 1));
+            if (!enc->subtitle_header) return false;
+            memcpy(enc->subtitle_header, dec->subtitle_header, dec->subtitle_header_size);
+            enc->subtitle_header_size = dec->subtitle_header_size;
+        }
+        return avcodec_open2(enc, encoder, nullptr) >= 0;
+    }
+
+    // Replace `pkt`'s payload with the mov_text encoding of its cue, keeping
+    // its timing. A packet without a duration takes the decoded cue's.
+    // Returns false for cues to drop (empty, undecodable).
+    bool Convert(AVPacket* pkt, std::vector<uint8_t>& buf) {
+        AVSubtitle sub;
+        int got = 0;
+        if (avcodec_decode_subtitle2(dec, &sub, &got, pkt) < 0 || !got) return false;
+        int size = -1;
+        if (sub.num_rects > 0) {
+            // The encoder requires the cue to start at its packet time.
+            if (pkt->duration <= 0 && sub.end_display_time > sub.start_display_time)
+                pkt->duration = av_rescale_q(sub.end_display_time - sub.start_display_time,
+                                             AVRational{1, 1000}, dec->pkt_timebase);
+            sub.end_display_time -= sub.start_display_time;
+            sub.start_display_time = 0;
+            size = avcodec_encode_subtitle(enc, buf.data(), static_cast<int>(buf.size()), &sub);
+        }
+        avsubtitle_free(&sub);
+        if (size <= 0) return false;
+
+        AVPacket* out = av_packet_alloc();
+        if (!out || av_new_packet(out, size) < 0) {
+            av_packet_free(&out);
+            return false;
+        }
+        memcpy(out->data, buf.data(), size);
+        av_packet_copy_props(out, pkt);
+        out->duration = pkt->duration;
+        out->stream_index = pkt->stream_index;
+        av_packet_unref(pkt);
+        av_packet_move_ref(pkt, out);
+        av_packet_free(&out);
+        return true;
+    }
+};
+
+// Subtitle cues already showing at the in frame usually start before the
+// keyframe the copy loop seeks to, so it never reads them (Matroska only
+// reaches back for subtitle tracks its Cues index, which muxers rarely do).
+// Collect them with a second demuxer from a bounded lookback, reading video
+// and the given subtitle streams only, up to the in frame. Returns the
+// packets unmodified, in read order.
+static constexpr double kSubtitleLookbackSec = 30.0;
+
+struct PacketDeleter {
+    void operator()(AVPacket* p) const { av_packet_free(&p); }
+};
+using PacketPtr = std::unique_ptr<AVPacket, PacketDeleter>;
+
+static std::deque<PacketPtr> CollectSubtitleLeadIns(const std::string& path, double inSec,
+                                                      int64_t videoStartPts,
+                                                      const std::vector<int>& subStreams,
+                                                      const std::vector<int64_t>& segStart,
+                                                      const std::atomic<bool>& cancel) {
+    PROFILE_SCOPE();
+    std::deque<PacketPtr> out;
+    Demuxer demuxer;
+    if (!demuxer.Open(path, "export subtitle lead-in")) return out;
+    AVFormatContext* fmt = demuxer.GetFormatContext();
+    const int videoIdx = demuxer.GetVideoStreamIndex();
+    std::vector<bool> isSub(fmt->nb_streams, false);
+    for (int s : subStreams) isSub[s] = true;
+    for (int i = 0; i < static_cast<int>(fmt->nb_streams); i++)
+        if (i != videoIdx && !isSub[i]) fmt->streams[i]->discard = AVDISCARD_ALL;
+
+    demuxer.Seek(std::max(0.0, inSec - kSubtitleLookbackSec));
+    AVPacket* pkt = av_packet_alloc();
+    while (!cancel && demuxer.ReadPacket(pkt) >= 0) {
+        const int idx = pkt->stream_index;
+        if (idx == videoIdx) {
+            int64_t ts = (pkt->dts != AV_NOPTS_VALUE) ? pkt->dts : pkt->pts;
+            av_packet_unref(pkt);
+            if (ts != AV_NOPTS_VALUE && ts >= videoStartPts) break;  // reached the in frame
+            continue;
+        }
+        if (idx >= 0 && idx < static_cast<int>(isSub.size()) && isSub[idx] &&
+            pkt->pts != AV_NOPTS_VALUE && pkt->pts < segStart[idx] &&
+            pkt->duration > 0 && pkt->pts + pkt->duration > segStart[idx]) {
+            out.emplace_back(av_packet_clone(pkt));
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Stream copy export
 // ---------------------------------------------------------------------------
 bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
@@ -510,16 +665,31 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         return false;
     }
 
-    // Map streams: copy video, and audio if effectively kept (GIF mode and
-    // non-1× speed force audio off because stream-copy can't produce clean
-    // audio output in those cases).
-    int videoInIdx = demuxer.GetVideoStreamIndex();
-    int audioInIdx = EffectiveKeepAudio(range) ? demuxer.GetAudioStreamIndex() : -1;
-    int videoOutIdx = -1;
-    int audioOutIdx = -1;
-    int outStreamCount = 0;
+    // Only MP4/MOV has an edit list to trim after muxing (see below).
+    const bool isMp4 = outFmt->oformat && outFmt->oformat->name &&
+                       (strcmp(outFmt->oformat->name, "mp4") == 0 ||
+                        strcmp(outFmt->oformat->name, "mov") == 0);
 
-    // Speed != 1: audio is already dropped (audioInIdx = -1), so only video
+    // Map streams in source order, with their tags and dispositions, so the
+    // output's track layout (and default/"best" tracks) match the source:
+    // - the main video stream;
+    // - every audio stream, if audio is effectively kept (GIF mode and
+    //   non-1× speed force audio off because stream-copy can't produce clean
+    //   audio output in those cases);
+    // - every subtitle stream the muxer accepts as-is; text subtitles it
+    //   doesn't are converted to mov_text for MP4, the rest (bitmap
+    //   subtitles in MP4) are dropped.
+    // Other streams (extra video, data, attachments) are not copied.
+    const int videoInIdx = demuxer.GetVideoStreamIndex();
+    const bool keepAudio = EffectiveKeepAudio(range);
+    struct StreamMap {
+        int outIdx = -1;
+        std::unique_ptr<SubtitleConverter> subConv;
+    };
+    std::vector<StreamMap> streams(inFmt->nb_streams);
+    std::vector<uint8_t> subBuf;  // mov_text encode scratch
+
+    // Speed != 1: audio is already dropped, so only video and subtitle
     // pts/dts/duration get divided by `speed`.
     const bool speedScaled = range.speed > 0.0 && std::abs(range.speed - 1.0) > 1e-6;
     const double speedInv = speedScaled ? (1.0 / range.speed) : 1.0;
@@ -527,27 +697,60 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
 
     for (int i = 0; i < static_cast<int>(inFmt->nb_streams); i++) {
         AVStream* inStream = inFmt->streams[i];
-        if (i == videoInIdx || i == audioInIdx) {
-            AVStream* outStream = avformat_new_stream(outFmt, nullptr);
-            if (!outStream) {
-                m_progress.SetError("Failed to create output stream");
-                av_bsf_free(&videoBsf);
-                avformat_free_context(outFmt);
-                return false;
+        const AVCodecParameters* par = inStream->codecpar;
+        bool convertSub = false;
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (i != videoInIdx) continue;
+        } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+            if (!keepAudio) continue;
+        } else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            if (avformat_query_codec(outFmt->oformat, par->codec_id, FF_COMPLIANCE_NORMAL) != 1) {
+                const AVCodecDescriptor* desc = avcodec_descriptor_get(par->codec_id);
+                bool text = desc && (desc->props & AV_CODEC_PROP_TEXT_SUB);
+                if (!isMp4 || !text) {
+                    LOG_INFO("Segment export: dropping subtitle stream %d (%s not supported by %s)",
+                             i, avcodec_get_name(par->codec_id), outFmt->oformat->name);
+                    continue;
+                }
+                streams[i].subConv = std::make_unique<SubtitleConverter>();
+                if (!streams[i].subConv->Open(inStream, demuxer.GetVideoCodecParams())) {
+                    LOG_WARN("Segment export: dropping subtitle stream %d (%s -> mov_text conversion unavailable)",
+                             i, avcodec_get_name(par->codec_id));
+                    streams[i].subConv.reset();
+                    continue;
+                }
+                convertSub = true;
+                if (subBuf.empty()) subBuf.resize(1 << 20);
             }
-            avcodec_parameters_copy(outStream->codecpar, inStream->codecpar);
-            if (i == videoInIdx && speedScaled) {
-                videoBsf = OpenTimingRewriteFilter(inFmt, videoInIdx, range.speed);
-                // Carries the rewritten extradata into the container header.
-                if (videoBsf) avcodec_parameters_copy(outStream->codecpar, videoBsf->par_out);
-            }
-            outStream->codecpar->codec_tag = 0;
-
-            if (i == videoInIdx) videoOutIdx = outStreamCount;
-            if (i == audioInIdx) audioOutIdx = outStreamCount;
-            outStreamCount++;
+        } else {
+            continue;
         }
+
+        AVStream* outStream = avformat_new_stream(outFmt, nullptr);
+        if (!outStream) {
+            m_progress.SetError("Failed to create output stream");
+            av_bsf_free(&videoBsf);
+            avformat_free_context(outFmt);
+            return false;
+        }
+        if (convertSub) {
+            avcodec_parameters_from_context(outStream->codecpar, streams[i].subConv->enc);
+            outStream->time_base = inStream->time_base;
+        } else {
+            avcodec_parameters_copy(outStream->codecpar, par);
+        }
+        if (i == videoInIdx && speedScaled) {
+            videoBsf = OpenTimingRewriteFilter(inFmt, videoInIdx, range.speed);
+            // Carries the rewritten extradata into the container header.
+            if (videoBsf) avcodec_parameters_copy(outStream->codecpar, videoBsf->par_out);
+        }
+        outStream->codecpar->codec_tag = 0;
+        outStream->disposition = inStream->disposition;
+        CopyTags(&outStream->metadata, inStream->metadata);
+        streams[i].outIdx = outStream->index;
     }
+    CopyTags(&outFmt->metadata, inFmt->metadata);
+    av_dict_set(&outFmt->metadata, "encoder", nullptr, 0);  // the muxer writes its own
 
     // Open output file
     if (!(outFmt->oformat->flags & AVFMT_NOFILE)) {
@@ -590,35 +793,60 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
     // User seconds map 1:1 to raw pts seconds (the Player's clock is
     // `frame->pts * tb`, no start_time subtraction).
     // videoEndPts is the last video packet kept (inclusive); the segment ends
-    // where that frame's display ends (videoEndTs), which is where audio cuts.
+    // where that frame's display ends (videoEndTs), which is where audio and
+    // subtitles cut.
     AVRational vtb = (videoInIdx >= 0) ? inFmt->streams[videoInIdx]->time_base
                                        : AVRational{1, AV_TIME_BASE};
     int64_t videoStartPts = snapped ? sf.inPts  : ff::SecondsToPts(range.startSec, vtb);
     int64_t videoEndPts   = snapped ? sf.outPts : ff::SecondsToPts(range.endSec, vtb);
     int64_t videoEndTs    = snapped ? sf.outPts + sf.outDur : videoEndPts;
-    int64_t audioStartPts = 0;
-    int64_t audioEndPts   = 0;
-    if (audioInIdx >= 0) {
-        AVRational atb = inFmt->streams[audioInIdx]->time_base;
-        audioStartPts = (videoInIdx >= 0) ? av_rescale_q(videoStartPts, vtb, atb)
-                                          : ff::SecondsToPts(range.startSec, atb);
-        audioEndPts   = (videoInIdx >= 0) ? av_rescale_q(videoEndTs, vtb, atb)
-                                          : ff::SecondsToPts(range.endSec, atb);
+
+    // Per-stream segment bounds in each stream's own time base. Video's end
+    // is the out frame (inclusive); the others end where its display ends
+    // (exclusive).
+    std::vector<int64_t> segStart(inFmt->nb_streams, 0), segEnd(inFmt->nb_streams, 0);
+    for (int i = 0; i < static_cast<int>(inFmt->nb_streams); i++) {
+        if (streams[i].outIdx < 0) continue;
+        if (i == videoInIdx) {
+            segStart[i] = videoStartPts;
+            segEnd[i]   = videoEndPts;
+            continue;
+        }
+        AVRational tb = inFmt->streams[i]->time_base;
+        segStart[i] = (videoInIdx >= 0) ? av_rescale_q(videoStartPts, vtb, tb)
+                                        : ff::SecondsToPts(range.startSec, tb);
+        segEnd[i]   = (videoInIdx >= 0) ? av_rescale_q(videoEndTs, vtb, tb)
+                                        : ff::SecondsToPts(range.endSec, tb);
     }
 
     double segDuration = static_cast<double>(videoEndTs - videoStartPts) * av_q2d(vtb);
     double effSegDuration = speedScaled ? segDuration / range.speed : segDuration;
 
-    // Only MP4/MOV has an edit list to trim after muxing (see below).
-    const bool isMp4 = outFmt->oformat && outFmt->oformat->name &&
-                       (strcmp(outFmt->oformat->name, "mp4") == 0 ||
-                        strcmp(outFmt->oformat->name, "mov") == 0);
+    // Cues already showing at the in frame go first; the copy loop then
+    // skips every cue starting before it, so none is written twice.
+    std::deque<PacketPtr> subLeadIns;
+    {
+        std::vector<int> subStreams;
+        for (int i = 0; i < static_cast<int>(inFmt->nb_streams); i++)
+            if (streams[i].outIdx >= 0 && inFmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                subStreams.push_back(i);
+        if (!subStreams.empty() && videoInIdx >= 0)
+            subLeadIns = CollectSubtitleLeadIns(inputPath, range.startSec, videoStartPts,
+                                                subStreams, segStart, m_cancel);
+    }
 
     // Read and write packets
     AVPacket* pkt = av_packet_alloc();
     bool done = false;
     while (!done && !m_cancel) {
-        ret = demuxer.ReadPacket(pkt);
+        const bool leadIn = !subLeadIns.empty();
+        if (leadIn) {
+            av_packet_move_ref(pkt, subLeadIns.front().get());
+            subLeadIns.pop_front();
+            ret = 0;
+        } else {
+            ret = demuxer.ReadPacket(pkt);
+        }
         if (ret == AVERROR_EOF) break;
         if (ret < 0) {
             m_progress.SetError("Read error: " + ff::ErrorString(ret));
@@ -627,19 +855,14 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
         }
 
         int inIdx = pkt->stream_index;
-        int outIdx = -1;
-        int64_t endPts = 0;
-
-        if (inIdx == videoInIdx) {
-            outIdx = videoOutIdx;
-            endPts = videoEndPts;
-        } else if (inIdx == audioInIdx) {
-            outIdx = audioOutIdx;
-            endPts = audioEndPts;
-        } else {
+        int outIdx = (inIdx >= 0 && inIdx < static_cast<int>(streams.size()))
+                         ? streams[inIdx].outIdx : -1;
+        if (outIdx < 0) {
             av_packet_unref(pkt);
             continue;
         }
+        const int64_t endPts = segEnd[inIdx];
+        const bool isSub = inFmt->streams[inIdx]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
 
         // Speed-changed copies: rewrite in-band parameter sets (see
         // OpenTimingRewriteFilter). The filter returns each packet immediately.
@@ -686,9 +909,32 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
             }
         }
 
+        const int64_t startPts = segStart[inIdx];
+        if (isSub) {
+            // Subtitle cues aren't pre-roll: clip each to the segment instead
+            // of letting the edit list hide it. A cue already showing at the
+            // in frame (a lead-in, see CollectSubtitleLeadIns) starts at 0.
+            bool keep = pkt->pts != AV_NOPTS_VALUE;
+            if (keep && pkt->pts < startPts) {
+                keep = leadIn && pkt->pts + pkt->duration > startPts;
+                if (keep) {
+                    pkt->duration -= startPts - pkt->pts;
+                    pkt->pts = startPts;
+                }
+            }
+            if (keep && pkt->duration > 0 && pkt->pts + pkt->duration > endPts)
+                pkt->duration = endPts - pkt->pts;
+            if (keep && streams[inIdx].subConv)
+                keep = streams[inIdx].subConv->Convert(pkt, subBuf);
+            if (!keep) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            pkt->dts = pkt->pts;
+        }
+
         // Rebase against the in frame; pre-roll packets get negative PTS/DTS,
         // which the MP4/MOV muxer turns into the edit list (see above).
-        int64_t startPts = (inIdx == videoInIdx) ? videoStartPts : audioStartPts;
         AVStream* inStream = inFmt->streams[inIdx];
         AVStream* outStream = outFmt->streams[outIdx];
 
@@ -704,7 +950,7 @@ bool Exporter::ExportSegmentStreamCopy(const std::string& inputPath,
 
         // Per-segment speed: scale this packet's timestamps. Audio at
         // speed != 1 was already filtered out at stream-mapping time, so
-        // only video reaches here.
+        // only video and subtitles reach here.
         if (speedScaled) {
             if (pkt->pts != AV_NOPTS_VALUE)
                 pkt->pts = static_cast<int64_t>(std::llround(static_cast<double>(pkt->pts) * speedInv));
