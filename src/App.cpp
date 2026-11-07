@@ -477,19 +477,21 @@ bool App::Init() {
         SDL_ShowWindow(m_window);
     }
 
-    // During the GPU init below the freshly shown window would sit solid
-    // black (SDL's WM_ERASEBKGND fill). Paint it with the UI background color
-    // through the software window surface — no GPU needed — so it looks like
-    // the app frame immediately. The surface is destroyed right away; the
-    // window is claimed for the GPU device below.
-    if (SDL_Surface* surface = SDL_GetWindowSurface(m_window)) {
-        PROFILE_SCOPE_N("PrepaintWindow");
-        // What's visible once the UI is up isn't the raw 0.1f clear color but
-        // the Viewport window's WindowBg (0.06, alpha 0.94) composited over
-        // it: 0.06*0.94 + 0.1*0.06 = 0.0624 -> RGB(15,15,15).
-        SDL_FillSurfaceRect(surface, nullptr, SDL_MapSurfaceRGB(surface, 15, 15, 15));
-        SDL_UpdateWindowSurface(m_window);
-        SDL_DestroyWindowSurface(m_window);
+    // Wayland does not support switching from SDL software window
+    // presentation to SDL_GPU presentation reliably.
+    // Avoid creating a software surface before claiming the window for GPU rendering.
+    const char* videoDriver = SDL_GetCurrentVideoDriver();
+    if (!videoDriver || SDL_strcmp(videoDriver, "wayland") != 0) {
+        // Existing prepaint code...
+        if (SDL_Surface* surface = SDL_GetWindowSurface(m_window)) {
+            PROFILE_SCOPE_N("PrepaintWindow");
+            // What's visible once the UI is up isn't the raw 0.1f clear color but
+            // the Viewport window's WindowBg (0.06, alpha 0.94) composited over
+            // it: 0.06*0.94 + 0.1*0.06 = 0.0624 -> RGB(15,15,15).
+            SDL_FillSurfaceRect(surface, nullptr, SDL_MapSurfaceRGB(surface, 15, 15, 15));
+            SDL_UpdateWindowSurface(m_window);
+            SDL_DestroyWindowSurface(m_window);
+        }
     }
     m_startupWindowShownNS = SDL_GetTicksNS();
 
