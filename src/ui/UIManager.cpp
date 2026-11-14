@@ -180,6 +180,19 @@ void UIManager::EndFrame(SDL_GPUCommandBuffer* cmd, SDL_GPUTexture* target) {
     SDL_EndGPURenderPass(pass);
 }
 
+// ImGui::DockBuilderGetCentralNode() returns the root node's cached CentralNode
+// pointer, which is only refreshed when ImGui::DockSpace() runs later in the
+// frame. NewFrame() can merge and delete dock nodes before that (e.g. when a
+// window is undocked), leaving the cached pointer dangling for the rest of that
+// frame. Find the central leaf by walking the live node tree instead.
+static ImGuiDockNode* FindCentralLeaf(ImGuiDockNode* node) {
+    if (!node) return nullptr;
+    if (node->IsLeafNode()) return node->IsCentralNode() ? node : nullptr;
+    for (int i = 0; i < 2; i++)
+        if (ImGuiDockNode* central = FindCentralLeaf(node->ChildNodes[i])) return central;
+    return nullptr;
+}
+
 void UIManager::SetupDockspace() {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGuiID dockspaceId = ImGui::GetID("MainDockspace");
@@ -203,7 +216,7 @@ void UIManager::SetupDockspace() {
     // "Viewport" tab. Other docked windows show their tab bar by default
     // (user can right-click a tab → "Hide Tab Bar" to hide; that choice
     // persists in imgui.ini per dock node).
-    if (ImGuiDockNode* centralNode = ImGui::DockBuilderGetCentralNode(dockspaceId)) {
+    if (ImGuiDockNode* centralNode = FindCentralLeaf(ImGui::DockBuilderGetNode(dockspaceId))) {
         centralNode->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
     }
 
