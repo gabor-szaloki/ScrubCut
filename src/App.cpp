@@ -2306,6 +2306,13 @@ void App::Render() {
     // Viewport panel
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    // Suppress the tab bar on whichever dock node hosts the Viewport — we
+    // never want a "Viewport" tab. Other docked windows show their tab bar
+    // by default (user can right-click a tab → "Hide Tab Bar" to hide; that
+    // choice persists in imgui.ini per dock node).
+    ImGuiWindowClass viewportClass;
+    viewportClass.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar;
+    ImGui::SetNextWindowClass(&viewportClass);
     ImGui::Begin("Viewport");
     // Gate on m_displayTexture, not m_videoTexture: a freshly created texture
     // has undefined contents (pink garbage on Metal) until the first decoded

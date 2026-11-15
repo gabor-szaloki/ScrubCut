@@ -199,14 +199,6 @@ void UIManager::SetupDockspace() {
         }
     }
 
-    // Suppress the tab bar on the Viewport's node — we never want a
-    // "Viewport" tab. Other docked windows show their tab bar by default
-    // (user can right-click a tab → "Hide Tab Bar" to hide; that choice
-    // persists in imgui.ini per dock node).
-    if (ImGuiDockNode* centralNode = ImGui::DockBuilderGetCentralNode(dockspaceId)) {
-        centralNode->LocalFlags |= ImGuiDockNodeFlags_NoTabBar;
-    }
-
     // When non-viewport windows are docked, the root node is split; reserve
     // the menu bar's height so docked windows don't get clipped under it.
     // When only the viewport is docked, cover the full viewport so video
