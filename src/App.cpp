@@ -210,6 +210,61 @@ static std::string FormatTime(double t, bool withMs, bool withHours = false) {
     return buf;
 }
 
+// Open Recent hover tooltip: full path, then (if showMarks) the file's marks
+// in time order.
+static void DrawRecentFileTooltip(const std::string& path, bool exists, bool showMarks,
+                                  const std::vector<TimeRange>& segments,
+                                  const std::vector<FrameMark>& frames) {
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(path.c_str());
+    if (!exists) ImGui::TextDisabled("(file no longer exists)");
+    if (showMarks && (!segments.empty() || !frames.empty())) {
+        struct Row { double t; const TimeRange* seg; const FrameMark* frame; };
+        std::vector<Row> rows;
+        bool hours = false;
+        for (const auto& sg : segments) {
+            rows.push_back({sg.startSec, &sg, nullptr});
+            hours |= sg.endSec >= 3600.0;
+        }
+        for (const auto& f : frames) {
+            rows.push_back({f.timeSec, nullptr, &f});
+            hours |= f.timeSec >= 3600.0;
+        }
+        std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.t < b.t; });
+
+        ImGui::Separator();
+        if (ImGui::BeginTable("##recentMarks", 4, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Type");
+            ImGui::TableSetupColumn("Name");
+            ImGui::TableSetupColumn("Time");
+            ImGui::TableSetupColumn("Duration");
+            ImGui::TableHeadersRow();
+            for (const Row& r : rows) {
+                const int color = r.seg ? r.seg->colorIndex : r.frame->colorIndex;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(GetSegmentColor(color)), "%s",
+                                   r.seg ? "Segment" : "Frame");
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(r.seg ? r.seg->name.c_str() : r.frame->name.c_str());
+                ImGui::TableNextColumn();
+                if (r.seg) {
+                    ImGui::Text("%s - %s", FormatTime(r.seg->startSec, true, hours).c_str(),
+                                FormatTime(r.seg->endSec, true, hours).c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s", FormatTime(r.seg->endSec - r.seg->startSec, true, hours).c_str());
+                } else {
+                    ImGui::TextUnformatted(FormatTime(r.frame->timeSec, true, hours).c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("-");
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::EndTooltip();
+}
+
 // Discrete playback-speed multipliers, matching the timeline's speed buttons.
 // Used both for export-segment speed and (separately) the in-app player speed.
 static constexpr double kPlaybackSpeeds[] = { 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 };
@@ -598,6 +653,7 @@ void App::Run() {
             m_pendingCloseFile = false;
             CloseFile();
         }
+        AutoSaveMarks();
         // Deferred subtitle-file open (dialog callback, possibly off-thread).
         if (!m_pendingSubtitlePath.empty()) {
             std::string p = m_pendingSubtitlePath;
@@ -749,6 +805,7 @@ void App::Shutdown() {
         ImGui::MarkIniSettingsDirty();
     }
 
+    SaveCurrentFileToRecents();  // before Close(), see its comment
     m_player.Close();
 
     // Save windowed mode geometry (tracked while not fullscreen and not
@@ -782,13 +839,16 @@ void App::Shutdown() {
         m_prefSettings.SetBool("export_use_base_name", m_exportUseBaseName);
         m_prefSettings.SetInt("tonemapper", static_cast<int>(m_tonemapper));
         m_prefSettings.SetBool("hdr_output", m_hdrOutputEnabled);
-        SaveRecentFiles();
+        m_prefSettings.SetInt("recent_max", m_recents.GetMax());
+        m_prefSettings.SetBool("recents_remember_marks", m_recentsRememberMarks);
+        m_prefSettings.SetBool("recents_remember_playhead", m_recentsRememberPlayhead);
         m_prefSettings.Save();
     }
     SDL_ShowCursor();
 
     // Join or abandon the update-check worker; must precede Profiler::Shutdown().
     m_updateChecker.Stop();
+    m_recents.Stop();  // flushes queued saves; also must precede Profiler::Shutdown()
 
     // Stop any in-flight export (joins its thread) before tearing down the GPU
     // resources it may still be using, then drain the GPU before releasing.
@@ -842,10 +902,7 @@ void App::RequestOpenFile(const std::string& path) {
     // on a non-main thread, and OpenFile touches GPU resources and player
     // state owned by the main thread.
     m_pendingOpenFilePath = path;
-    if (m_segments.GetTotalCount() > 0)
-        m_showOpenFileConfirm = true;
-    else
-        m_pendingOpenImmediate = true;
+    m_pendingOpenImmediate = true;
 }
 
 void App::OpenFile(const std::string& rawPath) {
@@ -853,6 +910,8 @@ void App::OpenFile(const std::string& rawPath) {
     // NFC-normalize so the stored/displayed path (title, recent list) uses
     // precomposed characters — macOS hands us NFD, which ImGui fonts can't draw.
     const std::string path = NormalizeUtf8NFC(rawPath);
+
+    SaveCurrentFileToRecents();
 
     m_player.Close();
 
@@ -870,6 +929,40 @@ void App::OpenFile(const std::string& rawPath) {
     m_currentFilePath = path;
     m_segments.Clear();
     m_segmentsClosedManually = false;
+
+    // Restore marks saved for this path. The file may have changed since, so
+    // drop marks past the new end and shorten segments that run over it.
+    // Sync read for other instances' latest data (cheap next to the open).
+    m_recents.Refresh();
+    m_recents.Touch(path);
+    const RecentEntry* saved = m_recents.Find(path);
+    if (m_recentsRememberMarks && saved && saved->MarkCount() > 0) {
+        const double dur = m_player.GetDuration();
+        std::vector<TimeRange> segs;
+        std::vector<FrameMark> frames;
+        for (TimeRange r : saved->segments) {
+            if (dur > 0.0) {
+                if (r.startSec >= dur) continue;
+                r.endSec = std::min(r.endSec, dur);
+            }
+            segs.push_back(std::move(r));
+        }
+        for (const FrameMark& f : saved->frames)
+            if (dur <= 0.0 || f.timeSec <= dur) frames.push_back(f);
+        const int dropped = saved->MarkCount() - static_cast<int>(segs.size() + frames.size());
+        m_segments.Restore(std::move(segs), std::move(frames));
+        const int restored = m_segments.GetTotalCount();
+        LOG_INFO("Restored %d saved mark(s), dropped %d past end", restored, dropped);
+        if (restored > 0) {
+            m_showSegments = true;
+            std::string msg = "Restored " + std::to_string(restored) +
+                              (restored == 1 ? " mark" : " marks");
+            if (dropped > 0)
+                msg += " (" + std::to_string(dropped) + " past end dropped)";
+            ShowStatus(msg);
+        }
+    }
+    m_marksSavedRevision = m_marksLastSeenRevision = m_segments.GetRevision();
 
     // Reset subtitles to "off" and rebuild the track list from the new file's
     // embedded subtitle streams (session-only — no persistence across opens).
@@ -897,13 +990,23 @@ void App::OpenFile(const std::string& rawPath) {
 #endif
     SDL_SetWindowTitle(m_window, title.c_str());
 
-    AddToRecent(path);
-
-    m_player.Play();
+    // Resume where the file was left (clamped, in case it changed), else
+    // play from the start.
+    if (m_recentsRememberPlayhead && saved && saved->positionSec >= 0.0) {
+        const double dur = m_player.GetDuration();
+        const double pos = dur > 0.0 ? std::min(saved->positionSec, dur) : saved->positionSec;
+        LOG_INFO("Restoring playhead %.3fs (%s)", pos, saved->paused ? "paused" : "playing");
+        m_player.SeekTo(pos, /*resumeAfter=*/!saved->paused);
+        m_seekTarget = pos;
+    } else {
+        m_player.Play();
+    }
 }
 
 void App::CloseFile() {
     PROFILE_SCOPE();
+
+    SaveCurrentFileToRecents();
 
     m_player.Close();
 
@@ -1275,31 +1378,48 @@ void App::RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
 }
 
 void App::LoadRecentFiles() {
-    m_recentFiles.clear();
-    for (int i = 0; i < kRecentMax; i++) {
+    PROFILE_SCOPE();
+    m_recents.SetMax(m_prefSettings.GetInt("recent_max", RecentFiles::kDefaultMax));
+    m_recentMaxEdit = m_recents.GetMax();
+    m_recentsRememberMarks = m_prefSettings.GetBool("recents_remember_marks", true);
+    m_recentsRememberPlayhead = m_prefSettings.GetBool("recents_remember_playhead", false);
+    if (m_recents.Load(GetAppDataDir() / "recents.ini"))
+        return;
+    // No recents.ini yet: migrate the old path-only recent_N keys.
+    std::vector<std::string> legacy;
+    for (int i = 0; i < RecentFiles::kMaxMax; i++) {
         std::string key = "recent_" + std::to_string(i);
         std::string p = m_prefSettings.GetString(key, "");
-        if (!p.empty()) m_recentFiles.push_back(std::move(p));
+        if (!p.empty()) legacy.push_back(std::move(p));
+        m_prefSettings.Remove(key);
     }
+    for (auto it = legacy.rbegin(); it != legacy.rend(); ++it)
+        m_recents.Touch(*it);
 }
 
-void App::SaveRecentFiles() {
-    for (int i = 0; i < kRecentMax; i++) {
-        std::string key = "recent_" + std::to_string(i);
-        m_prefSettings.SetString(key,
-            i < static_cast<int>(m_recentFiles.size()) ? m_recentFiles[i] : std::string());
+void App::SaveCurrentFileToRecents() {
+    PROFILE_SCOPE();
+    if (m_currentFilePath.empty()) return;
+    if (m_recentsRememberMarks) {
+        m_recents.SetMarks(m_currentFilePath, m_segments.GetSegments(), m_segments.GetFrames());
+        m_marksSavedRevision = m_marksLastSeenRevision = m_segments.GetRevision();
     }
+    if (m_recentsRememberPlayhead && m_player.HasMedia())
+        m_recents.SetPlayhead(m_currentFilePath, m_player.GetSeekTargetTime(), !m_player.IsPlaying());
 }
 
-void App::AddToRecent(const std::string& path) {
-    // Move-to-front: remove any existing entry for this path (so the list
-    // stays unique), prepend the new path, then trim to kRecentMax.
-    auto eq = [&](const std::string& s) { return s == path; };
-    m_recentFiles.erase(std::remove_if(m_recentFiles.begin(), m_recentFiles.end(), eq),
-                        m_recentFiles.end());
-    m_recentFiles.insert(m_recentFiles.begin(), path);
-    if (static_cast<int>(m_recentFiles.size()) > kRecentMax)
-        m_recentFiles.resize(kRecentMax);
+void App::AutoSaveMarks() {
+    if (!m_recentsRememberMarks) return;
+    // Debounced: a timeline drag bumps the revision every frame.
+    constexpr uint64_t kDebounceNS = 1'000'000'000ull;
+    const uint64_t rev = m_segments.GetRevision();
+    const uint64_t now = SDL_GetTicksNS();
+    if (rev != m_marksLastSeenRevision) {
+        m_marksLastSeenRevision = rev;
+        m_marksChangedNS = now;
+    }
+    if (rev != m_marksSavedRevision && now - m_marksChangedNS >= kDebounceNS)
+        SaveCurrentFileToRecents();
 }
 
 void App::ProcessEvents() {
@@ -1873,31 +1993,104 @@ void App::Render() {
                         static_cast<App*>(userdata)->RequestOpenFile(filelist[0]);
                 }, this, m_window, videoFilters, 2, nullptr, false);
             }
-            if (ImGui::BeginMenu("Open Recent", !m_recentFiles.empty())) {
-                std::string toReopen;
-                bool clearRequested = false;
-                for (int i = 0; i < static_cast<int>(m_recentFiles.size()); i++) {
-                    const std::string& full = m_recentFiles[i];
-                    std::string label = std::filesystem::path(full).filename().string();
-                    // Suffix index lets duplicate filenames have unique IDs.
-                    std::string itemId = label + "##recent" + std::to_string(i);
-                    std::error_code ec;
-                    bool exists = std::filesystem::exists(full, ec) && !ec;
-                    if (ImGui::MenuItem(itemId.c_str(), nullptr, false, exists)) toReopen = full;
-                    // AllowWhenDisabled so the missing-file tooltip still fires.
-                    if (g_tooltipsEnabled &&
-                        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                        if (exists)
-                            ImGui::SetTooltip("%s", full.c_str());
-                        else
-                            ImGui::SetTooltip("%s\n(file no longer exists)", full.c_str());
+            // Always enabled so the settings stay reachable when empty.
+            if (ImGui::BeginMenu("Open Recent")) {
+                // Just opened (not open last frame): pick up other instances'
+                // changes, and stat the files once rather than every frame.
+                if (m_recentMenuLastOpenFrame != ImGui::GetFrameCount() - 1) {
+                    m_recents.Refresh();
+                    m_recentExists.clear();
+                    for (const RecentEntry& e : m_recents.Entries()) {
+                        std::error_code ec;
+                        m_recentExists.push_back(std::filesystem::exists(e.path, ec) && !ec);
                     }
                 }
+                m_recentMenuLastOpenFrame = ImGui::GetFrameCount();
+                std::string toReopen;
+                const auto& entries = m_recents.Entries();
+                if (entries.empty())
+                    ImGui::MenuItem("(empty)", nullptr, false, false);
+                for (int i = 0; i < static_cast<int>(entries.size()); i++) {
+                    const RecentEntry& e = entries[i];
+                    // The open file's live marks may be ahead of the saved copy.
+                    const bool isOpen = e.path == m_currentFilePath;
+                    const auto& segs = isOpen ? m_segments.GetSegments() : e.segments;
+                    const auto& frames = isOpen ? m_segments.GetFrames() : e.frames;
+                    const int markCount = static_cast<int>(segs.size() + frames.size());
+                    std::string label = std::filesystem::path(e.path).filename().string();
+                    // Grayed "(this video)" suffix: MenuItem can't color part of
+                    // its label, so pad it with spaces and draw over them.
+                    static const char* kThisVideo = "(this video)";
+                    const float nameW = ImGui::CalcTextSize(label.c_str()).x;
+                    if (isOpen) {
+                        const float spaceW = ImGui::CalcTextSize(" ").x;
+                        const float padW = spaceW + ImGui::CalcTextSize(kThisVideo).x;
+                        label.append(static_cast<size_t>(std::ceil(padW / std::max(spaceW, 1.0f))), ' ');
+                    }
+                    // Suffix index lets duplicate filenames have unique IDs.
+                    std::string itemId = label + "##recent" + std::to_string(i);
+                    const ImVec2 itemPos = ImGui::GetCursorScreenPos();
+                    std::string countText;
+                    if (m_recentsRememberMarks && markCount > 0)
+                        countText = std::to_string(markCount) + (markCount == 1 ? " mark" : " marks");
+                    const bool exists = i >= static_cast<int>(m_recentExists.size()) || m_recentExists[i];
+                    if (ImGui::MenuItem(itemId.c_str(), countText.empty() ? nullptr : countText.c_str(),
+                                        false, exists))
+                        toReopen = e.path;
+                    if (isOpen)
+                        ImGui::GetWindowDrawList()->AddText(
+                            ImVec2(itemPos.x + nameW + ImGui::CalcTextSize(" ").x, itemPos.y),
+                            ImGui::GetColorU32(ImGuiCol_TextDisabled), kThisVideo);
+                    // AllowWhenDisabled so missing files still get a tooltip.
+                    if (g_tooltipsEnabled &&
+                        ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip |
+                                             ImGuiHoveredFlags_AllowWhenDisabled))
+                        DrawRecentFileTooltip(e.path, exists, m_recentsRememberMarks, segs, frames);
+                }
                 ImGui::Separator();
-                if (ImGui::MenuItem("Clear Recent")) clearRequested = true;
+                // Laid out like UI Scale. Typed values apply once the field is
+                // inactive, so typing "25" doesn't first trim the list to 2.
+                {
+                    constexpr int kStep = 10;
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("Max Recent Files");
+                    TooltipFor("Older entries beyond this count are forgotten, with their marks.");
+                    ImGui::SameLine();
+                    const ImGuiStyle& st = ImGui::GetStyle();
+                    const float btn = ImGui::GetFrameHeight();
+                    const float fieldW = ImGui::CalcTextSize("000").x + st.FramePadding.x * 2.0f;
+                    const float rowW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x);
+                    const float avail = ImGui::GetContentRegionAvail().x;
+                    if (avail > rowW)
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+                    ImGui::SetNextItemWidth(fieldW);
+                    ImGui::InputInt("##recentMax", &m_recentMaxEdit, 0, 0);
+                    const bool typing = ImGui::IsItemActive();
+                    m_recentMaxEdit = std::clamp(m_recentMaxEdit, RecentFiles::kMinMax, RecentFiles::kMaxMax);
+                    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                    ImGui::BeginDisabled(m_recentMaxEdit <= kStep);
+                    if (ImGui::Button("-##recentMax", ImVec2(btn, btn)))
+                        m_recentMaxEdit = std::max(RecentFiles::kMinMax, m_recentMaxEdit - kStep);
+                    ImGui::EndDisabled();
+                    ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                    ImGui::BeginDisabled(m_recentMaxEdit >= RecentFiles::kMaxMax);
+                    if (ImGui::Button("+##recentMax", ImVec2(btn, btn)))
+                        m_recentMaxEdit = std::min(RecentFiles::kMaxMax, m_recentMaxEdit + kStep);
+                    ImGui::EndDisabled();
+                    if (m_recentMaxEdit != m_recents.GetMax() && !typing)
+                        m_recents.SetMax(m_recentMaxEdit);
+                }
+                if (ImGui::MenuItem("Remember Marks", nullptr, m_recentsRememberMarks))
+                    m_recentsRememberMarks = !m_recentsRememberMarks;
+                TooltipFor("Remember each recent file's marks and restore them when it's reopened.");
+                if (ImGui::MenuItem("Remember Playhead Position", nullptr, m_recentsRememberPlayhead))
+                    m_recentsRememberPlayhead = !m_recentsRememberPlayhead;
+                TooltipFor("Reopen recent files at their last position, playing or paused as they were left.");
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recents", nullptr, false, !entries.empty()))
+                    m_recents.Clear();
                 ImGui::EndMenu();
                 if (!toReopen.empty()) RequestOpenFile(toReopen);
-                if (clearRequested) m_recentFiles.clear();
             }
             if (ImGui::MenuItem("Export Segments...", (std::string(kKeys.cmdName) + "+E").c_str(),
                                 false, m_segments.GetCount() > 0 && !m_exporter.IsRunning())) {
@@ -1930,10 +2123,7 @@ void App::Render() {
             if (ImGui::MenuItem("Close Video", nullptr, false, m_player.HasMedia())) {
                 // Defer the actual close to Run()'s between-frames path —
                 // this frame's draw list still references the video texture.
-                if (m_segments.GetTotalCount() > 0)
-                    m_showCloseFileConfirm = true;
-                else
-                    m_pendingCloseFile = true;
+                m_pendingCloseFile = true;
             }
             if (ImGui::MenuItem("Quit", kKeys.quitShortcut)) {
                 m_running = false;
@@ -4073,57 +4263,6 @@ void App::Render() {
             ImGui::EndPopup();
         }
 
-        ImGui::EndPopup();
-    }
-
-    // Open file confirmation (marks will be lost)
-    if (m_showOpenFileConfirm) {
-        ImGui::OpenPopup("Open New File?");
-        m_showOpenFileConfirm = false;
-    }
-    if (ImGui::BeginPopupModal("Open New File?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Opening a new file will clear all marks.");
-        ImGui::Text("Are you sure you want to proceed?");
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        if (ImGui::Button("Proceed", ImVec2(btnW, 0))) {
-            // Defer to Run()'s between-frames open path: this frame's ImGui
-            // draw list already references the current video texture, so
-            // OpenFile (which releases it) must not run mid-frame.
-            m_pendingOpenImmediate = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(-1, 0))) {
-            m_pendingOpenFilePath.clear();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-
-    // Close video confirmation (marks will be lost)
-    if (m_showCloseFileConfirm) {
-        ImGui::OpenPopup("Close Video?");
-        m_showCloseFileConfirm = false;
-    }
-    if (ImGui::BeginPopupModal("Close Video?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Closing the video will clear all marks.");
-        ImGui::Text("Are you sure you want to proceed?");
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        float btnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-        if (ImGui::Button("Proceed", ImVec2(btnW, 0))) {
-            // Defer to Run()'s between-frames close path (same texture-lifetime
-            // constraint as the open confirm above).
-            m_pendingCloseFile = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(-1, 0)))
-            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 

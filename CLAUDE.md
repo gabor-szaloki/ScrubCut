@@ -25,7 +25,7 @@ src/core/           # playback pipeline (Player, Demuxer, decoders, queues, cloc
 src/ui/UIManager    # ImGui + SDL3 + SDLGPU3 backends, fonts, DPI, dockspace
 src/ui/shaders/     # HLSL, compiled at build time (shadercross; glslang+spirv-cross on macOS) and embedded per-platform
 src/export/         # background segment/frame export
-src/util/           # AppPaths, Settings (INI), Log, Profiler (Tracy wrappers), Types (shared structs), FFmpegUtils, HttpClient (WinHTTP / NSURLSession GET), UpdateChecker (GitHub release check), MacReveal + MacFullscreen (.mm: Finder reveal, Cocoa borderless fullscreen)
+src/util/           # AppPaths, Settings (INI), RecentFiles, Log, Profiler (Tracy wrappers), Types (shared structs), FFmpegUtils, HttpClient (WinHTTP / NSURLSession GET), UpdateChecker (GitHub release check), MacReveal + MacFullscreen (.mm: Finder reveal, Cocoa borderless fullscreen)
 platform/{windows,macos}/  # icons, manifest, plist template, NSIS bits
 cmake/              # GenerateVersion.cmake, EmbedShaders.cmake (shader blob embedding)
 third_party/stb/    # vendored stb_image_write
@@ -41,7 +41,7 @@ These are invariants that grep won't tell you in five minutes:
 - **Pipeline park/unpark** (`Player::ParkPipeline` / `UnparkPipeline`): workers halt at top-of-loop gates while queues get interrupted, so seek / flush / decoder-swap can mutate state without races. This is the safe sync point for any mid-playback reconfiguration.
 - **Background extractor pattern**: long-running file scans (e.g. `WaveformExtractor`) run on their own thread with their own `Demuxer`, write results monotonically into a buffer, and expose progress as an atomic counter. Destructor and next `Start()` both `Stop()` cleanly. Reuse this shape for any new "scan the whole file once" feature.
 - **File-derived read-only metadata** (chapters today, audio/subtitle stream lists in the future): populated in `Player::Open` from `AVFormatContext`, cleared in `Close`. The `Chapter` struct in `util/Types.h` is the model.
-- **Two settings files** in `GetAppDataDir()` (see `util/AppPaths.h`): `layout.ini` for window/panel geometry, `preferences.ini` for user prefs and recent files. `util/Settings.h` is a tiny `key=value` reader/writer.
+- **Settings files** in `GetAppDataDir()` (see `util/AppPaths.h`): `layout.ini` for window/panel geometry, `preferences.ini` for user prefs (`util/Settings.h`, a tiny `key=value` reader/writer), and `recents.ini` for recent files with their saved marks and playhead (`util/RecentFiles`).
 - **Timeline overlays** in `App::Render` all share one mapping: `x = barPos.x + (timeSec / duration) * barWidth`. Pick the right draw order between background → waveform → segments → frame marks → playhead so user marks stay on top.
 - **A/V sync**: the wall `Clock` (video) is the master — `Player::SyncAudioToClock` steers the audio device rate each frame so the pts-anchored audio position follows it. Pause/resume keeps the audio stream's buffered content; never flush the audio output on a transport path without re-anchoring it to real packet ptss.
 - **Cross-platform shortcuts**: the `kKeys` struct in `App.cpp` exposes platform-aware modifiers (`cmdMod`, `winMod`, etc.) and display names (`cmdName`, `altKeyName`). Use these instead of hard-coding Cmd vs Ctrl.

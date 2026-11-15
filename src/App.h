@@ -9,6 +9,7 @@
 #include "util/Types.h"
 #include "export/Exporter.h"
 #include "util/Settings.h"
+#include "util/RecentFiles.h"
 #include "util/UpdateChecker.h"
 
 #include <imgui.h>
@@ -84,12 +85,22 @@ private:
     std::string m_statusMsg;
     uint64_t m_statusMsgStartNS = 0;
 
-    // Recent files: persisted list, MRU on top, capped at kRecentMax entries.
-    static constexpr int kRecentMax = 10;
-    std::vector<std::string> m_recentFiles;
+    // Recent files with their saved marks and playhead.
+    RecentFiles m_recents;
     void LoadRecentFiles();
-    void SaveRecentFiles();
-    void AddToRecent(const std::string& path);
+    // Store the open file's marks/playhead (per the toggles below). Must run
+    // before m_player.Close(), which loses the position and play state.
+    void SaveCurrentFileToRecents();
+    // Per frame: saves marks once edits have paused for a moment.
+    void AutoSaveMarks();
+    bool m_recentsRememberMarks = true;
+    bool m_recentsRememberPlayhead = false;
+    uint64_t m_marksSavedRevision = 0;   // SegmentManager revision last saved
+    uint64_t m_marksLastSeenRevision = 0;
+    uint64_t m_marksChangedNS = 0;       // when the revision last changed
+    int m_recentMaxEdit = RecentFiles::kDefaultMax;  // Open Recent count field
+    int m_recentMenuLastOpenFrame = -10;
+    std::vector<bool> m_recentExists;    // per entry, checked when the menu opens
 
     // Refresh the auto-hide UI timer (and unhide if currently hidden) —
     // called whenever the user does something we consider UI activity:
@@ -276,8 +287,6 @@ private:
     std::vector<bool> m_exportChecked;
     std::vector<bool> m_frameExportChecked;
     bool m_showOverwriteConfirm = false;
-    bool m_showOpenFileConfirm = false;
-    bool m_showCloseFileConfirm = false;
     // Cmd+E from the global keyboard handler — resolved in Render where
     // ImGui state is current. (The handler runs before BeginFrame, when
     // ImGui's CurrentWindow is null and calls like IsPopupOpen crash.)
