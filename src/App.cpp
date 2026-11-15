@@ -2309,9 +2309,11 @@ void App::Render() {
     // Suppress the tab bar on whichever dock node hosts the Viewport — we
     // never want a "Viewport" tab. Other docked windows show their tab bar
     // by default (user can right-click a tab → "Hide Tab Bar" to hide; that
-    // choice persists in imgui.ini per dock node).
+    // choice persists in imgui.ini per dock node). Docking other windows into
+    // that node as tabs is disabled too: with no tab bar they'd be hidden
+    // behind the Viewport with no way to get them back. Splitting still works.
     ImGuiWindowClass viewportClass;
-    viewportClass.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar;
+    viewportClass.DockNodeFlagsOverrideSet = ImGuiDockNodeFlags_NoTabBar | ImGuiDockNodeFlags_NoDockingOverMe;
     ImGui::SetNextWindowClass(&viewportClass);
     ImGui::Begin("Viewport");
     // Gate on m_displayTexture, not m_videoTexture: a freshly created texture
