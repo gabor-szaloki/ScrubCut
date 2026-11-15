@@ -2548,10 +2548,20 @@ void App::Render() {
             const float wheel = ImGui::GetIO().MouseWheel;
             if (wheel != 0.0f) {
                 const ImVec2 mouse = ImGui::GetIO().MousePos;
-                const float mu = m_crop.U0() + (mouse.x - imgMin.x) / displayW * (m_crop.U1() - m_crop.U0());
-                const float mv = m_crop.V0() + (mouse.y - imgMin.y) / displayH * (m_crop.V1() - m_crop.V0());
-                m_crop.zoom *= std::pow(1.25f, wheel);
-                m_crop.PanTo(mu, mv);   // clamps zoom and centre
+                // Cursor position inside the displayed image (0..1) and the
+                // video point (UV) currently under it.
+                const float fx = (mouse.x - imgMin.x) / displayW;
+                const float fy = (mouse.y - imgMin.y) / displayH;
+                const float mu = m_crop.U0() + fx * (m_crop.U1() - m_crop.U0());
+                const float mv = m_crop.V0() + fy * (m_crop.V1() - m_crop.V0());
+
+                m_crop.ZoomBy(std::pow(1.25f, wheel));   // clamps zoom
+
+                // Re-place the crop so (mu, mv) lands under the cursor again.
+                // PanTo clamps, so at a frame border the view slides along the
+                // edge instead and the pixel drifts away from the cursor.
+                m_crop.PanTo(mu - (fx - 0.5f) * 2.0f * m_crop.HalfX(),
+                             mv - (fy - 0.5f) * 2.0f * m_crop.HalfY());
                 FlashZoom();
             }
         }
