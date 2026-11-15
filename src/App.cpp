@@ -1313,7 +1313,9 @@ void App::RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame) {
         : 16.0f / 9.0f;
     const float pad = 4.0f * s;
     const float defW = 280.0f * s;
-    const float defH = (defW - 2.0f * pad) / aspect + 2.0f * pad + ImGui::GetFrameHeight();
+    const ImGuiStyle& mmStyle = ImGui::GetStyle();
+    const float footerH = ImGui::GetFrameHeight() + 2.0f * mmStyle.ItemSpacing.y + 1.0f;   // separator + control row
+    const float defH = (defW - 2.0f * pad) / aspect + 2.0f * pad + ImGui::GetFrameHeight() + footerH;
 
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
@@ -1328,7 +1330,8 @@ void App::RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame) {
 
     if (canDraw) {
         // Letterbox the frame into the window's content area, like the Viewport does.
-        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        avail.y -= footerH;   // keep room for the zoom controls
         float mmW = avail.x, mmH = avail.x / aspect;
         if (mmH > avail.y) { mmH = avail.y; mmW = avail.y * aspect; }
 
@@ -1384,6 +1387,34 @@ void App::RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame) {
             dl->AddRect(mmMin, mmMax, IM_COL32(255, 255, 255, A(120)), 0.0f, 0,
                         std::max(1.0f, s));
         }
+    }
+
+    // Footer: zoom controls, same as View > Video Zoom (field, -, +, reset).
+    // Pinned to the bottom of the window, below a separator like the Marks footer.
+    {
+        ImGui::SetCursorPos(ImVec2(pad, ImGui::GetWindowHeight() - pad - footerH + mmStyle.ItemSpacing.y));
+        ImGui::Separator();
+        ImGui::BeginDisabled(!m_player.HasMedia());
+        const float btn = ImGui::GetFrameHeight();
+        const float sp = mmStyle.ItemSpacing.x;
+        const float fieldW = std::max(30.0f * s, ImGui::GetContentRegionAvail().x - 3.0f * (btn + sp));
+        ImGui::SetNextItemWidth(fieldW);
+        float z = m_crop.zoom;
+        const char* zoomFmt = (z >= 9.995f) ? "%.1fx" : "%.2fx";
+        if (ImGui::InputFloat("##minimapzoom", &z, 0.0f, 0.0f, zoomFmt)) {
+            m_crop.zoom = z;
+            m_crop.Clamp();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("-##minimapzoom", ImVec2(btn, btn))) ZoomCrop(1.0f / 1.25f);
+        TooltipFor("Zoom out", (std::string(kKeys.cmdName) + " + Minus").c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("+##minimapzoom", ImVec2(btn, btn))) ZoomCrop(1.25f);
+        TooltipFor("Zoom in", (std::string(kKeys.cmdName) + " + Plus").c_str());
+        ImGui::SameLine();
+        if (ImGui::Button("1##minimapzoom", ImVec2(btn, btn))) m_crop.Reset();
+        TooltipFor("Reset zoom", (std::string(kKeys.cmdName) + " + 0").c_str());
+        ImGui::EndDisabled();
     }
 
     ImGui::End();
@@ -2501,6 +2532,7 @@ void App::Render() {
                      ImVec2(m_crop.U1(), m_crop.V1()));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
+        m_viewDisplayW = displayW;
         // Click the video to toggle play/pause; double-click to toggle
         // fullscreen. (...оставьте исходный комментарий...)
         // Ignored while the pointer is on the minimap, otherwise dragging the
@@ -2510,6 +2542,18 @@ void App::Render() {
                 TogglePlayPauseWithFlash();
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 m_pendingFullscreenToggle = true;
+
+            // Mouse wheel zooms; the crop centre jumps to the video point
+            // under the cursor. Fractional wheel values (trackpads) scale smoothly.
+            const float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f) {
+                const ImVec2 mouse = ImGui::GetIO().MousePos;
+                const float mu = m_crop.U0() + (mouse.x - imgMin.x) / displayW * (m_crop.U1() - m_crop.U0());
+                const float mv = m_crop.V0() + (mouse.y - imgMin.y) / displayH * (m_crop.V1() - m_crop.V0());
+                m_crop.zoom *= std::pow(1.25f, wheel);
+                m_crop.PanTo(mu, mv);   // clamps zoom and centre
+                FlashZoom();
+            }
         }
 
         // Briefly flash a Play/Pause icon at the center of the video after a
@@ -3257,9 +3301,17 @@ void App::Render() {
             brateBuf[0] = '\0';
 
         const std::string& colorLabel = m_player.GetColorSpaceLabel();
-        char infoRight[160];
-        snprintf(infoRight, sizeof(infoRight), "%dx%d  |  %.1f fps  |  %s  |  %s  |  %s  |  %s",
-                 m_videoWidth, m_videoHeight, m_player.GetFrameRate(),
+        // Actual zoom = on-screen pixels per source pixel: video zoom times
+        // the fit-to-window scale of the Viewport image.
+        char zoomBuf[24] = "--";
+        if (hasMedia && m_videoWidth > 0 && m_viewDisplayW > 0.0f) {
+            const float fbScale = ImGui::GetIO().DisplayFramebufferScale.x;
+            snprintf(zoomBuf, sizeof(zoomBuf), "%.2fx",
+                     m_viewDisplayW * fbScale * m_crop.zoom / static_cast<float>(m_videoWidth));
+        }
+        char infoRight[192];
+        snprintf(infoRight, sizeof(infoRight), "%dx%d  |  %.1f fps  |  zoom %s  |  %s  |  %s  |  %s  |  %s",
+                 m_videoWidth, m_videoHeight, m_player.GetFrameRate(), zoomBuf,
                  m_player.GetVideoCodecName(),
                  colorLabel.empty() ? "?" : colorLabel.c_str(), brateBuf, sizeBuf);
         float infoRightWidth = ImGui::CalcTextSize(infoRight).x;

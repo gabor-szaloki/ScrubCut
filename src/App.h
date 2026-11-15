@@ -366,6 +366,7 @@ private:
     int m_videoHeight = 0;
     ViewCrop m_crop;
     ImVec2 m_minimapGrab{0.0f, 0.0f};  // UV offset: crop centre minus mouse at drag start
+    float m_viewDisplayW = 0.0f;       // Viewport image width on screen (ImGui units), for the actual-zoom readout
     VideoColorMode m_videoColorMode = VideoColorMode::SDR;
     VideoTonemap m_tonemap;          // tone-map / HDR-passthrough pass (HDR videos only, lazy init)
     // Selected HDR->SDR tone-mapping operator (View > HDR, persisted in prefs).
