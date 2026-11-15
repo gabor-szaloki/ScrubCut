@@ -213,7 +213,7 @@ private:
     // toggles between frames, like m_pendingLayoutReset.
     bool m_pendingFullscreenToggle = false;
     bool m_showChapters = true;
-    bool m_showWaveform = false;
+    bool m_showWaveform = true;
     bool m_showTooltips = true;
     // When on, brief on-screen feedback flashes for keyboard actions: the
     // centre play/pause icon and the top-right status overlay.

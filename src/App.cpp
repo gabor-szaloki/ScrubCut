@@ -400,7 +400,7 @@ bool App::Init() {
 
     // Preferences always load
     m_showChapters = m_prefSettings.GetBool("show_chapters", true);
-    m_showWaveform = m_prefSettings.GetBool("show_waveform", false);
+    m_showWaveform = m_prefSettings.GetBool("show_waveform", true);
     m_showTooltips = m_prefSettings.GetBool("show_tooltips", true);
     m_flashStatusOverlay = m_prefSettings.GetBool("flash_status_overlay", true);
     m_useDpiScaling = m_prefSettings.GetBool("use_dpi_scaling", true);
@@ -932,7 +932,11 @@ void App::ResetSubtitleState() {
 
 void App::ResetSettings() {
     m_showChapters = true;
-    m_showWaveform = false;
+    m_showWaveform = true;
+    if (m_player.HasMedia() && m_player.HasAudio() &&
+        m_waveform.GetFilledBuckets() == 0 && !m_waveform.IsRunning()) {
+        m_waveform.Start(m_currentFilePath, m_player.GetDuration());
+    }
     m_showTooltips = true;
     m_flashStatusOverlay = true;
     m_autoHideCursor = true;
