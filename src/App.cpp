@@ -1350,8 +1350,8 @@ void App::RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame) {
             const float mv = (mouse.y - mmMin.y) / mmH;
 
             if (ImGui::IsItemActivated()) {
-                const float h = m_crop.Half();
-                const bool inside = std::abs(mu - m_crop.cx) <= h && std::abs(mv - m_crop.cy) <= h;
+                const bool inside = std::abs(mu - m_crop.cx) <= m_crop.HalfX() &&
+                                    std::abs(mv - m_crop.cy) <= m_crop.HalfY();
                 // Grab the rect where it was clicked; a click outside re-centres it.
                 m_minimapGrab = inside ? ImVec2(m_crop.cx - mu, m_crop.cy - mv)
                                        : ImVec2(0.0f, 0.0f);
@@ -2480,6 +2480,14 @@ void App::Render() {
         if (displayH > avail.y) {
             displayH = avail.y;
             displayW = avail.y * aspectRatio;
+        }
+        // The shown part of the video has the proportions of this panel, not of
+        // the video: zoom magnifies the fitted frame, and the visible area
+        // widens until it fills the panel before it starts cropping.
+        if (displayW > 1.0f && displayH > 1.0f) {
+            m_crop.SetCanvasRatio(avail.x / displayW, avail.y / displayH);
+            displayW = std::min(avail.x, displayW * m_crop.zoom);
+            displayH = std::min(avail.y, displayH * m_crop.zoom);
         }
         ImVec2 cursor = ImGui::GetCursorPos();
         ImGui::SetCursorPos(ImVec2(
