@@ -189,6 +189,27 @@ static ImU32 GetSegmentColor(int colorIndex, float alpha = 1.0f) {
                     static_cast<int>(c.z * 255), static_cast<int>(alpha * 255));
 }
 
+// Timestamp as "MM:SS[.mmm]", or "H:MM:SS[.mmm]" once hours are needed.
+// `withHours` forces the hour field (pass duration >= 3600 so every time
+// shown for a long file uses the same layout).
+static std::string FormatTime(double t, bool withMs, bool withHours = false) {
+    if (t < 0.0) t = 0.0;
+    int total = static_cast<int>(t);
+    int h  = total / 3600;
+    int m  = (total / 60) % 60;
+    int s  = total % 60;
+    int ms = static_cast<int>(t * 1000) % 1000;
+    char buf[32];
+    if (h > 0 || withHours) {
+        if (withMs) snprintf(buf, sizeof(buf), "%d:%02d:%02d.%03d", h, m, s, ms);
+        else        snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
+    } else {
+        if (withMs) snprintf(buf, sizeof(buf), "%02d:%02d.%03d", m, s, ms);
+        else        snprintf(buf, sizeof(buf), "%02d:%02d", m, s);
+    }
+    return buf;
+}
+
 // Discrete playback-speed multipliers, matching the timeline's speed buttons.
 // Used both for export-segment speed and (separately) the in-app player speed.
 static constexpr double kPlaybackSpeeds[] = { 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0 };
@@ -1091,13 +1112,9 @@ void App::ShowStatus(const std::string& msg) {
 }
 
 void App::FlashLabeledTime(const std::string& label, double t) {
-    int m  = static_cast<int>(t) / 60;
-    int s  = static_cast<int>(t) % 60;
-    int ms = static_cast<int>(t * 1000) % 1000;
-    char buf[80];
+    bool hours = m_player.GetDuration() >= 3600.0;
     // "\xe2\x80\x94" is an em dash (explicit UTF-8 so it's charset-independent).
-    snprintf(buf, sizeof(buf), "%s \xe2\x80\x94 %02d:%02d.%03d", label.c_str(), m, s, ms);
-    ShowStatus(buf);
+    ShowStatus(label + " \xe2\x80\x94 " + FormatTime(t, true, hours));
 }
 
 void App::FlashTime(const std::string& label) {
@@ -3069,12 +3086,9 @@ void App::Render() {
         ImGui::SetCursorScreenPos(ImVec2(barPos.x, barPos.y + barHeight + 2.0f));
         ImGui::Dummy(ImVec2(0, 0)); // reset ImGui cursor tracking
 
-        int curMin2 = static_cast<int>(currentTime) / 60;
-        int curSec2 = static_cast<int>(currentTime) % 60;
-        int curMs2  = static_cast<int>(currentTime * 1000) % 1000;
-        int durMin2 = static_cast<int>(duration) / 60;
-        int durSec2 = static_cast<int>(duration) % 60;
-        ImGui::Text("%02d:%02d.%03d / %02d:%02d", curMin2, curSec2, curMs2, durMin2, durSec2);
+        bool hours = duration >= 3600.0;
+        ImGui::Text("%s / %s", FormatTime(currentTime, true, hours).c_str(),
+                    FormatTime(duration, false, hours).c_str());
 
         // Format file size
         int64_t fileSize = m_player.GetFileSize();
@@ -3118,7 +3132,7 @@ void App::Render() {
     ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
     float uiScale = m_ui.GetUiScale();
-    float marksW = 450.0f * uiScale;
+    float marksW = 470.0f * uiScale;
     float marksH = 250.0f * uiScale;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - marksW - 40 * uiScale, vp->WorkPos.y + 40 * uiScale), layoutCond);
     ImGui::SetNextWindowSize(ImVec2(marksW, marksH), layoutCond);
@@ -3130,10 +3144,9 @@ void App::Render() {
     // Pending mark-in indicator
     if (m_segments.HasPendingMarkIn()) {
         double markIn = m_segments.GetPendingMarkIn();
-        int mMin = static_cast<int>(markIn) / 60;
-        int mSec = static_cast<int>(markIn) % 60;
-        int mMs  = static_cast<int>(markIn * 1000) % 1000;
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Mark In: %02d:%02d.%03d", mMin, mSec, mMs);
+        bool hours = m_player.GetDuration() >= 3600.0;
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Mark In: %s",
+                           FormatTime(markIn, true, hours).c_str());
     }
 
     // Scrollable mark list — segments and frames interleaved by timestamp
@@ -3257,15 +3270,11 @@ void App::Render() {
                 if (!row.isFrame) {
                     // Row 2 (segments only): start/end seek buttons + set-to-current + duration
                     const TimeRange& s = segs[row.index];
-                    int sMin = static_cast<int>(s.startSec) / 60;
-                    int sSec = static_cast<int>(s.startSec) % 60;
-                    int sMs  = static_cast<int>(s.startSec * 1000) % 1000;
-                    int eMin = static_cast<int>(s.endSec) / 60;
-                    int eSec = static_cast<int>(s.endSec) % 60;
-                    int eMs  = static_cast<int>(s.endSec * 1000) % 1000;
-                    char startBuf[32], endBuf[32];
-                    snprintf(startBuf, sizeof(startBuf), "%02d:%02d.%03d##start", sMin, sSec, sMs);
-                    snprintf(endBuf,   sizeof(endBuf),   "%02d:%02d.%03d##end",   eMin, eSec, eMs);
+                    bool hours = m_player.GetDuration() >= 3600.0;
+                    std::string startStr = FormatTime(s.startSec, true, hours) + "##start";
+                    std::string endStr   = FormatTime(s.endSec,   true, hours) + "##end";
+                    const char* startBuf = startStr.c_str();
+                    const char* endBuf   = endStr.c_str();
                     double playhead = m_seekTarget;
                     bool canSetStart = playhead < s.endSec;
                     bool canSetEnd   = playhead > s.startSec;
@@ -3293,7 +3302,16 @@ void App::Render() {
                     // discrete multipliers). SpeedCombo renders as a SmallButton
                     // so it fits inline with the other small buttons at the
                     // same row height.
+                    //
+                    // Speed / duration / audio form a group right-aligned to
+                    // the delete button's right edge on the row above; when
+                    // the panel is too narrow they just follow the time buttons.
+                    float durFieldW = 56.0f * uiScale;
+                    float groupW = FixedSpeedButtonWidth() + spacing + durFieldW
+                                 + spacing + FixedAudioButtonWidth();
                     ImGui::SameLine();
+                    ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(),
+                                                  xBtnX + xBtnW - groupW));
                     double newSpeed;
                     if (SpeedCombo("##segspeed", s.speed, newSpeed, /*small*/ true)) {
                         m_segments.SetSegmentSpeed(row.index, newSpeed);
@@ -3311,7 +3329,7 @@ void App::Render() {
                     ImGuiStyle& smallStyle = ImGui::GetStyle();
                     float backupPadY = smallStyle.FramePadding.y;
                     smallStyle.FramePadding.y = 0;
-                    ImGui::SetNextItemWidth(56.0f * uiScale);
+                    ImGui::SetNextItemWidth(durFieldW);
                     bool durChanged = ImGui::InputFloat("##segdur", &effDurF, 0.0f, 0.0f, "%.1fs");
                     smallStyle.FramePadding.y = backupPadY;
                     if (durChanged) {
@@ -3335,11 +3353,9 @@ void App::Render() {
                 } else {
                     // Row 2 (frames): seek button + set-to-current
                     const FrameMark& f = frames[row.index];
-                    int fMin = static_cast<int>(f.timeSec) / 60;
-                    int fSec = static_cast<int>(f.timeSec) % 60;
-                    int fMs  = static_cast<int>(f.timeSec * 1000) % 1000;
-                    char timeBuf[32];
-                    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d.%03d##ftime", fMin, fSec, fMs);
+                    bool hours = m_player.GetDuration() >= 3600.0;
+                    std::string timeStr = FormatTime(f.timeSec, true, hours) + "##ftime";
+                    const char* timeBuf = timeStr.c_str();
                     if (ImGui::SmallButton(timeBuf)) m_player.SeekTo(f.timeSec);
                     TooltipFor("Seek to this time");
                     ImGui::SameLine();
