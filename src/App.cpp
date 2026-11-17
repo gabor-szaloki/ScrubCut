@@ -2525,11 +2525,21 @@ void App::Render() {
             cursor.x + (avail.x - displayW) * 0.5f,
             cursor.y + (avail.y - displayH) * 0.5f
         ));
+        // Pixel-exact look once a source pixel spans more than one screen pixel;
+        // linear stays on while the video is scaled down.
+        const bool pixelFilter =
+        displayW * ImGui::GetIO().DisplayFramebufferScale.x * m_crop.zoom
+        / static_cast<float>(m_videoWidth) > 1.0f;
+        ImDrawList* viewDl = ImGui::GetWindowDrawList();
+        if (pixelFilter)
+            viewDl->AddCallback(ImGui::GetPlatformIO().DrawCallback_SetSamplerNearest, nullptr);
 
         ImGui::Image(reinterpret_cast<ImTextureID>(m_displayTexture),
                      ImVec2(displayW, displayH),
                      ImVec2(m_crop.U0(), m_crop.V0()),
                      ImVec2(m_crop.U1(), m_crop.V1()));
+        if (pixelFilter)
+            viewDl->AddCallback(ImGui::GetPlatformIO().DrawCallback_SetSamplerLinear, nullptr);
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
         m_viewDisplayW = displayW;
