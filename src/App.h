@@ -2,6 +2,7 @@
 
 #include "ui/UIManager.h"
 #include "ui/VideoTonemap.h"
+#include "ui/ViewCrop.h"
 #include "core/Player.h"
 #include "core/SegmentManager.h"
 #include "core/WaveformExtractor.h"
@@ -76,6 +77,13 @@ private:
     // play/pause flash.
     void ShowStatus(const std::string& msg);
     void RenderStatusOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
+
+    // Zoom / crop of the video view. Zoom is applied through the UV rect of
+    // the Viewport's ImGui::Image; the minimap is drawn while zoomed in and
+    // lets the user drag the crop rectangle.
+    void ZoomCrop(float factor);
+    void FlashZoom();
+    void RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame);
 
     // Combined subtitle track list: embedded tracks (copied from the Player on
     // open) followed by any externally-opened files. -1 = subtitles off.
@@ -222,6 +230,7 @@ private:
     bool m_segmentsNoFocusOnOpen = false;
     bool m_showExportDialog = false;
     bool m_showHelpPanel = false;
+    bool m_showMinimap = true;   // user toggle; the window also needs an active zoom to appear
     // Reset Layout briefly forces Marks/Help visible so their Begin blocks
     // run with layoutCond = Always (re-applying their default Pos/Size).
     // After that frame this flag triggers re-hiding them. Avoids
@@ -269,7 +278,7 @@ private:
     // Floating window geometry snapshot (position + size) taken when entering
     // fullscreen, so it can be restored exactly on exit.
     struct FloatingWindowSnap { ImVec2 pos; ImVec2 size; bool valid = false; };
-    FloatingWindowSnap m_snapTimeline, m_snapSegments, m_snapHelp;
+    FloatingWindowSnap m_snapTimeline, m_snapSegments, m_snapHelp, m_snapMinimap;
 
     // Center-of-video Play/Pause flash triggered by clicking the video.
     // m_playPauseFlashStartNS is the SDL_GetTicksNS when the click happened;
@@ -292,7 +301,7 @@ private:
     bool m_liveResizeFrame = false;
     bool m_resizeAnchorActive = false;
     ImVec2 m_resizeAnchorViewport = {0, 0};
-    FloatingWindowSnap m_anchorTimeline, m_anchorSegments, m_anchorHelp;
+    FloatingWindowSnap m_anchorTimeline, m_anchorSegments, m_anchorHelp, m_anchorMinimap;
     ExportSettings m_pendingExport;
     std::vector<bool> m_exportChecked;
     std::vector<bool> m_frameExportChecked;
@@ -374,6 +383,9 @@ private:
     bool m_tonemapInitFailed = false;
     int m_videoWidth = 0;
     int m_videoHeight = 0;
+    ViewCrop m_crop;
+    ImVec2 m_minimapGrab{0.0f, 0.0f};  // UV offset: crop centre minus mouse at drag start
+    float m_viewDisplayW = 0.0f;       // Viewport image width on screen (ImGui units), for the actual-zoom readout
     VideoColorMode m_videoColorMode = VideoColorMode::SDR;
     VideoTonemap m_tonemap;          // tone-map / HDR-passthrough pass (HDR videos only, lazy init)
     // Selected HDR->SDR tone-mapping operator (View > HDR, persisted in prefs).
