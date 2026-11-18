@@ -3,6 +3,7 @@
 #include "util/Profiler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace {
@@ -52,7 +53,70 @@ std::string StripTags(const char* in) {
     return out;
 }
 
+// Run-length encode a w x h block of 8-bit palette indices (rows `stride`
+// bytes apart) as [index][LEB128 run length] pairs, row-major, with runs
+// allowed to span rows. Subtitle images are mostly long transparent or
+// solid-fill runs, so this is ~5x smaller than the raw indices. Also returns
+// the highest index used, so the palette can be trimmed to match.
+void EncodeIndicesRle(const uint8_t* src, int stride, int w, int h,
+                      std::vector<uint8_t>& out, int& maxIndex) {
+    out.clear();
+    maxIndex = 0;
+    auto emit = [&](uint8_t value, size_t run) {
+        out.push_back(value);
+        do {
+            uint8_t b = run & 0x7F;
+            run >>= 7;
+            out.push_back(run ? static_cast<uint8_t>(b | 0x80) : b);
+        } while (run);
+        maxIndex = std::max<int>(maxIndex, value);
+    };
+    size_t run = 0;
+    uint8_t cur = 0;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* row = src + static_cast<size_t>(y) * stride;
+        for (int x = 0; x < w; ++x) {
+            if (run && row[x] == cur) { ++run; continue; }
+            if (run) emit(cur, run);
+            cur = row[x];
+            run = 1;
+        }
+    }
+    if (run) emit(cur, run);
+    out.shrink_to_fit();
+}
+
 } // namespace
+
+void ExpandSubtitleRect(const SubtitleBitmapRect& r, uint8_t* rgba) {
+    // Palette (0xAARRGGBB) -> RGBA8 byte order; indices past the palette are
+    // transparent.
+    uint32_t lut[256] = {};
+    for (size_t c = 0; c < r.palette.size() && c < 256; ++c) {
+        uint32_t p = r.palette[c];
+        uint8_t px[4] = {static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 8),
+                         static_cast<uint8_t>(p), static_cast<uint8_t>(p >> 24)};
+        std::memcpy(&lut[c], px, 4);
+    }
+    uint32_t* out = reinterpret_cast<uint32_t*>(rgba);
+    const size_t total = static_cast<size_t>(r.w) * r.h;
+    size_t pos = 0;
+    const uint8_t* p = r.rle.data();
+    const uint8_t* end = p + r.rle.size();
+    while (p < end && pos < total) {
+        uint32_t color = lut[*p++];
+        size_t run = 0;
+        for (int shift = 0; p < end && shift < 64; shift += 7) {
+            uint8_t b = *p++;
+            run |= static_cast<size_t>(b & 0x7F) << shift;
+            if (!(b & 0x80)) break;
+        }
+        run = std::min(run, total - pos);
+        std::fill(out + pos, out + pos + run, color);
+        pos += run;
+    }
+    std::fill(out + pos, out + total, 0u);
+}
 
 SubtitleExtractor::~SubtitleExtractor() {
     Stop();
@@ -90,6 +154,17 @@ bool SubtitleExtractor::HasEvents() const {
 
 std::string SubtitleExtractor::ActiveText(double t) const {
     std::lock_guard<std::mutex> lk(m_mutex);
+    const SubtitleEvent* e = FindActive(t);
+    return e ? e->text : std::string();
+}
+
+std::shared_ptr<const SubtitleBitmap> SubtitleExtractor::ActiveBitmap(double t) const {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    const SubtitleEvent* e = FindActive(t);
+    return e ? e->bitmap : nullptr;
+}
+
+const SubtitleEvent* SubtitleExtractor::FindActive(double t) const {
     // m_events is sorted by startSec. Binary-search to the last cue that starts
     // at or before t, then walk back over the few cues that could still be on
     // screen. Any cue containing t must have started no earlier than
@@ -104,15 +179,16 @@ std::string SubtitleExtractor::ActiveText(double t) const {
         --it;
         if (it->startSec < earliestStart) break; // nothing earlier can still be active
         if (t >= it->startSec && t < it->endSec)
-            return it->text;
+            return &*it;
     }
-    return {};
+    return nullptr;
 }
 
 void SubtitleExtractor::Worker(std::string path, int streamIndex) {
     PROFILE_THREAD("Subtitle Scan");
     PROFILE_SCOPE();
     Profiler::ScopedSection section(Profiler::kSectionJobs, "Subtitle scan");
+    const auto scanStart = std::chrono::steady_clock::now();
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
         LOG_WARN("Subtitle: failed to open %s", path.c_str());
@@ -161,6 +237,15 @@ void SubtitleExtractor::Worker(std::string path, int streamIndex) {
         return;
     }
 
+    // Bitmap tracks differ from text ones in two ways: cues are images, and
+    // a cue often has no real end time (PGS: end_display_time == UINT32_MAX)
+    // — it lasts until the next display set, which for a plain "clear" has no
+    // images at all. So for bitmap tracks every decoded subtitle, empty ones
+    // included, is recorded and later used to cut the previous cue short.
+    const AVCodecDescriptor* desc = avcodec_descriptor_get(st->codecpar->codec_id);
+    const bool bitmapTrack = desc && (desc->props & AV_CODEC_PROP_BITMAP_SUB);
+    constexpr double kOpenEndedSec = 10.0; // cap for a final cue nothing clears
+
     std::vector<SubtitleEvent> events;
     AVPacket* pkt = av_packet_alloc();
 
@@ -179,6 +264,36 @@ void SubtitleExtractor::Worker(std::string path, int streamIndex) {
 
         double start = pktSec + sub.start_display_time / 1000.0;
         double end   = pktSec + sub.end_display_time / 1000.0;
+        if (bitmapTrack) {
+            if (sub.end_display_time == UINT32_MAX || end <= start)
+                end = start + kOpenEndedSec; // open-ended; trimmed by the next cue below
+            std::shared_ptr<SubtitleBitmap> bmp;
+            for (unsigned i = 0; i < sub.num_rects; ++i) {
+                const AVSubtitleRect* r = sub.rects[i];
+                if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 ||
+                    !r->data[0] || !r->data[1] || r->nb_colors <= 0)
+                    continue;
+                if (!bmp) {
+                    bmp = std::make_shared<SubtitleBitmap>();
+                    // PGS sets the canvas size on the decoder while parsing;
+                    // VobSub/DVB may leave it 0 (the renderer then uses the
+                    // video frame size).
+                    bmp->canvasW = ctx->width;
+                    bmp->canvasH = ctx->height;
+                }
+                SubtitleBitmapRect br;
+                br.x = r->x; br.y = r->y; br.w = r->w; br.h = r->h;
+                int maxIndex = 0;
+                EncodeIndicesRle(r->data[0], r->linesize[0], r->w, r->h, br.rle, maxIndex);
+                const uint32_t* pal = reinterpret_cast<const uint32_t*>(r->data[1]);
+                br.palette.assign(pal, pal + std::min({r->nb_colors, maxIndex + 1, 256}));
+                bmp->rects.push_back(std::move(br));
+            }
+            avsubtitle_free(&sub);
+            // Keep empty ("clear") cues for now: they end the previous one.
+            events.push_back({start, end, {}, std::move(bmp)});
+            continue;
+        }
         if (end <= start)
             end = start + (pktDur > 0.0 ? pktDur : 5.0); // fall back to packet duration
 
@@ -214,11 +329,33 @@ void SubtitleExtractor::Worker(std::string path, int streamIndex) {
                          [](const SubtitleEvent& a, const SubtitleEvent& b) {
                              return a.startSec < b.startSec;
                          });
+        if (bitmapTrack) {
+            // Bitmap cues replace each other on screen: each one ends no later
+            // than the next one starts. Then drop the "clear" markers.
+            for (size_t i = 0; i + 1 < events.size(); ++i)
+                events[i].endSec = std::min(events[i].endSec, events[i + 1].startSec);
+            events.erase(std::remove_if(events.begin(), events.end(),
+                                        [](const SubtitleEvent& e) {
+                                            return !e.bitmap || e.endSec <= e.startSec;
+                                        }),
+                         events.end());
+        }
         double maxDur = 0.0;
         for (const auto& e : events)
             maxDur = std::max(maxDur, e.endSec - e.startSec);
-        LOG_INFO("Subtitle: scanned %zu cues from %s (stream %d)",
-                 events.size(), path.c_str(), subIdx);
+        const double scanMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - scanStart).count();
+        if (bitmapTrack) {
+            size_t bytes = 0;
+            for (const SubtitleEvent& e : events)
+                for (const SubtitleBitmapRect& r : e.bitmap->rects)
+                    bytes += r.rle.size() + r.palette.size() * sizeof(uint32_t);
+            LOG_INFO("Subtitle: scanned %zu bitmap cues (%.1f MB encoded) in %.0f ms from %s (stream %d)",
+                     events.size(), bytes / (1024.0 * 1024.0), scanMs, path.c_str(), subIdx);
+        } else {
+            LOG_INFO("Subtitle: scanned %zu text cues in %.0f ms from %s (stream %d)",
+                     events.size(), scanMs, path.c_str(), subIdx);
+        }
         std::lock_guard<std::mutex> lk(m_mutex);
         m_events = std::move(events);
         m_maxDurationSec = maxDur;

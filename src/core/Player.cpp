@@ -181,7 +181,6 @@ bool Player::Open(const std::string& path) {
                         ? ("Track " + std::to_string(m_subtitleTracks.size() + 1))
                         : s.language;
                 }
-                if (!s.textBased) s.title += " [bitmap]";
                 m_subtitleTracks.push_back(std::move(s));
             }
         }

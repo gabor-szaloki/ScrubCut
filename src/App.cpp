@@ -865,6 +865,7 @@ void App::Shutdown() {
         SDL_ReleaseGPUTransferBuffer(m_gpuDevice, m_frameTransfer);
         m_frameTransfer = nullptr;
     }
+    ReleaseSubtitleBitmapTextures();
     m_tonemap.Shutdown();
 
     m_ui.Shutdown();
@@ -1044,7 +1045,8 @@ bool App::IsSubtitlePath(const std::string& path) {
     if (dot == std::string::npos) return false;
     std::string ext = path.substr(dot + 1);
     for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext == "srt" || ext == "ass" || ext == "ssa" || ext == "vtt" || ext == "sub";
+    return ext == "srt" || ext == "ass" || ext == "ssa" || ext == "vtt" || ext == "sub" ||
+           ext == "sup" || ext == "idx";
 }
 
 void App::ResetSubtitleState() {
@@ -1107,7 +1109,6 @@ void App::SelectSubtitleTrack(int index) {
     m_activeSubtitle = index;
     if (index < 0) { m_subtitleExtractor.Reset(); return; }
     const SubtitleTrackInfo& t = m_subtitleTracks[index];
-    if (!t.textBased) { m_subtitleExtractor.Reset(); return; } // bitmap — nothing to render
     if (t.external) m_subtitleExtractor.Start(t.path, -1);
     else            m_subtitleExtractor.Start(m_currentFilePath, t.streamIndex);
 }
@@ -1149,12 +1150,26 @@ std::string App::ChapterLabel(int index) const {
 
 void App::OpenSubtitleFile(const std::string& rawPath) {
     if (!m_player.HasMedia()) return;
-    const std::string path = NormalizeUtf8NFC(rawPath);
+    std::string path = NormalizeUtf8NFC(rawPath);
+    // A VobSub .sub is MPEG-PS whose palette and canvas size live in the
+    // sibling .idx; FFmpeg's vobsub demuxer opens the pair from the .idx. (A
+    // lone .sub is MicroDVD text.)
+    std::filesystem::path fsPath = std::filesystem::u8path(path);
+    std::string ext = fsPath.extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext == ".sub") {
+        for (const char* idxExt : {".idx", ".IDX"}) {
+            std::filesystem::path idx = fsPath;
+            idx.replace_extension(idxExt);
+            std::error_code ec;
+            if (std::filesystem::exists(idx, ec)) { path = idx.u8string(); ext = ".idx"; break; }
+        }
+    }
     SubtitleTrackInfo t;
     t.external = true;
-    t.textBased = true;
+    t.textBased = !(ext == ".sup" || ext == ".idx");
     t.path = path;
-    t.title = std::filesystem::path(path).filename().string();
+    t.title = std::filesystem::u8path(path).filename().u8string();
     m_subtitleTracks.push_back(std::move(t));
     SelectSubtitleTrack(static_cast<int>(m_subtitleTracks.size()) - 1);
 }
@@ -1285,20 +1300,12 @@ void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
         return imgMax.y;
     };
 
-    // Bitmap (unsupported) track that the user explicitly selected: show a note.
+    double t = m_player.GetPlaybackTime() - m_subtitleDelaySec;
     if (m_activeSubtitle < static_cast<int>(m_subtitleTracks.size()) &&
         !m_subtitleTracks[m_activeSubtitle].textBased) {
-        const char* msg = "Subtitle format not supported";
-        float sz = std::clamp(videoH * 0.035f, 12.0f, 40.0f);
-        ImVec2 ts = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, msg);
-        float bottom = liftedBottom(ts.y);
-        ImVec2 pos(centerX - ts.x * 0.5f, bottom - ts.y - margin);
-        dl->AddText(font, sz, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, 220), msg);
-        dl->AddText(font, sz, pos, IM_COL32(255, 220, 120, 235), msg);
+        RenderSubtitleBitmap(m_subtitleExtractor.ActiveBitmap(t), imgMin, imgMax);
         return;
     }
-
-    double t = m_player.GetPlaybackTime() - m_subtitleDelaySec;
     std::string text = m_subtitleExtractor.ActiveText(t);
     if (text.empty()) return;
 
@@ -1339,6 +1346,153 @@ void App::RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax) {
         for (const ImVec2& d : offs)
             dl->AddText(font, fontSize, ImVec2(x + d.x, y + d.y), black, s);
         dl->AddText(font, fontSize, ImVec2(x, y), white, s);
+    }
+}
+
+// Called only from RenderSubtitleBitmap (before it queues this frame's images)
+// and Shutdown (after GPU idle). Track switches deliberately don't release:
+// they can run mid-frame after the overlay has already queued the textures in
+// ImGui's draw list. The stale cue is simply replaced on the next change; the
+// m_subBitmap reference also keeps its address from being reused by a new cue.
+void App::ReleaseSubtitleBitmapTextures() {
+    for (SDL_GPUTexture* tex : m_subBitmapTextures)
+        if (tex) SDL_ReleaseGPUTexture(m_gpuDevice, tex);  // deferred-safe
+    m_subBitmapTextures.clear();
+    m_subBitmap.reset();
+}
+
+void App::RenderSubtitleBitmap(const std::shared_ptr<const SubtitleBitmap>& bmp,
+                               const ImVec2& imgMin, const ImVec2& imgMax) {
+    if (!bmp || bmp->rects.empty()) return;
+
+    // Upload on cue change: expand each rect's palette to RGBA8 and push it
+    // through a one-shot transfer buffer. Cues change a few times a minute, so
+    // nothing here is worth pooling.
+    if (bmp != m_subBitmap) {
+        PROFILE_SCOPE_N("Upload subtitle bitmap");
+        ReleaseSubtitleBitmapTextures();
+        m_subBitmap = bmp;
+        SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(m_gpuDevice);
+        SDL_GPUCopyPass* pass = cmd ? SDL_BeginGPUCopyPass(cmd) : nullptr;
+        std::vector<SDL_GPUTransferBuffer*> transfers;
+        for (const SubtitleBitmapRect& r : bmp->rects) {
+            SDL_GPUTexture* tex = nullptr;
+            if (pass) {
+                SDL_GPUTextureCreateInfo texInfo = {};
+                texInfo.type = SDL_GPU_TEXTURETYPE_2D;
+                texInfo.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+                texInfo.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+                texInfo.width = static_cast<Uint32>(r.w);
+                texInfo.height = static_cast<Uint32>(r.h);
+                texInfo.layer_count_or_depth = 1;
+                texInfo.num_levels = 1;
+                tex = SDL_CreateGPUTexture(m_gpuDevice, &texInfo);
+            }
+            SDL_GPUTransferBuffer* tb = nullptr;
+            if (tex) {
+                SDL_GPUTransferBufferCreateInfo tbInfo = {};
+                tbInfo.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+                tbInfo.size = static_cast<Uint32>(r.w) * r.h * 4;
+                tb = SDL_CreateGPUTransferBuffer(m_gpuDevice, &tbInfo);
+            }
+            uint8_t* dst = tb ? static_cast<uint8_t*>(SDL_MapGPUTransferBuffer(m_gpuDevice, tb, false))
+                              : nullptr;
+            if (!dst) {
+                if (tb) SDL_ReleaseGPUTransferBuffer(m_gpuDevice, tb);
+                if (tex) SDL_ReleaseGPUTexture(m_gpuDevice, tex);
+                LOG_WARN("Subtitle bitmap upload failed: %s", SDL_GetError());
+                m_subBitmapTextures.push_back(nullptr);
+                continue;
+            }
+            ExpandSubtitleRect(r, dst);
+            SDL_UnmapGPUTransferBuffer(m_gpuDevice, tb);
+
+            SDL_GPUTextureTransferInfo src = {};
+            src.transfer_buffer = tb;
+            src.pixels_per_row = static_cast<Uint32>(r.w);
+            src.rows_per_layer = static_cast<Uint32>(r.h);
+            SDL_GPUTextureRegion region = {};
+            region.texture = tex;
+            region.w = static_cast<Uint32>(r.w);
+            region.h = static_cast<Uint32>(r.h);
+            region.d = 1;
+            SDL_UploadToGPUTexture(pass, &src, &region, false);
+            transfers.push_back(tb);
+            m_subBitmapTextures.push_back(tex);
+        }
+        if (pass) SDL_EndGPUCopyPass(pass);
+        if (cmd) SDL_SubmitGPUCommandBuffer(cmd);
+        for (SDL_GPUTransferBuffer* tb : transfers)
+            SDL_ReleaseGPUTransferBuffer(m_gpuDevice, tb);  // deferred until the copy completes
+    }
+
+    // Canvas -> screen mapping. When the canvas has the video's aspect (the
+    // usual case, including anamorphic DVDs whose 720x480 canvas matches the
+    // stored frame), stretch it over the video rect per axis. When it doesn't
+    // — a 1920x1080 PGS track over a cropped 1920x800 encode — fit the canvas
+    // by width, centred on the video, the way the disc's 16:9 frame contains
+    // the letterboxed picture. Rects that then fall outside the viewport are
+    // pulled back in below.
+    float videoW = imgMax.x - imgMin.x;
+    float videoH = imgMax.y - imgMin.y;
+    float canvasW = static_cast<float>(bmp->canvasW > 0 ? bmp->canvasW : m_videoWidth);
+    float canvasH = static_cast<float>(bmp->canvasH > 0 ? bmp->canvasH : m_videoHeight);
+    if (canvasW <= 0.0f || canvasH <= 0.0f || videoW <= 0.0f || videoH <= 0.0f) return;
+    float frameAspect = static_cast<float>(m_videoWidth) / static_cast<float>(m_videoHeight);
+    float canvasAspect = canvasW / canvasH;
+    float sx = videoW / canvasW;
+    float sy = videoH / canvasH;
+    float originY = imgMin.y;
+    if (std::abs(canvasAspect / frameAspect - 1.0f) > 0.02f) {
+        sy = sx;
+        originY = (imgMin.y + imgMax.y) * 0.5f - canvasH * sy * 0.5f;
+    }
+
+    // Visible area: the Viewport window's inner rect (letterbox bars included).
+    ImRect clip = ImGui::GetCurrentWindow()->InnerRect;
+    float margin = videoH * 0.02f;
+
+    // Timeline overlap: like the text path, lift cues that would sit under a
+    // Timeline panel overlapping the video. Only cues in the lower half move.
+    float twTop = FLT_MAX, twBot = -FLT_MAX;
+    if (m_showTimeline && !m_uiHidden) {
+        if (ImGuiWindow* tw = ImGui::FindWindowByName("Timeline")) {
+            if (tw->WasActive && tw->Pos.y > imgMin.y) {
+                twTop = tw->Pos.y;
+                twBot = tw->Pos.y + tw->Size.y;
+            }
+        }
+    }
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (size_t i = 0; i < bmp->rects.size() && i < m_subBitmapTextures.size(); ++i) {
+        SDL_GPUTexture* tex = m_subBitmapTextures[i];
+        if (!tex) continue;
+        const SubtitleBitmapRect& r = bmp->rects[i];
+        float x0 = imgMin.x + r.x * sx;
+        float y0 = originY + r.y * sy;
+        float w = r.w * sx;
+        float h = r.h * sy;
+
+        // Size multiplier: grow about the horizontal centre and the nearer
+        // canvas edge, so bottom cues grow upward and top cues downward.
+        bool lower = (r.y + r.h * 0.5f) > canvasH * 0.5f;
+        if (m_subtitleScale != 1.0f) {
+            float cx = x0 + w * 0.5f;
+            float edgeGap = lower ? (originY + canvasH * sy) - (y0 + h) : y0 - originY;
+            w *= m_subtitleScale;
+            h *= m_subtitleScale;
+            x0 = cx - w * 0.5f;
+            y0 = lower ? (originY + canvasH * sy) - edgeGap - h : originY + edgeGap;
+        }
+
+        // Keep inside the visible area.
+        if (y0 + h > clip.Max.y - margin) y0 = clip.Max.y - margin - h;
+        if (y0 < clip.Min.y + margin) y0 = clip.Min.y + margin;
+        if (lower && twTop < y0 + h + margin && twBot > y0)
+            y0 = twTop - margin - h;
+
+        dl->AddImage(reinterpret_cast<ImTextureID>(tex), ImVec2(x0, y0), ImVec2(x0 + w, y0 + h));
     }
 }
 
@@ -2352,18 +2506,39 @@ void App::Render() {
                 };
                 if (ImGui::MenuItem("Off", subHint(-1), m_activeSubtitle < 0))
                     SelectSubtitleTrack(-1);
+                // Grayed type tag after the title: [bitmap] always, [text]
+                // only when the list mixes both kinds.
+                bool anyText = false, anyBitmap = false;
+                for (const SubtitleTrackInfo& s : m_subtitleTracks)
+                    (s.textBased ? anyText : anyBitmap) = true;
+                const bool mixedTypes = anyText && anyBitmap;
                 for (int i = 0; i < sn; i++) {
                     const SubtitleTrackInfo& s = m_subtitleTracks[i];
                     std::string label = s.title;
                     if (s.external) label += " (file)";
+                    const char* tag = !s.textBased ? "[bitmap]" : (mixedTypes ? "[text]" : nullptr);
+                    // MenuItem can't color part of its label, so pad the label
+                    // with spaces (keeping the menu wide enough) and draw the
+                    // tag over them in the disabled-text color.
+                    float tagX = 0.0f;
+                    if (tag) {
+                        tagX = ImGui::CalcTextSize((label + " ").c_str()).x;
+                        float spaceW = std::max(1.0f, ImGui::CalcTextSize(" ").x);
+                        label.append(1 + static_cast<size_t>(
+                                             std::ceil(ImGui::CalcTextSize(tag).x / spaceW)), ' ');
+                    }
                     label += "##strk" + std::to_string(i);
+                    ImVec2 labelPos = ImGui::GetCursorScreenPos();
                     if (ImGui::MenuItem(label.c_str(), subHint(i), m_activeSubtitle == i))
                         SelectSubtitleTrack(i);
+                    if (tag)
+                        ImGui::GetWindowDrawList()->AddText(ImVec2(labelPos.x + tagX, labelPos.y),
+                                                            ImGui::GetColorU32(ImGuiCol_TextDisabled), tag);
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Open File...")) {
                     static const SDL_DialogFileFilter subFilters[] = {
-                        {"Subtitle files", "srt;ass;ssa;vtt;sub"},
+                        {"Subtitle files", "srt;ass;ssa;vtt;sub;sup;idx"},
                         {"All files", "*"},
                     };
                     SDL_ShowOpenFileDialog([](void* userdata, const char* const* filelist, int) {

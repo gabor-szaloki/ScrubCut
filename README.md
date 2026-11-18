@@ -30,7 +30,7 @@ ScrubCut can serve as your basic go-to video player app — you can find most ba
 - **Variable speed** -- 0.1x to 8x playback
 - **Volume control** -- mute button and volume slider
 - **Audio tracks** -- switch between multiple embedded audio tracks
-- **Subtitles** -- show embedded subtitle tracks, or load an external subtitle file (SRT, ASS/SSA, WebVTT, SUB) via the menu or drag-and-drop; adjustable text size and timing offset
+- **Subtitles** -- show embedded subtitle tracks, or load an external subtitle file (SRT, ASS/SSA, WebVTT, SUB, SUP, VobSub IDX) via the menu or drag-and-drop; adjustable size and timing offset
 - **HDR support** -- HDR videos (PQ/HLG) play tone-mapped on SDR displays with a selectable operator, and at native brightness on HDR displays
 - **Input formats** -- MP4, MKV, MOV, AVI, WebM, WMV, FLV, MPG/MPEG, 3GP, TS, M4V, and animated GIF
 

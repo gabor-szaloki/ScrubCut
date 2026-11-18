@@ -64,6 +64,12 @@ private:
     void ResetSubtitleState();
     // Draw the active subtitle cue over the video rect, if any.
     void RenderSubtitleOverlay(const ImVec2& imgMin, const ImVec2& imgMax);
+    // Bitmap-cue half of RenderSubtitleOverlay: uploads the cue's images when
+    // it changes (one texture per rect) and maps them from the subtitle canvas
+    // onto the video rect.
+    void RenderSubtitleBitmap(const std::shared_ptr<const SubtitleBitmap>& bmp,
+                              const ImVec2& imgMin, const ImVec2& imgMax);
+    void ReleaseSubtitleBitmapTextures();
 
     // Flash a short, fading status message in the top-right of the video
     // (track switches, delay/size nudges) — the counterpart to the centre
@@ -80,6 +86,10 @@ private:
     // Persisted in preferences.ini.
     float m_subtitleScale = 1.0f;
     SubtitleExtractor m_subtitleExtractor;
+    // Bitmap cue currently uploaded, and its textures (parallel to its rects;
+    // an entry is null if that rect failed to upload).
+    std::shared_ptr<const SubtitleBitmap> m_subBitmap;
+    std::vector<SDL_GPUTexture*> m_subBitmapTextures;
 
     // Top-right status flash.
     std::string m_statusMsg;

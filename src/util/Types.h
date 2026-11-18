@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -102,8 +103,26 @@ struct SubtitleTrackInfo {
     std::string title;
     std::string language;
     bool external = false;
-    bool textBased = true; // false for bitmap formats (PGS/VOBSUB/DVB) — shown but not rendered
+    bool textBased = true; // false for bitmap formats (PGS/VOBSUB/DVB) — rendered as images
     std::string path;      // external file path (external only)
+};
+
+// One image of a bitmap subtitle cue (PGS / VobSub / DVB). A whole track's
+// cues stay in memory, so the palette indices are run-length encoded (~5x
+// smaller than raw indices, ~20x smaller than RGBA on Blu-ray PGS); see
+// ExpandSubtitleRect in core/SubtitleExtractor.h for the RGBA expansion.
+struct SubtitleBitmapRect {
+    int x = 0, y = 0, w = 0, h = 0;    // position/size on the subtitle canvas
+    std::vector<uint8_t> rle;          // row-major runs: index byte, then LEB128 run length
+    std::vector<uint32_t> palette;     // 0xAARRGGBB (non-premultiplied), trimmed to used indices
+};
+
+// All images of one bitmap cue, positioned on the subtitle's own canvas
+// (which may differ from the video frame size, e.g. a 1920x1080 PGS track
+// over a cropped 1920x800 encode).
+struct SubtitleBitmap {
+    int canvasW = 0, canvasH = 0;
+    std::vector<SubtitleBitmapRect> rects;
 };
 
 // A single decoded subtitle cue. SubtitleExtractor produces a time-sorted
@@ -112,6 +131,7 @@ struct SubtitleEvent {
     double startSec = 0.0;
     double endSec   = 0.0;
     std::string text; // plain text, '\n'-separated lines, formatting tags stripped
+    std::shared_ptr<const SubtitleBitmap> bitmap; // bitmap tracks only (text empty)
 };
 
 struct ExportSettings {

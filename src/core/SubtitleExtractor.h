@@ -4,13 +4,15 @@
 #include "util/Types.h"
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 // Background worker that decodes one subtitle track — embedded or from an
-// external subtitle file — once, into a time-sorted list of SubtitleEvents.
+// external subtitle file, text or bitmap (PGS / VobSub / DVB) — once, into a
+// time-sorted list of SubtitleEvents.
 // This deliberately stays out of the live playback pipeline: subtitles are
 // scanned once and then rendered by a simple time lookup, which scrubs and
 // seeks for free. Modeled on WaveformExtractor.
@@ -24,6 +26,10 @@
 // Thread safety:
 //   The worker appends to m_events under m_mutex; ActiveText() reads under the
 //   same lock, so a still-running scan is safe to query.
+// Expand a bitmap cue rect to tightly packed RGBA8 (r.w * r.h * 4 bytes at
+// `rgba`). Malformed or short RLE data leaves the remainder transparent.
+void ExpandSubtitleRect(const SubtitleBitmapRect& r, uint8_t* rgba);
+
 class SubtitleExtractor {
 public:
     SubtitleExtractor() = default;
@@ -45,7 +51,14 @@ public:
     // '\n'-separated.
     std::string ActiveText(double t) const;
 
+    // Return the bitmap cue active at time t (null if none, or if the track is
+    // text-based). The pointer doubles as the cue's identity, so callers can
+    // cache the uploaded texture until it changes.
+    std::shared_ptr<const SubtitleBitmap> ActiveBitmap(double t) const;
+
 private:
+    // Caller holds m_mutex.
+    const SubtitleEvent* FindActive(double t) const;
     void Stop();
     void Worker(std::string path, int streamIndex);
 
