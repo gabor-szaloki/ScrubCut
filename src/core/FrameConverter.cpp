@@ -67,10 +67,10 @@ int FrameConverter::OutputSize() const {
 }
 
 void FrameConverter::ScaleInto(AVFrame* frame, uint8_t* dst) {
-    // Both the SDR (RGBA) and HDR (X2BGR10LE) destination formats are 4 bytes
-    // per pixel, so the destination stride is the same either way.
-    uint8_t* dstData[1] = { dst };
-    int dstLinesize[1] = { m_width * 4 };
+    // sws_scale reads four plane entries from both arrays, even for packed
+    // output, so they must have four elements (unused ones zeroed).
+    uint8_t* dstData[4] = { dst, nullptr, nullptr, nullptr };
+    int dstLinesize[4] = { m_width * 4, 0, 0, 0 };
 
     sws_scale(m_swsCtx,
               frame->data, frame->linesize,
