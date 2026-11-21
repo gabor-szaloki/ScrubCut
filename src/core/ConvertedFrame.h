@@ -14,12 +14,17 @@ struct ConvertedFrame {
     int height = 0;
     bool keyframe = false;  // GOP boundary — drives the frame cache's window policy
 
+    // swscale's SIMD output stores whole vectors, so it can write past the end
+    // of the last row when the width isn't a multiple of 16 (32 bytes at 1080).
+    // Keep slack after the pixels so that can't hit the next heap chunk.
+    static constexpr size_t kSwsPadding = 128;
+
     // Grow the pixel storage without initializing it — sws_scale overwrites
     // every byte, and value-initializing tens of MB per frame is measurable
     // on the scrub path.
     void Resize(size_t bytes) {
         if (bytes > m_capacity) {
-            m_pixels.reset(new uint8_t[bytes]);
+            m_pixels.reset(new uint8_t[bytes + kSwsPadding]);
             m_capacity = bytes;
         }
         m_size = bytes;

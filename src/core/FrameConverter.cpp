@@ -39,7 +39,7 @@ const uint8_t* FrameConverter::Convert(AVFrame* frame) {
     if (needed > m_bufferSize) {
         FreeBuffer();
         m_bufferSize = needed;
-        m_buffer = static_cast<uint8_t*>(av_malloc(m_bufferSize));
+        m_buffer = static_cast<uint8_t*>(av_malloc(m_bufferSize + ConvertedFrame::kSwsPadding));
     }
 
     ScaleInto(frame, m_buffer);
